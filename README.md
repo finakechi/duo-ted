@@ -33,14 +33,14 @@ You need:
 - **A ChatGPT account for Codex**: Duo bundles a pinned Codex CLI; sign in with `npx codex login` from the Duo folder, or through the ChatGPT desktop app.
 
 ```bash
-git clone https://github.com/Audatic07/duo.git
-cd duo
+git clone https://github.com/finakechi/duo-ted.git
+cd duo-ted
 npm install
 node bin/duo.js setup
 duo doctor
 ```
 
-For a versioned release, download the source bundle and `SHA256SUMS` from [GitHub Releases](https://github.com/Audatic07/duo/releases), verify the checksum, extract it, and run `npm ci` followed by `node bin/duo.js setup` in the extracted folder. Bundles include the built GUI and require the same Node.js, Git and CLI sign-ins as a checkout. See the [0.3.0 release notes](docs/releases/0.3.0.md).
+For a versioned release, download the source bundle and `SHA256SUMS` from [GitHub Releases](https://github.com/finakechi/duo-ted/releases), verify the checksum, extract it, and run `npm ci` followed by `node bin/duo.js setup` in the extracted folder. Bundles include the built GUI and require the same Node.js, Git and CLI sign-ins as a checkout. See the [0.3.0 release notes](docs/releases/0.3.0.md).
 
 `duo setup` adds an app launcher (the application menu on Linux, `~/Applications/Duo.app` on macOS, the Start menu on Windows), the `duo` and `duo-safe` commands, a `/duo` skill for Claude Code, a `$duo` skill for Codex, and a Codex rule that pre-approves `duo-safe`. `duo setup --uninstall` removes all of it.
 
@@ -213,6 +213,8 @@ test/         unit and end-to-end tests, fake CLIs, real stream fixtures
 ```
 
 ## Credits
+
+This repository is a fork of Duo by Aditya Shrivastav (`Audatic07/duo`). Please report problems with this fork here, not to the original project.
 
 Built on [claw-orchestrator](https://github.com/Enderfga/claw-orchestrator) (MIT), which drives both CLIs as persistent sessions. Protocol ideas from Karpathy's llm-council (anonymized peer ranking), STRML/cc-debate (contradiction rounds) and TorpedoD/claude-council (dissent preservation). Inter and JetBrains Mono fonts (OFL).
 
