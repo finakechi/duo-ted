@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
@@ -33,4 +33,24 @@ test('a small diff is shown whole', () => {
   writeFileSync(join(repo, 'small.txt'), 'three\n');
   const s = gitState(repo);
   assert.ok(s.repo && /\+three/.test(s.diff) && !/truncated/.test(s.diff));
+});
+
+// Ported from the Codex maintenance review.
+test('Changes treats NUL-delimited rename sources as paths, even when they look like status entries', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'duo-git-state-'));
+  const g = (...args: string[]) => execFileSync('git', ['-C', dir, ...args], { stdio: 'pipe' });
+  try {
+    g('init', '--quiet');
+    const source = ' M source with spaces.txt';
+    const target = 'renamed with spaces.txt';
+    writeFileSync(join(dir, source), 'rename me\n');
+    g('add', '--all');
+    g('-c', 'user.name=Test', '-c', 'user.email=test@localhost', '-c', 'commit.gpgsign=false', 'commit', '--quiet', '-m', 'initial');
+    renameSync(join(dir, source), join(dir, target));
+    writeFileSync(join(dir, 'untracked.txt'), 'hello');
+    g('add', '--', target, source);
+    const state = gitState(dir);
+    assert.equal(state.repo, true);
+    if (state.repo) assert.deepEqual(state.files, [{ status: 'R', path: target }, { status: '??', path: 'untracked.txt' }]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
