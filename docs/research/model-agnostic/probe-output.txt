@@ -1,0 +1,40 @@
+# Output of probe.mjs — 2026-11-03, v22.23.4, Linux x86_64, claw-orchestrator 7.6.0
+# Fake CLIs only: these results describe library plumbing, not real CLIs, providers or models.
+CONFIRMED      P1   Duo seat grammar refuses "opencode:qwen/qwen3.6-35b-a3b"
+                    unknown engine "opencode" in "opencode:qwen/qwen3.6-35b-a3b" (use codex or claude)
+CONFIRMED      P1   Duo seat grammar refuses "deepseek:deepseek-flash"
+                    unknown engine "deepseek" in "deepseek:deepseek-flash" (use codex or claude)
+CONFIRMED      P1   Duo seat grammar refuses "ollama:qwen3.6"
+                    unknown engine "ollama" in "ollama:qwen3.6" (use codex or claude)
+CONFIRMED      P2   Template selector refuses engine "opencode"
+                    assignment: unknown engine
+CONFIRMED      P3-argv A 200,000-character prompt to the OpenCode engine fails before the CLI runs
+                    spawn E2BIG
+CONFIRMED      P3a  OpenCode prompt travels on argv (not stdin)
+                    first message length 20065
+CONFIRMED      P3b  jsonSchema is not forwarded to OpenCode (no schema flag)
+                    ["run","<message 20065 chars>","--format","json","--agent","clawo-readonly","--model","ollama/qwen3.6:35b-a3b","--variant","high"]
+CONFIRMED      P3c  appendSystemPrompt is prepended to the first user message only
+CONFIRMED      P3d  read-only maps to an injected agent denying edit/bash/task/webfetch
+                    {"agent":{"clawo-readonly":{"mode":"primary","permission":{"edit":"deny","bash":"deny","external_directory":"deny","task":"deny","webfetch":"deny"},"tools":{"task":false,"write":false,"edit":false,"bash":false,"patch":false}}}}
+CONFIRMED      P3e  second send resumes the OpenCode session id
+                    turn2 --session ses_fake_2845
+CONFIRMED      P3f  model passes through only in provider/model form; effort becomes --variant
+CONFIRMED      P3g  claw returns the reply text (structured output must be parsed by Duo)
+                    output="{\"answer\":\"fake opencode reply\"}"
+CONFIRMED      P4   claw rewrites a non-Claude model to --model opus and appends /real/<model> to baseUrl (proxy convention)
+                    {"cli":"claude","model":"opus","ANTHROPIC_BASE_URL":"https://api.deepseek.com/anthropic/real/deepseek-flash","hasAuthToken":false}
+CONFIRMED      P5   Without baseUrl (and no OpenClaw gateway), model and env-provided ANTHROPIC_BASE_URL pass through unchanged
+                    {"cli":"claude","model":"deepseek-flash","ANTHROPIC_BASE_URL":"https://api.deepseek.com/anthropic","hasAuthToken":true}
+CONFIRMED      P6   classifyError("connect ECONNREFUSED 127.0.0.1:11434") → other
+                    got other
+CONFIRMED      P6   classifyError("fetch failed: getaddrinfo ENOTFOUND api.deepseek.com") → other
+                    got other
+CONFIRMED      P6   classifyError("402 Insufficient Balance") → other
+                    got other
+CONFIRMED      P6   classifyError("429 Too Many Requests") → quota
+                    got quota
+CONFIRMED      P6   classifyError("This model's maximum context length is 131072 tokens") → other
+                    got other
+CONFIRMED      P6   classifyError("503 Service Unavailable") → capacity
+                    got capacity

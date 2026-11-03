@@ -57,10 +57,10 @@
   "author": "Aditya Shrivastav",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Audatic07/duo.git"
+    "url": "git+https://github.com/finakechi/duo-ted.git"
   },
-  "homepage": "https://github.com/Audatic07/duo#readme",
+  "homepage": "https://github.com/finakechi/duo-ted#readme",
   "bugs": {
-    "url": "https://github.com/Audatic07/duo/issues"
+    "url": "https://github.com/finakechi/duo-ted/issues"
   }
 }

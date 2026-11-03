@@ -18,4 +18,4 @@ Chats run with the permissions you choose for them. *Full access* (Claude `bypas
 
 ## Reporting a vulnerability
 
-Please report security problems privately through [GitHub private vulnerability reporting](https://github.com/Audatic07/duo/security/advisories/new) rather than a public issue. Include the steps to reproduce and the version (`duo --version`). We aim to reply within a week.
+Please report security problems privately through [GitHub private vulnerability reporting](https://github.com/finakechi/duo-ted/security/advisories/new) rather than a public issue. Include the steps to reproduce and the version (`duo --version`). We aim to reply within a week.
