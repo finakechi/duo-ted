@@ -13,6 +13,16 @@ date. Direct page fetches of `api-docs.deepseek.com` and `qwenlm.github.io` were
 session's network policy, so I could not read those pages' own dates. Facts taken from them are
 labelled *official docs (via search index)*. Re-read them before you rely on a price or model name.
 
+**Revision 2 (2026-11-03): cross-checked against an independent Codex study** of the same brief.
+The user supplied it as an upload; it is not in this repository. This revision adds:
+- DeepSeek's Codex-tuned Responses API as a second DeepSeek route (C, D, G);
+- six source findings from that study, each re-verified against commit `25b9cff` (A.5, B19-B24);
+- DeepSeek concurrency and error semantics, now corroborated in DeepSeek's docs (D.1);
+- a merged first milestone: a shared per-seat child environment for both CLIs (H).
+
+Claims taken from that study that I could not corroborate are labelled *Codex study*. One of its
+recommendations contradicts **Probe P4**; it is noted in C.2.
+
 **Evidence labels used throughout**
 
 | Label | Meaning |
@@ -54,6 +64,14 @@ labelled *official docs (via search index)*. Re-read them before you rely on a p
    translator, permission broker and every coordination template keep working unchanged.
    **Probe P5** confirms that claw passes the model and an environment-provided endpoint through
    untouched when `baseUrl` is not used.
+
+   **A second DeepSeek route deserves qualification in parallel.** DeepSeek also documents a
+   Responses API "specifically adapted for Codex" (changelog, 2026-08-13) and an official Codex
+   integration guide. That route keeps Codex's proven OS sandbox, which makes it the stronger
+   candidate for a DeepSeek *writer*. It costs more to build: Duo must generate a trusted provider
+   block and model catalog that pass `CFG_DENY` and `--ignore-user-config`, and that is unverified
+   on the pinned Codex 0.159.0. It also does not cover local Qwen. The Claude Code route stays the
+   cheaper single mechanism for DeepSeek reviewers plus local models.
 4. **A new harness (OpenCode, Qwen Code, DeepSeek's `dsh`) is a later, conditional step.** It is
    worth doing only if desktop benchmarks show that a Qwen-tuned harness beats Claude Code on the
    same local model. OpenCode through claw has concrete blockers:
@@ -73,13 +91,28 @@ labelled *official docs (via search index)*. Re-read them before you rely on a p
    total parameters. Every throughput number below is an estimate. Section E gives the desktop
    benchmark plan.
 7. **Recommended strategy:** *Option A+, a minimal provider-profile extension of the existing
-   harnesses, plus a capability registry*. Add one harness adapter later only if it earns its
-   place. Avoid the broad model-independent refactor (Option C).
-8. **Next Codex task (section H):** "Seat provider profiles for Claude Code seats
-   (Anthropic-compatible endpoints)". This means a `+provider=<id>` seat option, per-session
-   endpoint and credential injection in the existing spawn hook, a guard against claw's model and
-   URL rewriting, explicit provider attribution in run records, no quota or cost misattribution,
-   and fake-CLI tests. It has no GUI editor and no new dependencies.
+   harnesses, plus a capability registry*. Use two transports on the CLIs Duo already drives:
+   - Claude Code → Anthropic-compatible endpoints, for DeepSeek, Ollama and llama.cpp;
+   - Codex → DeepSeek Responses, for DeepSeek as a writer, once qualified.
+
+   Add one harness adapter later only if it earns its place. Avoid the broad model-independent
+   refactor (Option C).
+8. **Correctness and security issues exist independent of new providers** (A.5):
+   - the launch token is written to disk despite `SECURITY.md`;
+   - a chat turn with an error is shown as "done" if any text arrived;
+   - the setup check and quota refresh send billable prompts;
+   - the server requires both CLIs at startup.
+
+   The first and second must be fixed before Duo adds backends whose errors and approvals are less
+   familiar.
+9. **Next Codex task (section H):** "Shared per-seat child environment for Codex and Claude spawn
+   routes". This is a small internal primitive. It builds each seat's process environment from an
+   explicit omit-list plus overlay, never mutates `process.env`, and is keyed per Codex route and
+   per Claude session id. It has no user-facing syntax and no new dependencies, and old routes
+   behave identically.
+
+   Both provider routes need this primitive. The provider-profile work (`+provider=`, the claw
+   rewrite guard, attribution and cost labels) follows as milestone H.2.
 
 ---
 
@@ -182,6 +215,19 @@ arbitrary-provider support.
   Electron, Preact and esbuild. None of the recommendations below need a new dependency. Node's
   built-in `fetch` is enough for the later direct-inference client.
 
+### A.5 Further source observations (added in revision 2)
+
+The independent Codex study raised these. Each was re-checked against commit `25b9cff` (**Repo**).
+
+| Observation | Evidence | Why it matters for new backends |
+|---|---|---|
+| The local API launch token **is written to disk**, contradicting `SECURITY.md:8` ("it is never written to disk or sent anywhere else"). | `ChatManager.mcpConfig()` writes `DUO_API_TOKEN` into `DUO_HOME/gui/mcp/<chat>.json` (`src/server/chats.ts:240`). `remove()` deletes the file (`:227`); `close()` does not (`:465-468`). No restrictive file mode is set; effective access depends on umask and was not tested. | The permission bridge is the pattern a new harness's approval channel would copy. Provider keys must never follow it, and the local control-plane token must not double as an adapter credential. |
+| A chat turn that ends with an error is shown as **done** when any text block arrived. | `endTurn()`: `turn.status = o.stopped ? 'stopped' : o.error && !answered ? 'error' : 'done'` (`chats.ts:452-453`). The error and hint are still recorded (`:454-457`). | This is the "silent downgraded success" the brief warns about. Third-party endpoints that stream partial text and then fail (truncation, context overflow, dropped connection) would look successful in chats. Runs are stricter: `Engines.send` treats a transport error as success only when the CLI reported completion (`engine.ts:323`). |
+| `doctor --live` and quota refresh **send real prompts**. | `src/doctor.ts:102`, `:120` and `src/quota-refresh.ts:13`, `:18` each run a "Reply with: ok" turn. | A provider health check must be passive by default (version, `/models`, local `/api/version`). A paid probe needs explicit consent per provider. |
+| The server **requires both CLIs at startup**. | `src/server/main.ts:45` resolves both binaries eagerly, and `RunContext.create()` resolves both again (`src/protocols/common.ts:103`). | A local-only or DeepSeek-only user without Claude Code or Codex cannot start the app. Resolve only the CLIs that the selected seats need. |
+| The pair **check command runs on the host**, outside the model's sandbox. | `runCheck()` spawns with `shell: true` and `env: process.env` (`src/worktree.ts:184`). Its timeout calls `p.kill()` on the direct child only (`:195`). | Correct by design, since it is the user's command. But it must never be chosen by a model or provider. Descendant cleanup on timeout or cancellation needs tests before broader guarantees. |
+| **Continue** supports only Debate, Ask and Pair. | `src/protocols/continue.ts:38`, `:42`. | A provider profile must not imply universal resume. Continuation of a provider seat must also fail visibly if its profile was removed or changed (F.6). |
+
 ---
 
 ## B. Integration barriers
@@ -199,7 +245,7 @@ security boundary, or behavior the library cannot provide.
 | B5 | Write access exists only as `codexSandbox` + `claudeMode` (`engine.ts:31-33`, `pair.ts:71-79`). | A harness without an OS sandbox (OpenCode: no sandbox found in its docs; Qwen Code: sandbox off by default per its docs) cannot honor Duo's "Sandboxed" writer promise (README "Pair mode"). | **Major** for writers on such harnesses. None for read-only roles where the harness enforces the allowlist. |
 | B6 | Prompts are passed on argv by claw's one-shot engines (**Probe P3-argv**: a 200,000-char prompt fails with `spawn E2BIG`). Duo fixes this only for Codex (`hooks.ts:103-113`). | Debate and review prompts exceed the Linux 128 KiB per-argument limit, and on Windows the whole command line is limited to about 32 K characters. | **Major** for OpenCode/one-shot custom engines unless the CLI accepts stdin (unverified for OpenCode). Not an issue for Claude Code, which reads prompts from stream-json stdin. |
 | B7 | Structured output relies on the CLI enforcing a schema (README "How the protocols keep models honest"). OpenCode gets no schema (**Probe P3b**). Duo then falls back to `extractJson` + local validation + one retry. | Debate, review, council and pair all depend on schema compliance. Weaker models fail more often, and Duo retries once, then fails visibly. That failure is good behavior, but it costs turns. | Moderate. |
-| B8 | claw's `baseUrl` path rewrites a non-Claude model to `opus` and the URL to `/real/<model>` (**Probe P4**). Its gateway auto-detection (`GATEWAY_URL` or `~/.openclaw/openclaw.json`) can inject that path without Duo asking. | A DeepSeek seat could silently run, and bill, as `deepseek-v4-pro`: DeepSeek maps `claude-opus*` to V4 Pro (official docs via search index, "Messages API"). That is a hidden model change. | **Moderate. Must be guarded in milestone H.** |
+| B8 | claw's `baseUrl` path rewrites a non-Claude model to `opus` and the URL to `/real/<model>` (**Probe P4**). Its gateway auto-detection (`GATEWAY_URL` or `~/.openclaw/openclaw.json`) can inject that path without Duo asking. | A DeepSeek seat could silently run, and bill, as `deepseek-v4-pro`: DeepSeek maps `claude-opus*` to V4 Pro (official docs via search index, "Messages API"). That is a hidden model change. | **Moderate. Must be guarded in milestone H.2.** |
 | B9 | An inherited `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` in the user's shell reaches every Claude seat today. `sanitizeEnvironment()` (`src/env.ts:20-24`) strips only `OPENAI_API_KEY`, and claw keeps a non-Anthropic key whenever a base URL is set (`persistent-session.js:338-346`; pass-through shown by **Probe P5**). | Present-day hazard. A user who exported DeepSeek variables for their own `claude` would get "Claude opus" seats that actually run elsewhere, labeled as Anthropic, with source code sent to that endpoint. | Moderate (privacy/attribution). Fix by detecting and showing it, not silently stripping, because some users intend a gateway. |
 | B10 | Cost and quota are shaped for two plans: `codexCredits`/`usd` (`store.ts:82-83`), the Claude quota cache written from any `rate_limit_event` (`engine.ts:312`), and `costUsd` taken from Claude's `total_cost_usd` (`engine.ts:315-321`). | Claude Code on another provider will report a USD figure computed from Anthropic prices or zero. That figure is unverified and should be treated as untrustworthy. Rate-limit events, if any, would overwrite the Claude-plan quota display. | Moderate. |
 | B11 | Error classes are regexes over the two CLIs' messages (`errors.ts:22-38`). | **Probe P6:** an offline local server, DNS failure, insufficient balance or context overflow is `other`, which triggers a format-repair retry with a misleading note and no actionable hint. `429` is `quota`, so the seat is removed with the plan hint. That is right for a plan but wrong for an API rate limit, which wants back-off. | Minor to moderate. |
@@ -208,8 +254,14 @@ security boundary, or behavior the library cannot provide.
 | B14 | Chat access tables are per engine (`chats.ts:34-46`), and approval cards exist only for Claude (`permissionPromptTool`). | Claude Code on another provider keeps approval cards for free. A new harness needs its own permission bridge, or it must be read-only in chats. | Moderate per new harness. |
 | B15 | Session semantics: two id fields (`store.ts:48-49`) and continuation requiring one of them (`continue.ts:71`). | Direct inference has no harness-side conversation, so Duo would have to own history. Templates already support `session: 'fresh'` and explicit routing, which suits stateless direct roles. | Moderate (direct inference only). |
 | B16 | Template selector `engine` enum (`validate.ts:43`, maker `template-fields.tsx:63`). | Authors cannot target a provider, locality ("local only") or capability. Under AGENTS.md, any such targeting must arrive in the shared model, validator, executor and visual controls together. | Moderate. |
-| B17 | `CFG_DENY` blocks `model_provider(s)` for Codex seats (`seats.ts:32-37`). | Pointing Codex at a local provider is deliberately impossible through `cfg:`. A Duo-owned, validated provider profile would have to set it. The current Codex docs say custom `wire_api` must be `responses`, so a local server needs the Responses API (official docs, Codex config reference). | Moderate. Defer. |
+| B17 | `CFG_DENY` blocks `model_provider(s)` for Codex seats (`seats.ts:32-37`). | Pointing Codex at a local provider is deliberately impossible through `cfg:`. A Duo-owned, validated provider profile would have to set it. The current Codex docs say custom `wire_api` must be `responses`, so a local server needs the Responses API (official docs, Codex config reference). | Moderate. Addressed by phase 1b (DeepSeek) and phase 5 (local), both through Duo-generated trusted config, never user `cfg:`. |
 | B18 | Run records: `versions.codex/claude` and `codexBin/claudeBin` only (`common.ts:113-122`). | The provider and endpoint host are not recorded, so audit and reproduction are incomplete for non-default backends. | Minor. |
+| B19 | Per-seat environment is additive only: `BinSpec.env` is merged over `options.env ?? process.env` (`hooks.ts:130`, `:146`). There is no way to *remove* an inherited variable for one seat. | Mixed seats (ChatGPT-plan Codex beside DeepSeek Codex, or Anthropic beside DeepSeek Claude) cannot be isolated from each other's routing and auth variables. The serialized `CODEX_BIN` handoff (`engine.ts:392-405`) is a route-selection workaround, not isolation. | **Major** for reliable mixed credentials. This is the H.1 primitive. |
+| B20 | The launch token is persisted for the permission bridge (`chats.ts:240`), and `close()` does not clean it up (A.5). | It contradicts `SECURITY.md`, and it is the pattern any new approval bridge would copy. | Moderate to implement; major for the credential boundary. Fix before generalizing the bridge. |
+| B21 | Chat turns are "done" when text arrived despite an error (`chats.ts:453`). | A failure after partial output is shown as success. | Moderate (correctness-critical for new providers). |
+| B22 | Both CLIs are resolved at startup (`main.ts:45`, `common.ts:103`). | A setup without one CLI fails to start, even if no seat uses it. | Moderate. |
+| B23 | Health checks are billable (`doctor.ts:102`, `:120`; `quota-refresh.ts:13`, `:18`). | Applying the same pattern to providers would spend money on a "check". | Minor. |
+| B24 | Codex provider settings can come only from Duo-generated config. `CFG_DENY` blocks `model_provider(s)` (`seats.ts:32-37`), and seats run with `ignoreUserConfig: true` (`engine.ts:187`). DeepSeek's Codex guide edits the shared `~/.codex/config.toml` and stores the key in `experimental_bearer_token` (official docs). | Duo must pass a provider block, an environment-key reference and a model catalog through trusted `-c` overrides on both initial and resumed turns. Whether the pinned Codex 0.159.0 accepts `model_providers.*` and a catalog path this way is **unverified**. | Moderate. It is a qualification gate for the Codex + DeepSeek route. |
 
 ---
 
@@ -244,7 +296,8 @@ That would make Duo a harness, which is out of scope and a security liability.
 
 | Strategy | Benefit | Change scope | Maintenance | Limits | Regression risk |
 |---|---|---|---|---|---|
-| **1. CLI/config extension: provider profiles on existing harnesses** (Claude Code → Anthropic-compatible endpoints; later Codex → Responses-compatible local endpoints) | Adds DeepSeek cloud and local Qwen while keeping Claude Code's permissions, events, resume and schema plumbing. Duo's parsers, broker, templates and tests are reused. | `seats.ts`, `config.ts`, `hooks.ts`, `engine.ts`, `chats.ts`, `store.ts`, `errors.ts`, `doctor.ts`, then GUI. About 300-500 lines plus tests. | Low. It tracks two env var conventions that DeepSeek, Ollama and llama.cpp document. | Harness prompts and tools are tuned for Claude models, so reliability on other models is **unverified**. Claude Code background calls need model mapping. Cost is unpriced. Each provider's Anthropic compatibility is partial (DeepSeek ignores some fields). | Low, if existing seats get byte-identical spawn args and env (parity tests). |
+| **1a. CLI/config extension: Claude Code → Anthropic-compatible endpoints** (DeepSeek `/anthropic`, Ollama ≥ 0.14, llama.cpp `/v1/messages`) | Adds DeepSeek cloud and local Qwen while keeping Claude Code's permissions, events, resume and schema plumbing. Duo's parsers, broker, templates and tests are reused. | `seats.ts`, `config.ts`, `hooks.ts`, `engine.ts`, `chats.ts`, `store.ts`, `errors.ts`, `doctor.ts`, then GUI. About 300-500 lines plus tests. | Low. It tracks two env var conventions that DeepSeek, Ollama and llama.cpp document. | Harness prompts and tools are tuned for Claude models, so reliability on other models is **unverified**. Claude Code background calls need model mapping. Cost is unpriced. Each provider's Anthropic compatibility is partial (DeepSeek ignores some fields). | Low, if existing seats get byte-identical spawn args and env (parity tests). |
+| **1b. CLI/config extension: Codex → DeepSeek Responses API** (official DeepSeek Codex guide; API "specifically adapted for Codex", 2026-08-13) | Keeps Codex's OS sandbox, `--output-schema`, `exec resume` and Duo's Codex parser. The endpoint is tuned for this harness, so it is the strongest DeepSeek *writer* candidate. | The Codex branch of `engine.ts` (Duo-generated `-c model_provider=…`, `model_providers.<id>.*` with an env-key reference, and a model catalog file), `seats.ts`, `pricing.ts` (USD, not plan credits), `quota.ts` gating, `errors.ts`, plus H.1's child environment. | Medium. It tracks Codex's provider and catalog schema, which can be ahead of or behind the pinned 0.159.0. | Unverified on the pin: provider settings via `-c` under `--ignore-user-config` and on `exec resume` (B24). The Responses API is stateless (no `previous_response_id`, `store` always false, per DeepSeek docs), so `exec resume` must replay history itself (unverified). Web search only with V4 Pro (DeepSeek guide). It does not cover local models. | Medium (Codex argv and env), guarded by `units.test.ts` and `engine.test.ts`. |
 | **2. Harness adapters** (OpenCode via claw; Qwen Code / `dsh` via claw `custom` or a new adapter) | Qwen Code's tool formats are presumably tuned for Qwen models (unverified). OpenCode is provider-agnostic. claw already wraps OpenCode. | New spawn route per harness, parser, translator, fixtures, access mapping, structured-output strategy and an argv workaround. | High. OpenCode releases often and its JSON schema is not formally documented. Qwen Code is at 0.26.x and `dsh` is a release candidate. | No OS sandbox (OpenCode), sandbox off by default (Qwen Code), schema not enforced by claw (OpenCode), E2BIG (**Probe**). | Medium. |
 | **3. Direct cloud APIs** (DeepSeek Chat/Responses, no harness) | Cheapest and fastest path for tool-less work. Native JSON modes (DeepSeek `json_object`, Responses `json_schema`; official docs). | New HTTP client, history ownership, usage mapping. | Medium. | No repository access and no tools, so it cannot do debate, review or pair as designed: citation checks would fail and there is nothing to verify against. | Low, if confined to new tool-less roles. |
 | **4. Local direct inference** (Ollama / llama.cpp / LM Studio, OpenAI-compatible) | Private, no per-token cost, good for the Narrator and helpers. | Same client as option 3, pointed at loopback. | Low/medium. | VRAM, prefill latency, `num_ctx` not settable per request through Ollama's OpenAI API (official docs), and llama.cpp tool-call format bugs (issue #20198). | Low. |
@@ -262,8 +315,24 @@ Architecture options for the code base:
 
 ### C.3 Recommendation
 
-**Strategy 1 / Option A+.** Add provider profiles for the Claude Code harness, plus a capability
-registry and run-start compatibility checks. Add direct inference only for tool-less roles, with
+**Strategy 1 / Option A+, with two transports on the existing harnesses.**
+- **1a (Claude Code → Anthropic-compatible) first.** One mechanism covers DeepSeek reviewers and
+  debaters plus local Qwen, it needs only environment variables, and **Probe P5** shows clean
+  pass-through.
+- **1b (Codex → DeepSeek Responses) qualified in parallel** as the DeepSeek writer route, because
+  it keeps Codex's sandbox and uses the endpoint DeepSeek tuned for Codex. Ship it only if the
+  pinned Codex accepts Duo-generated provider settings on both initial and resumed turns.
+
+Both need the same per-seat environment isolation (H.1), the same capability registry and the
+same run-start compatibility checks.
+
+**Correction to the Codex study.** It suggests controlling claw's non-Claude-model proxy behavior
+"with an explicit base URL". **Probe P4** shows the opposite: passing an explicit `baseUrl` is
+exactly what makes claw 7.6.0 pass `--model opus` and rewrite the URL to `<baseUrl>/real/<model>`.
+The endpoint must reach Claude Code through the seat's environment, with `baseUrl` left unset, and
+Duo must refuse the spawn if claw rewrote the model anyway (H.2).
+
+Beyond the two transports, add direct inference only for tool-less roles, with
 the Narrator as the first consumer. Add Option B's adapter seam and one more harness only if
 desktop benchmarks show a Qwen-tuned harness clearly beats Claude Code on the same local model.
 This keeps permissions where they are enforced today, by the harness and its sandbox. It reuses
@@ -298,6 +367,30 @@ unless marked otherwise. Prices change; re-check them.
 | **Qwen3-Coder-30B-A3B / Qwen3-Coder-Next (80B-A3B, 262 K ctx) / 480B-A35B** | 2025-2026 | Self-host / providers | 30B-A3B Q4 ≈ 18-19 GB (**estimate**). Next Q4 ≈ 45-50 GB (**estimate**), so it needs ≥ 64 GB RAM. | Official cards (via search index). |
 | **Anthropic Claude / OpenAI Codex models** (current) | As today | Vendor subscription through the CLIs | Baseline. | Repo + end-to-end by users. |
 
+**DeepSeek operational details (added in revision 2):**
+- **Concurrency.** Limits are per account, regardless of API key: **2,500** concurrent requests for
+  `deepseek-flash` and **500** for `deepseek-v4-pro`. A request counts from send until the
+  response finishes, and exceeding the limit returns **429** (official docs:
+  [Rate Limit & Isolation](https://api-docs.deepseek.com/quick_start/rate_limit/), via search
+  index). So a 429 from DeepSeek means *throttling*, not an exhausted plan. Duo's current
+  `quota` class (`errors.ts:28`) would wrongly remove the seat.
+- **Error codes.** **402** = insufficient balance: top up, do not retry. 408, 429 and 5xx: wait and
+  retry (official docs: [Error Codes](https://api-docs.deepseek.com/quick_start/error_codes/), via
+  search index). This confirms the classes proposed in F.6.
+- **V4 Pro status.** The Codex study reads the pricing page as listing `deepseek-v4-pro` as current
+  (V4-Pro-0813), with the same prices as D.1. That fits the 2026-09-10 changelog entry saying Pro
+  service continues. Treat Pro as available, but record the requested *and* resolved model on
+  every turn.
+- **Not corroborated here** (*Codex study*, from DeepSeek's pricing, Responses and thinking-mode
+  pages):
+  - Peak hours are 01:00-04:00 and 06:00-10:00 UTC on weekdays.
+  - Responses streams end with `response.completed`, `response.incomplete` or `response.failed`
+    rather than `[DONE]`.
+  - With Chat Completions plus `tools`, earlier `reasoning_content` must be replayed.
+  - Strict tool schemas require every property and `additionalProperties: false`.
+
+  The only one that changes this plan is the first: off-peak pricing can halve cost for long runs.
+
 ### D.2 Harness / endpoint combinations
 
 The "Into Duo today" column describes what works without new code.
@@ -308,6 +401,7 @@ The "Into Duo today" column describes what works without new code.
 | Codex + ChatGPT (current) | Yes | Read-only, workspace-write, full sandbox | `--output-schema` | `exec resume` | Full (`parseCodexStream`) | Cumulative tokens → credits | Repo, fake-tested, real use |
 | **Claude Code + DeepSeek `/anthropic`** | Not safely (B8/B9). Milestone H. | **Same harness enforcement** (it is local) | Through Claude Code; DeepSeek compliance **unverified** | Claude Code resume (local transcript); provider-side caching automatic per DeepSeek docs | Same stream format (expected), but `rate_limit_event` and `total_cost_usd` semantics are **unverified** | Tokens yes; USD untrustworthy → mark "unpriced" or use a dated rate card | Official docs (DeepSeek integration page); **Probe P5** for plumbing |
 | **Claude Code + Ollama ≥ 0.14 / llama-server `/v1/messages` (local Qwen)** | Not safely. Milestone H covers it. | Same harness enforcement | Through Claude Code; depends on the model's tool calls (`--jinja` for llama.cpp) | As above | As above. Thinking blocks may be dropped by llama.cpp conversion (issue #20090). Context is set server-side (`OLLAMA_CONTEXT_LENGTH`/`-c`), and Ollama may truncate silently (third-party report) | Tokens; cost "none (local)" | Official docs (Ollama blog, llama.cpp HF blog); local reliability **unverified** |
+| **Codex + DeepSeek Responses** (`https://api.deepseek.com/`, `wire_api = "responses"`) | Not yet (B17, B24). Phase 1b. | **Codex OS sandbox retained**, which is the main advantage for writers | `--output-schema` through Codex; DeepSeek compliance **unverified** | `exec resume` with Codex's local history; the API itself is stateless (official docs) | Same Codex stream (expected; capture a fixture) | Tokens yes; must be API USD, never plan credits | Official docs (DeepSeek Codex guide, changelog 2026-08-13); pinned-CLI acceptance of Duo-generated config **unverified** |
 | Codex + `--oss` (Ollama / LM Studio) | No (B17) | Codex sandbox retained | `--output-schema` (model-dependent) | `exec resume` | Same Codex stream | Credits meaningless → "none" | Official docs (Codex CLI reference); Responses API support by local servers **unverified** |
 | OpenCode (claw `opencode` engine) | No (B3, B6, B7) | Read-only via the injected `clawo-readonly` agent (**Probe P3d**); writers: permission rules only, **no OS sandbox found** | None from claw (**Probe P3b**) | `--session` (**Probe P3e**) | New parser needed; undocumented schema | `step_finish` tokens per claw | Repo (claw) + Probe; opencode-ai 1.19.5 (npm, 2026-10-28) |
 | Qwen Code (`qwen`, 0.26.6, npm 2026-11-02) | No (no claw engine; would be `custom`) | Approval modes plan/default/auto-edit/auto/yolo; sandbox **off by default** | `--json-schema` (headless only, synthetic `structured_output` tool that ends the session) | **Unverified** for headless | `--output-format stream-json` (similar message types to Claude Code; equivalence **unverified**) | Unverified | Official docs (via search index) + bundle inspection of the npm package |
@@ -322,7 +416,7 @@ recorded end-to-end run.
 
 | Role | Requirements (derived from Duo's code) | Suitable now | Conditional (after verification) | Not suitable |
 |---|---|---|---|---|
-| **Full agent / writer** (pair writer, write roles) | File edit + shell **inside an OS sandbox** (`writerSeatAccess`); reliable multi-step tool use; `PAIR_WRITER_SCHEMA` | Claude/Anthropic, Codex/ChatGPT | DeepSeek Flash/Pro through Claude Code (Claude sandbox settings apply locally); Qwen3.6-35B-A3B local only after the fixture test passes reliably | OpenCode/Qwen Code writers until sandboxing is solved; any direct API; small Qwen |
+| **Full agent / writer** (pair writer, write roles) | File edit + shell **inside an OS sandbox** (`writerSeatAccess`); reliable multi-step tool use; `PAIR_WRITER_SCHEMA` | Claude/Anthropic, Codex/ChatGPT | DeepSeek Flash/Pro **through Codex (preferred: OS sandbox, endpoint tuned for Codex)** or through Claude Code (Claude sandbox settings apply locally); Qwen3.6-35B-A3B local only after the fixture test passes reliably | OpenCode/Qwen Code writers until sandboxing is solved; any direct API; small Qwen |
 | **Reviewer** (pair reviewer, Review participants) | Read-only repo tools, citations, `REVIEW_SCHEMA`/`PAIR_REVIEW_SCHEMA` | Current two | DeepSeek via Claude Code (best first candidate); local Qwen3.6-35B-A3B | Direct APIs (no repo access); small Qwen |
 | **Technical debate participant** | Read-only tools, `DEBATE_SCHEMA` (claims, stances), up to 8 claims, final ledger review with complete stances (strict: incomplete → fail) | Current two | DeepSeek via Claude Code; local 35B-A3B (latency per round is the concern) | Direct APIs; small models (strict ledger review likely to fail; unverified) |
 | **Coordinator / chair / summarizer** | Reads the routed record. Optional read-only fact checks. No schema by default (`builtins.ts` chair role) | Current two | DeepSeek via Claude Code; direct DeepSeek (no repo checks); local 35B-A3B | Small Qwen for faithful synthesis of long records (unverified) |
@@ -369,6 +463,12 @@ desktop GPU. All sizes and speeds are labeled as estimates, apart from the cited
   so **32 K tokens ≈ 4.5 GB** and q8_0 KV ≈ 2.3 GB (**illustrative, not a specific Qwen model**).
   Qwen3.5/3.6 may use hybrid linear attention with smaller KV (**unverified**). Read the real
   numbers from llama.cpp's load log.
+- **A concrete model example** (*Codex study*): Qwen2.5-Coder-7B has 28 layers, 4 KV heads and head
+  dimension 128, read from its `config.json` (huggingface.co is blocked in this session, so not
+  re-read here). The arithmetic checks out: 2·28·4·128·2 = 57,344 B ≈ **56 KiB per token** at
+  fp16, so 8 K ≈ 448 MiB, 32 K ≈ 1.75 GiB and 128 K ≈ 7 GiB, before working buffers. Its small KV
+  footprint makes **Qwen2.5-Coder-7B a useful stable local baseline** to compare against
+  Qwen3.5-9B (add it to E.3 step 2).
 - **The Claude Code harness adds a large fixed prompt:** system prompt plus tool definitions,
   re-sent each turn. Its token count is **unknown** (measure the first turn's `input_tokens`). On
   local hardware, prefill of that prefix sets the time to first token. llama.cpp prompt caching
@@ -408,7 +508,7 @@ Tests that need the desktop are marked **[desktop]**. Nothing here was run.
    CUDA. CachyOS/Arch package names need checking (for example `ollama-cuda`, `llama.cpp-cuda`).
    Check: `curl http://127.0.0.1:11434/api/version` (Ollama ≥ 0.14 for `/v1/messages`).
 2. **Raw throughput [desktop].**
-   - Run `llama-bench -m <gguf> -ngl 99 -fa 1 -p 512,4096,16384 -n 128` for Qwen3.5-4B, Qwen3.5-9B,
+   - Run `llama-bench -m <gguf> -ngl 99 -fa 1 -p 512,4096,16384 -n 128` for Qwen3.5-4B, Qwen2.5-Coder-7B (stable baseline), Qwen3.5-9B,
      Qwen3.6-35B-A3B (with `-ot ".ffn_.*_exps.=CPU"`, then tune `--n-cpu-moe`) and
      Qwen3-Coder-30B-A3B.
    - Record prefill tok/s, decode tok/s and peak VRAM. Repeat with q8_0 KV (`-ctk q8_0 -ctv q8_0`).
@@ -434,10 +534,11 @@ Tests that need the desktop are marked **[desktop]**. Nothing here was run.
      `average([])` returns `0` instead of `0.0`, and `median` is wrong for even-length lists.
    - Task: "fix both, add pytest tests, run them". Five runs per combination:
      Claude Code + local 35B-A3B; Qwen Code + same model (`--openai-base-url`); OpenCode + same
-     model; Claude Code + DeepSeek Flash (paid, optional).
+     model; Claude Code + DeepSeek Flash; Codex + DeepSeek Flash through the Responses route
+     (both paid and optional; the Codex one only after phase 1b's config gate).
    - Record pass/fail of `python -m pytest`, wall time, tool errors, turns, and whether any write
      escaped the folder.
-7. **Duo end-to-end [desktop, after milestone H].**
+7. **Duo end-to-end [desktop, after milestone H.2].**
    - `duo review -s 'claude:<local-model>+provider=local-llama' -s codex:gpt-6-sol@medium --base HEAD~1 -C <fixture repo>`
      and `duo ask --no-project -s 'claude:<model>+provider=…' "…"`.
    - Inspect `run.json` (provider host recorded, no key), taps, the report and the error hints.
@@ -461,7 +562,8 @@ tool_errors, notes`.
 | Concern | Owner after the change | Notes |
 |---|---|---|
 | **Provider auth** | Provider profile names an **env var** (`credentialEnv`), never a value. Duo reads it at spawn and injects it into **that seat's** process only. | Nothing in `config.json`, run records, taps or the GUI state. `doctor` reports set/unset only. No new keychain dependency. |
-| **Model identity** | `seat.model` plus `seat.provider` (default `vendor`). Recorded in `SeatRecord`. | Peer label "DeepSeek deepseek-flash (via Claude Code)". |
+| **Child environment** | One pure builder (H.1): inherited env → omit listed routing/auth variables → apply the seat's overlay. Keyed per Codex route and per Claude session id. It never mutates `process.env`. | Prerequisite for mixed seats (B19). The key still reaches the harness process and any shell it runs, so it is not a vault; document that residual boundary. Duo's own launch token never enters a provider overlay (B20). |
+| **Model identity** | `seat.model` plus `seat.provider` (default `vendor`). Recorded in `SeatRecord` with the requested *and* resolved model. | Peer label "DeepSeek deepseek-flash (via Claude Code)" or "(via Codex)". |
 | **Harness** | `seat.engine`, kept as is (`claude` = Claude Code, `codex` = Codex CLI). | No rename, so saved templates and specs stay valid. |
 | **Direct inference** | Separate `DirectClient` (OpenAI-chat-compatible, Node `fetch`) used **only** by tool-less features (Narrator, later helper roles). | Never a coding seat. |
 | **Capabilities** | Static registry per (harness, provider kind), refined by a profile's dated user assertions and optional probes. | Evidence levels as in this document. |
@@ -496,7 +598,7 @@ tool_errors, notes`.
 
 ```ts
 // src/providers.ts (new, browser-safe types; validation in config.ts)
-export type ProviderKind = 'vendor' | 'anthropic-messages' /* phase 1 */ | 'openai-responses' /* phase 5 */ | 'openai-chat' /* direct only */;
+export type ProviderKind = 'vendor' | 'anthropic-messages' /* phase 1 */ | 'openai-responses' /* phase 1b (DeepSeek), phase 5 (local) */ | 'openai-chat' /* direct only */;
 
 export interface ProviderProfile {
   id: string;                    // ^[a-z][a-z0-9-]{0,31}$ ; 'vendor' reserved
@@ -504,7 +606,7 @@ export interface ProviderProfile {
   kind: ProviderKind;
   baseUrl: string;               // https://… or http://127.0.0.1|localhost|[::1] only
   credentialEnv?: string;        // NAME of an env var, ^[A-Z_][A-Z0-9_]*$ ; never a value
-  harnesses: ('claude' | 'codex')[]; // which harness may use it ('claude' only in phase 1)
+  harnesses: ('claude' | 'codex')[]; // 'claude' for anthropic-messages (phase 1), 'codex' for openai-responses (phase 1b)
   models?: string[];             // offered in the picker; any model allowed if absent
   backgroundModel?: string;      // maps Claude Code's small/background model calls
   pricing?: { asOf: string; source: string; perMTok: { input: number; cachedInput?: number; output: number }; currency: 'USD' };
@@ -594,6 +696,10 @@ export interface CostRecord { amount?: number; unit: 'usd' | 'codex-credits' | '
   - Local providers get `{unit:'none', source:'local'}`.
   - The Claude quota cache (`engine.ts:312`, `chats.ts:426`) is written only for `provider ===
     'vendor'`.
+- **Terminal status** (phase 0). A turn is `done` only if the CLI reported completion **and** there
+  is no unrecovered error. Chats currently show `done` when any text arrived (`chats.ts:453`). With
+  partial text plus an error, show `error`/`partial` and keep the text. Runs already follow this
+  rule (`engine.ts:323`).
 - **Errors** (phase 1). New classes:
   - `unreachable` (`ECONNREFUSED`, `ENOTFOUND`, "connection refused"): fatal for the seat. Hint:
     "Start the local server or check the provider URL".
@@ -677,24 +783,56 @@ supporting functionality. It is off by default.
 Every phase keeps `npm run check` green on Linux, macOS and Windows and the 13 parity snapshots
 unchanged for vendor seats.
 
-### Phase 0: Make the current endpoint explicit (guardrail)
+### Phase 0: Isolation primitive, guardrails and hygiene (milestone H.1 plus focused follow-ups)
 
-- **Objective:** close B9 without breaking intentional gateway users.
+- **Objective:**
+  - Give every seat a deliberately constructed child environment (B19).
+  - Make an inherited Claude endpoint visible (B9).
+  - Fix the two existing correctness and security issues before new backends depend on them
+    (B20, B21).
+  - Stop health checks from spending money silently (B23).
+  - Ship these as separate small PRs, H.1 first.
 - **Code areas:**
-  - `src/env.ts`: detect inherited `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`/non-`sk-ant`
-    `ANTHROPIC_API_KEY`.
-  - `src/protocols/common.ts:113-122`: record `versions.claudeEndpoint` host.
-  - `src/doctor.ts`: warn.
-  - `src/server/main.ts` `state()`: expose for a GUI banner.
+  - **H.1:** `src/env.ts` (pure `childEnv()` builder), `src/hooks.ts` (`CodexRoute.unsetEnv`, a
+    per-Claude-session overlay keyed like `claudeSinks`), new tests. See H.1.
+  - **Endpoint visibility:** `src/env.ts` detects an inherited `ANTHROPIC_BASE_URL`,
+    `ANTHROPIC_AUTH_TOKEN` or non-`sk-ant` `ANTHROPIC_API_KEY`;
+    `src/protocols/common.ts:113-122` records `versions.claudeEndpoint` (host only); `doctor.ts`
+    warns; `server/main.ts` `state()` exposes it for a GUI banner.
+  - **Token hygiene:** `ChatManager.mcpConfig()` (`chats.ts:231-245`) writes its file with mode
+    `0600`, and `close()` removes all `gui/mcp/*.json`. Prefer an approval-only token scoped to
+    the permission routes over the full launch token. Correct `SECURITY.md:8` either way.
+  - **Turn status:** `chats.ts` `endTurn()` (`:452-453`) adds a `partial` status for "text plus
+    error"; GUI `Chat.tsx` shows it.
+  - **Health checks:** `doctor.ts` and `quota-refresh.ts` label their live steps "sends one small
+    paid/plan request". The GUI asks before running them (wording only; behavior already needs a
+    click).
 - **Dependencies:** none.
-- **Difficulty:** low.
-- **Regression risk:** low. It only detects and records; it does not strip.
-- **Tests:** env with `ANTHROPIC_BASE_URL` → doctor warn and run.json host recorded; no key value
-  in run dir; parity unchanged.
-- **Definition of done:** a run under an inherited endpoint shows the host in `run.json`,
-  `duo doctor` and the GUI; tests pass on all three OSes.
+- **Difficulty:** low each.
+- **Regression risk:**
+  - Low for detection and labels.
+  - Moderate for the child environment, because env precedence affects binary resolution,
+    `DUO_DEPTH` and managed-Codex variables. H.1 keeps old routes byte-identical.
+  - Low-moderate for chat status, because GUI states change.
+- **Tests:**
+  - H.1 tests (below).
+  - Env with `ANTHROPIC_BASE_URL` → doctor warning and host recorded in `run.json`, with no key
+    value in the run dir.
+  - The MCP file is created `0600` on POSIX and removed by `close()`.
+  - The launch token is absent from `DUO_HOME` after shutdown.
+  - A fake Claude turn emitting text then `is_error: true` ends as `partial`, not `done`.
+  - Parity snapshots unchanged.
+- **Definition of done:**
+  - Two concurrent fake seats with different overlays and omissions cannot see each other's
+    synthetic variables.
+  - The parent environment is untouched.
+  - An inherited endpoint is visible in `run.json`, `duo doctor` and the GUI.
+  - No launch token remains on disk after a clean shutdown.
+  - `SECURITY.md` matches behavior.
+  - Partial-failure chats are not shown as done.
+  - All tests pass on the three CI OSes.
 
-### Phase 1: Provider profiles for Claude Code seats (milestone H, then hardening)
+### Phase 1: Provider profiles for Claude Code seats (milestone H.2, then hardening)
 
 - **Objective:** DeepSeek cloud and local Anthropic-compatible servers as Claude Code seats, with
   correct attribution, no quota or cost misattribution, and classified errors.
@@ -705,10 +843,12 @@ unchanged for vendor seats.
     (`seatPeerName` for provider seats only), `src/doctor.ts`, README, CHANGELOG.
   - Hardening: a captured real stream fixture (`test/fixtures/claude-deepseek-stream.jsonl`)
     once a user records one.
-- **Dependencies:** none. User credentials only for optional manual verification.
+- **Dependencies:** phase 0's child environment (H.1). User credentials only for optional manual
+  verification.
 - **Difficulty:** low-medium.
 - **Regression risk:** low (env and argv for vendor seats byte-identical; parity tests).
-- **Tests:** see H, plus error-class tests for the new classes.
+- **Tests:** see H.2, plus error-class tests for the new classes (including DeepSeek `402` →
+  billing and DeepSeek `429` → `rate_limited`, not plan `quota`).
 - **Definition of done:**
   - `claude:<model>+provider=<id>` works in `duo ask/review/debate/pair/template run` and GUI
     chats/runs started with that spec;
@@ -717,6 +857,55 @@ unchanged for vendor seats.
   - offline server gives `unreachable` with a hint and no format retry;
   - one manual run each against DeepSeek and a local server documented in the PR, as
     CONTRIBUTING asks: "which models you tried".
+
+### Phase 1b (parallel): Codex profile for DeepSeek's Responses API
+
+- **Objective:** a DeepSeek seat inside Codex's OS sandbox, the preferred DeepSeek *writer* route.
+  Start read-only (reviewer, debater). Promote it to writer only after the writer gates in
+  phase 6's test list pass on this profile.
+- **Code areas:**
+  - The Codex branch of `src/engine.ts` (`:173-195`): Duo-generated trusted overrides
+    `model_provider="<id>"`, `model_providers.<id>.base_url`,
+    `model_providers.<id>.wire_api="responses"`, `model_providers.<id>.env_key="<ENV NAME>"` and a
+    model catalog path. All are restated on `exec resume` alongside the sandbox. They are passed
+    through `codexOverrides`-style arguments, never through user `cfg:`, which `CFG_DENY` (`seats.ts:32-37`)
+    keeps refusing.
+  - A Duo-written catalog file under `CACHE_DIR`, from the profile's model metadata, replacing
+    DeepSeek's shared-config setup script and its `experimental_bearer_token`.
+  - `src/seats.ts` (`+provider=` allowed on Codex seats whose profile kind is `openai-responses`).
+  - `src/pricing.ts` and `engine.ts:338`: no plan credits for provider seats; API USD from a
+    dated rate card or "unpriced".
+  - `src/quota.ts`: provider runs do not touch the plan quota.
+  - `src/config.ts:115`: the Codex catalog for the plan does not list provider models.
+  - `src/errors.ts`: DeepSeek 402/429 classes.
+  - The child environment from H.1, which omits `OPENAI_API_KEY` and plan-routing variables and
+    adds the DeepSeek key variable.
+- **Dependencies:**
+  - Phase 0.
+  - **Gate:** a recorded check that pinned Codex 0.159.0 accepts these `-c` provider keys and the
+    catalog path with `--ignore-user-config`, on both `exec` and `exec resume`. This can be done in
+    Codex Cloud with `codex exec --help` and a fake endpoint for argv acceptance. Real acceptance
+    needs one capped live call with the user's key.
+  - DeepSeek's catalog metadata states a minimum client of 0.144.0 (*Codex study*), which the pin
+    satisfies.
+- **Difficulty:** medium.
+- **Regression risk:** medium (Codex argv/env), guarded by `units.test.ts` and `engine.test.ts`.
+- **Tests:**
+  - The fake Codex records provider overrides on initial and resumed calls, with **no literal key
+    in argv** (key name only).
+  - The sandbox, `--ignore-rules` and `--ignore-user-config` are unchanged.
+  - A ChatGPT-plan Codex seat and a DeepSeek Codex seat in the same run cannot cross-route (env
+    markers).
+  - Provider turns show USD/unpriced, never credits.
+  - The quota cache is unchanged.
+  - Error classes for 402/429/503.
+  - Vendor Codex argv is byte-identical (snapshot).
+- **Definition of done:**
+  - A pinned-CLI acceptance record exists.
+  - `codex:deepseek-flash@high+provider=deepseek` runs Review and Debate in fake tests.
+  - At least one documented live read-only run (model, version, date) shows valid schemas,
+    citations and a two-turn resume.
+  - If the gate fails, the phase is dropped and documented; DeepSeek stays on phase 1's route.
 
 ### Phase 2: Capability registry, run-start checks, template and maker support, picker
 
@@ -745,11 +934,14 @@ unchanged for vendor seats.
   local models and run; a writer role on a backend lacking `osSandbox` is refused with a precise
   message; every shipped template is still recreatable from a new method.
 
-### Phase 3: Usage, cost and quota semantics; setup check
+### Phase 3: Usage, cost and quota semantics; setup check; lazy CLI resolution
 
-- **Objective:** honest accounting per provider.
-- **Code areas:** `src/store.ts` (`CostRecord`), `src/engine.ts:314-338`, `src/server/chats.ts:430-451`, `src/render.ts` (usage section, turn line), `src/protocols/common.ts:258-285` (totals by unit), `gui/src/Run.tsx`/`Chat.tsx` (labels), `src/doctor.ts` (reachability without paid calls).
-- **Dependencies:** phase 1.
+- **Objective:** honest accounting per provider, and an app that starts with only the CLIs the
+  user's seats need (B22).
+- **Code areas:** `src/store.ts` (`CostRecord`), `src/engine.ts:314-338`, `src/server/chats.ts:430-451`, `src/render.ts` (usage section, turn line), `src/protocols/common.ts:258-285` (totals by unit), `gui/src/Run.tsx`/`Chat.tsx` (labels), `src/doctor.ts` (reachability without paid calls), `src/server/main.ts:45` and
+  `src/protocols/common.ts:103` (resolve a CLI only when a seat needs it, report the missing one
+  as an unavailable backend instead of failing startup).
+- **Dependencies:** phase 1 (and 1b for Codex provider seats).
 - **Difficulty:** low-medium.
 - **Regression risk:** medium (report snapshots). Update only for provider seats.
 - **Tests:**
@@ -759,7 +951,8 @@ unchanged for vendor seats.
   - local providers show tokens only;
   - Claude-plan quota is unchanged by provider runs.
 - **Definition of done:** reports and GUI never present fabricated USD; the quota bar is unaffected
-  by non-vendor seats.
+  by non-vendor seats; the app starts and runs provider-only seats with one of the two CLIs absent
+  (fake test with `DUO_CLAUDE_BIN` pointing at a missing path).
 
 ### Phase 4: Narrator (deterministic first, then optional local model)
 
@@ -784,7 +977,8 @@ unchanged for vendor seats.
 - **Code areas:** `src/engine.ts` Codex branch (Duo-owned `-c model_provider=…`/`--oss`
   `--local-provider`, never from `cfg:`), `src/seats.ts` (provider on Codex seats),
   `src/pricing.ts` (no credits for non-vendor), `src/config.ts:115` (catalog not applicable).
-- **Dependencies:** phase 1-3; desktop verification that Ollama/LM Studio serve the Responses
+- **Dependencies:** phase 1b (it reuses the Codex provider plumbing; only the endpoint and
+  locality differ), phases 2-3, and desktop verification that Ollama/LM Studio serve the Responses
   API that Codex requires (Codex config reference: `wire_api = "responses"` only).
 - **Difficulty:** medium.
 - **Regression risk:** medium (Codex argv, guarded by `units.test.ts`/`engine.test.ts`).
@@ -819,13 +1013,83 @@ unchanged for vendor seats.
 
 ---
 
-## H. First implementation milestone (one Codex Cloud PR)
+## H. First implementation milestone (one Codex Cloud PR), then the next
 
-**Title:** *Seat provider profiles for Claude Code seats (Anthropic-compatible endpoints), fake-tested*
+This revision merges the Codex study's milestone (environment omission for Codex routes) with
+mine (provider profiles for Claude seats). **H.1** is the shared prerequisite, small enough for
+one Codex Cloud PR and invisible to users. **H.2** is the first user-visible step, built on H.1.
 
-**Scope:** engine and CLI path, plus chats and runs that receive such a spec. No GUI editor, no
-template-selector change, no Codex providers, no new dependencies, no network calls in tests.
-Existing vendor seats must spawn with **identical argv and environment**.
+### H.1 Shared per-seat child environment for Codex and Claude spawn routes
+
+**Scope:** an internal primitive only. No seat or template syntax, provider definitions, key
+handling, pricing, prompts or new dependencies, and no network calls. Routes that do not use the
+new fields must spawn with **identical argv and environment**.
+
+**Exact changes**
+
+1. `src/env.ts`: add a pure builder:
+
+   ```ts
+   export function childEnv(inherited: NodeJS.ProcessEnv, omit: readonly string[] = [], overlay: Record<string, string> = {}): NodeJS.ProcessEnv
+   ```
+
+   - Precedence is explicit: copy `inherited` → delete each name in `omit` (missing names are
+     harmless) → apply `overlay`.
+   - Never mutate the arguments or `process.env`.
+   - Throw if `omit` contains `DUO_DEPTH` (`DEPTH_VAR`), or if `overlay` sets it to anything other
+     than `'1'`. Seats must never lose the recursion guard.
+2. `src/hooks.ts`
+   - `CodexRoute` gains an optional `unsetEnv?: readonly string[]`.
+   - In the Codex branch of `install()` (`:122-140`), build
+     `env: childEnv(options.env ?? process.env, codex.unsetEnv, codex.bin.env)`.
+   - Add `claudeEnv(sessionId, spec | undefined)` with `spec = { unset?: readonly string[]; overlay?: Record<string,string> }`,
+     stored in a map keyed by Claude session id, like `claudeSinks` (`:36`, `:60-63`).
+   - In the Claude branch (`:141-151`), when an entry exists for the session parsed by
+     `claudeSessionOf(args)`, build
+     `env: childEnv(options.env ?? process.env, spec.unset, { ...claude.env, ...spec.overlay })`.
+   - Without an entry, keep today's exact merge.
+   - Export `claudeEnv` and clear entries wherever `claudeSink(…, undefined)` is called
+     (`engine.ts:369`, `:382`; `chats.ts:222`).
+   - Nothing calls the new fields yet, apart from tests.
+3. `test/fakes/codex.mjs` and `test/fakes/claude.mjs`: in the existing `record()` entry, add
+   `markers` with the values of variables matching `^DUO_TEST_MARKER_` only. Also add `presence`
+   flags (booleans) for `OPENAI_API_KEY`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` and
+   `ANTHROPIC_API_KEY`. Never record other values.
+4. New `test/child-env.test.ts`:
+   - precedence and omission;
+   - inputs are not mutated;
+   - `DUO_DEPTH` cannot be omitted or changed;
+   - overlay wins over inherited values.
+5. New `test/hooks-env.test.ts`, using real claw sessions against the fakes, as `engine.test.ts`
+   does:
+   - Two Codex routes run concurrently with different `DUO_TEST_MARKER_*` overlays, and one omits
+     `OPENAI_API_KEY` (set in the parent to a synthetic value). Each fake sees only its own marker,
+     and only the omitting route lacks the key. The same holds on the resumed (`exec resume`)
+     turn.
+   - Long stdin prompts (150 KB), `--ignore-rules` and the sandbox flags are unchanged.
+   - Two Claude sessions in one manager, one registered with `claudeEnv`: only that process sees
+     its overlay and omissions.
+   - `process.env` is identical before and after.
+   - A route without the new fields records exactly the same argv and `presence` as before (assert
+     against a run with the feature unused).
+6. Run `npm run check`. In the PR, state that no provider, model or account was called, and that
+   this proves process configuration only.
+
+**Acceptance:**
+- All 114 baseline tests pass, plus the new ones.
+- Parity snapshots are unchanged.
+- There is no new `process.env` mutation (the existing `CODEX_BIN` handoff stays as it is).
+- Concurrent fake seats cannot read each other's synthetic configuration.
+
+**Excluded:** applying a scrub policy to existing users. Which variables to omit by default is a
+reviewed decision in H.2 and phase 1b.
+
+### H.2 Next PR: seat provider profiles for Claude Code seats (Anthropic-compatible endpoints)
+
+**Scope:** engine and CLI path, plus chats and runs that receive such a spec. It builds on H.1.
+No GUI editor, no template-selector change, no Codex providers (phase 1b), no new dependencies,
+and no network calls in tests. Existing vendor seats must spawn with **identical argv and
+environment**.
 
 **Exact changes**
 
@@ -854,16 +1118,17 @@ Existing vendor seats must spawn with **identical argv and environment**.
      when `backgroundModel` is set. The exact Claude Code variable names must be checked against
      <https://code.claude.com/docs/en/env-vars> before merging, and the PR must name the doc date.
    - `isLoopback(url)` and `providerRecord(profile)` → `{ id, host, locality }`.
-4. `src/hooks.ts`
-   - New `claudeEnv(sessionId, env | undefined, expect?: { model: string })`: a map keyed by
-     Claude session id, like `claudeSinks`.
-   - In the spawn hook's Claude branch (`hooks.ts:141-150`), when an entry exists for the session:
+4. `src/hooks.ts` (on top of H.1's `claudeEnv`)
+   - Extend the H.1 spec with `expect?: { model: string }`.
+   - In the spawn hook's Claude branch (`hooks.ts:141-151`), when an entry with `expect` exists for
+     the session:
      - **Guard:** if argv `--model` ≠ `expect.model`, or the inherited `ANTHROPIC_BASE_URL`
        contains `/real/`, do not spawn the CLI. Return a process that exits 1 with stderr
        "duo: refused to start provider seat: claw-orchestrator changed the model/endpoint
        (OpenClaw gateway detected?)". This becomes a turn error, which the fatal rule must match.
-     - Otherwise merge env as `{ ...options.env, ...bin.env, ...providerEnv }` and delete
-       `ANTHROPIC_API_KEY` so the documented gateway token takes precedence unambiguously.
+     - Otherwise use H.1's `childEnv()`. Pass `unset` = `ANTHROPIC_API_KEY` plus any inherited
+       `ANTHROPIC_*` routing variables, so the documented gateway token takes precedence
+       unambiguously. Pass `overlay` = `providerEnv(...)`.
    - No behavior change when there is no entry.
 5. `src/engine.ts` `openSeat()` Claude branch (`:196-224`)
    - If `seat.provider`, resolve the profile, call `claudeEnv(sessionId, providerEnv(...), { model: seat.model })`.
@@ -952,10 +1217,21 @@ Confirmed by repository reading or the probe:
   model and env through unchanged otherwise (**Probe P4/P5**).
 - Duo classifies offline, billing and context errors as `other` (**Probe P6**).
 - An inherited `ANTHROPIC_BASE_URL` reaches Claude seats today (Repo + **Probe P5**).
+- Re-verified from the Codex study (Repo, A.5):
+  - the launch token is written to disk despite `SECURITY.md:8`;
+  - chat turns with partial text and an error show as `done`;
+  - `doctor --live` and quota refresh send real prompts;
+  - both CLIs are resolved at startup;
+  - the pair check runs on the host with `shell: true` and a direct-child-only kill;
+  - Continue covers Debate, Ask and Pair only.
+- Per-seat environment is additive only. No seat can drop an inherited variable today (B19).
 
 ### I.2 Supported by official docs, untested here
 
 - DeepSeek's Anthropic endpoint and Claude Code integration; its model naming, prices and context.
+- DeepSeek's Codex integration: a Responses API "specifically adapted for Codex" (2026-08-13),
+  `wire_api = "responses"`, a model catalog, a stateless API, and web search with V4 Pro only.
+- DeepSeek per-account concurrency (2,500 Flash / 500 Pro), and 402 vs 429 semantics.
 - Ollama ≥ 0.14 and llama.cpp `/v1/messages`.
 - Qwen Code `--json-schema`, stream-json and approval modes.
 - Codex `--oss` and its `responses`-only custom wire API.
@@ -963,6 +1239,16 @@ Confirmed by repository reading or the probe:
 
 ### I.3 Hypotheses that need evidence
 
+- The pinned Codex 0.159.0 accepts Duo-generated `model_provider`/`model_providers.<id>.*` and a
+  catalog path via `-c`, under `--ignore-user-config`, on both `exec` and `exec resume` (B24).
+  This is the phase 1b gate.
+- `exec resume` against DeepSeek's stateless Responses API replays enough history for multi-turn
+  Debate and Pair (no `previous_response_id`).
+- DeepSeek through Codex (an endpoint tuned for Codex) is more reliable for writers than DeepSeek
+  through Claude Code. That needs E.3 step 6 with both routes.
+- *Codex study* items not corroborated here: DeepSeek peak-hour windows, Responses end-of-stream
+  events, `reasoning_content` replay rules, strict-schema constraints, and the minimum Codex
+  version in DeepSeek's catalog.
 - Claude Code's `--json-schema` produces schema-valid `structured_output` reliably on DeepSeek Flash
   and on local Qwen3.6-35B-A3B (E.3 step 5).
 - Claude Code's stream-json events from a third-party endpoint match the fixtures Duo parses,
@@ -996,6 +1282,13 @@ Confirmed by repository reading or the probe:
 4. Should a Narrator ever be allowed to see thinking or reasoning text?
 5. Should phase 6 bundle a pinned harness (as Duo does for Codex) or rely on a user install with a
    version check?
+6. Which DeepSeek route ships first to users: 1a (Claude Code, simpler, covers local) or 1b
+   (Codex, sandboxed writer)? My recommendation is 1a for reviewers, 1b for writers if its gate
+   passes.
+7. The permission-bridge token: give it file mode `0600` plus cleanup, or replace it with an
+   approval-only scoped token? The second is safer; the first is smaller.
+8. Should a chat with partial text plus an error show a distinct `partial` status, or `error`
+   with the text kept?
 
 ### I.7 Risks
 
@@ -1026,6 +1319,14 @@ Confirmed by repository reading or the probe:
   so page dates could not be read and quoted figures may lag the live pages.
 - No GPU benchmark was run. Codex Cloud and this session cannot reach the desktop GPU. All
   throughput and memory figures marked *estimate* are arithmetic, not measurements.
+- **Cross-check (revision 2).** An independent Codex study of the same brief was compared with this
+  report.
+  - Every repository claim adopted from it was re-checked in source (A.5, B19-B24).
+  - DeepSeek's concurrency and error semantics were corroborated through DeepSeek's docs (search
+    index).
+  - Claims I could not corroborate (huggingface.co was also blocked) are labelled *Codex study*.
+  - That study is not in this repository, and the branch it names (`docs/model-agnostic-feasibility`)
+    was not on the remote at the time of writing.
 - No production file, dependency or test was changed. `npm run check` passed (typecheck + 114
   tests).
 
@@ -1040,7 +1341,10 @@ All accessed 2026-11-03. Publication or update dates are given where the source 
 
 **DeepSeek** (official; read via search index, page dates not visible)
 - Models & Pricing — <https://api-docs.deepseek.com/quick_start/pricing/>
-- Change Log — <https://api-docs.deepseek.com/updates/> (entries 2026-09-10, 2026-10-17)
+- Change Log — <https://api-docs.deepseek.com/updates/> (entries 2026-08-13 Responses/Codex, 2026-09-10, 2026-10-17)
+- Integrate with Codex — <https://api-docs.deepseek.com/quick_start/agent_integrations/codex/>; Using the Responses API — <https://api-docs.deepseek.com/guides/responses_api/>
+- Rate Limit & Isolation — <https://api-docs.deepseek.com/quick_start/rate_limit/>; Error Codes — <https://api-docs.deepseek.com/quick_start/error_codes/>
+- Cited via the Codex study only (not re-read here): Thinking Mode — <https://api-docs.deepseek.com/guides/thinking_mode>
 - News: V4 Preview (2026-04-24) <https://api-docs.deepseek.com/news/news260424/>; V4-Pro GA (2026-08-13) <https://api-docs.deepseek.com/news/news260813/>; V4.1-Flash (2026-09-10) <https://api-docs.deepseek.com/news/news260910/>; V4.1-Flash-1017 (2026-10-17) <https://api-docs.deepseek.com/news/news261017/>
 - Using the Anthropic API — <https://api-docs.deepseek.com/guides/anthropic_api/>; Messages API — <https://api-docs.deepseek.com/api/create-message/>; Integrate with Claude Code — <https://api-docs.deepseek.com/quick_start/agent_integrations/claude_code/>
 - Tool Calls — <https://api-docs.deepseek.com/guides/tool_calls/>; JSON Output — <https://api-docs.deepseek.com/guides/json_mode/>; Responses API — <https://api-docs.deepseek.com/guides/responses_api/>; List Models — <https://api-docs.deepseek.com/api/list-models/>
@@ -1048,6 +1352,7 @@ All accessed 2026-11-03. Publication or update dates are given where the source 
 - Third-party (older, conflicting prices; not relied on): <https://www.morphllm.com/deepseek-api>, <https://www.nxcode.io/resources/news/deepseek-api-pricing-complete-guide-2026>, <https://apidog.com/blog/deepseek-v4-api-pricing/>
 
 **Qwen**
+- Qwen2.5-Coder-7B-Instruct config — <https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct/raw/main/config.json> (values via the Codex study; huggingface.co blocked in this session)
 - Qwen3.6-35B-A3B — <https://huggingface.co/Qwen/Qwen3.6-35B-A3B> (weights 2026-04-16); blog <https://qwen.ai/blog?id=qwen3.6-35b-a3b>; Qwen3.6-27B blog <https://qwen.ai/blog?id=qwen3.6-27b> (2026-04-22)
 - Qwen3.5 collection — <https://huggingface.co/collections/Qwen/qwen35> (2026-02-24 / 2026-03-02)
 - Qwen3-Coder — <https://github.com/QwenLM/Qwen3-Coder>; <https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct>; <https://huggingface.co/Qwen/Qwen3-Coder-Next>
@@ -1063,3 +1368,6 @@ All accessed 2026-11-03. Publication or update dates are given where the source 
 
 **Hardware**
 - NVIDIA GeForce RTX 3080 family — <https://www.nvidia.com/en-us/geforce/graphics-cards/30-series/rtx-3080-3080ti/>
+
+**Cross-check source**
+- Independent Codex study, "Capability-aware coding backends for Duo: feasibility and implementation plan" (2026-11-03), supplied by the user as an upload; not in this repository.
