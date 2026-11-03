@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- The app engine no longer freezes while a slow CLI call runs: quota refresh, the setup and live sign-in checks, and **Update Claude Code** now run without blocking chats, runs and other requests. CLI versions are remembered until the binary changes instead of being asked on every app state call and run start.
+- Pair check commands: a timeout or **Stop** ends the whole process tree the check started (not only its shell), a background process left behind no longer keeps the run waiting, and checks still running end with Duo.
+- Deleting a chat while it is answering no longer brings it back after the turn ends; its stream trace is removed with it.
+- The Changes panel shows a working-tree diff larger than 4 MB truncated, instead of silently falling back to the staged diff.
+- Streaming chats re-render only the turn that changed; finished run turns no longer keep their live output in the window's memory.
+- The HTML export of a run is served with a script-free Content-Security-Policy.
+
 ## 0.3.0 — 2026-10-08
 
 - **Custom Templates are the universal foundation for every Duo method.** Pair, Debate, Review, Council and Ask are fully constructed as templates in the same system, and all five can be recreated from a new method in the visual maker.

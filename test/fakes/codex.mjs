@@ -31,7 +31,7 @@ if (mode === 'fatal') {
   out({ type: 'turn.failed', error: { message: 'model_not_found: the model does not exist' } });
   process.exit(1);
 }
-if (mode === 'slow') await new Promise((r) => setTimeout(r, 20_000));
+if (mode === 'slow') await new Promise((r) => setTimeout(r, Number(process.env.FAKE_CODEX_SLOW_MS ?? 20_000)));
 if (mode === 'reconnect') out({ type: 'error', message: 'Reconnecting... 1/5 (stream disconnected before completion: idle timeout waiting for websocket)' });
 
 out({ type: 'item.started', item: { id: 'cmd', type: 'command_execution', command: 'ls', aggregated_output: '', status: 'in_progress' } });

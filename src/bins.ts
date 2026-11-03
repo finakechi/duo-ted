@@ -3,8 +3,8 @@
  * sometimes Node plus a script (npm installs on Windows only provide .cmd wrappers, which cannot be
  * spawned without a shell).
  */
-import { execFileSync, spawnSync, type SpawnSyncOptions } from 'node:child_process';
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { execFileSync, spawn, spawnSync, type SpawnSyncOptions } from 'node:child_process';
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -124,10 +124,74 @@ export function runBin(bin: BinSpec, args: string[], opts: SpawnSyncOptions = {}
   return spawnSync(bin.command, [...bin.args, ...args], { windowsHide: true, ...opts, env: { ...process.env, ...bin.env, ...(opts.env ?? {}) } });
 }
 
-export function binVersion(bin: BinSpec): string {
+/**
+ * Run a CLI without blocking the event loop (the GUI engine streams every chat and run on it).
+ * Resolves with the same fields `runBin` returns; a timeout kills the process and sets `error`.
+ */
+export function runBinAsync(bin: BinSpec, args: string[], opts: { cwd?: string; input?: string; timeout?: number; env?: Record<string, string> } = {}): Promise<{ status: number | null; stdout: string; stderr: string; error?: Error }> {
+  return new Promise((resolve) => {
+    let stdout = '';
+    let stderr = '';
+    let error: Error | undefined;
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const done = (status: number | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ status, stdout, stderr, error });
+    };
+    let p: ReturnType<typeof spawn>;
+    try {
+      p = spawn(bin.command, [...bin.args, ...args], { cwd: opts.cwd, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, ...bin.env, ...(opts.env ?? {}) } });
+    } catch (e) {
+      error = e as Error;
+      done(null);
+      return;
+    }
+    if (opts.timeout) timer = setTimeout(() => {
+      error = new Error(`timed out after ${opts.timeout} ms`);
+      p.kill('SIGKILL');
+    }, opts.timeout);
+    // Keep the tail of very chatty output, like spawnSync's maxBuffer would.
+    const cap = (s: string) => (s.length > 16 * 1024 * 1024 ? s.slice(-8 * 1024 * 1024) : s);
+    p.stdout?.setEncoding('utf8').on('data', (d: string) => { stdout = cap(stdout + d); });
+    p.stderr?.setEncoding('utf8').on('data', (d: string) => { stderr = cap(stderr + d); });
+    p.stdin?.on('error', () => undefined);
+    p.stdin?.end(opts.input ?? '');
+    p.on('error', (e) => { error = e; done(null); });
+    p.on('close', (code) => done(code));
+  });
+}
+
+/** What identifies an installed CLI: an update replaces the file (or retargets the symlink), changing these. */
+function binStamp(bin: BinSpec): string | undefined {
   try {
-    return execFileSync(bin.command, [...bin.args, '--version'], { encoding: 'utf8', timeout: 30_000, windowsHide: true, env: { ...process.env, ...bin.env }, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    // Only files can be watched for changes; anything else is asked every time.
+    return [bin.command, ...bin.args].map((p) => {
+      const st = statSync(p);
+      return `${p}:${st.ino}:${st.size}:${st.mtimeMs}`;
+    }).join('|');
   } catch {
-    return 'unknown';
+    return undefined;
   }
+}
+
+const versions = new Map<string, { stamp: string; version: string }>();
+
+/** `<cli> --version`, remembered until the binary changes (the GUI asks for it on every state call and run). */
+export function binVersion(bin: BinSpec): string {
+  const key = [bin.command, ...bin.args].join('\0');
+  const stamp = binStamp(bin);
+  const known = versions.get(key);
+  if (stamp && known?.stamp === stamp) return known.version;
+  let version = 'unknown';
+  try {
+    version = execFileSync(bin.command, [...bin.args, '--version'], { encoding: 'utf8', timeout: 30_000, windowsHide: true, env: { ...process.env, ...bin.env }, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  } catch {
+    /* not runnable right now; ask again next time */
+  }
+  if (stamp && version !== 'unknown') versions.set(key, { stamp, version });
+  else versions.delete(key);
+  return version;
 }

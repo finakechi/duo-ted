@@ -142,7 +142,8 @@ export class ChatManager {
   }
 
   private save(s: ChatSession): void {
-    if (this.drafts.has(s.id)) return;
+    // A deleted chat whose turn is still winding down must not be written back.
+    if (this.drafts.has(s.id) || this.sessions.get(s.id) !== s) return;
     const path = join(CHATS_DIR, `${s.id}.json`);
     writeFileSync(path + '.tmp', JSON.stringify(s));
     renameSync(path + '.tmp', path);
@@ -223,8 +224,10 @@ export class ChatManager {
     this.live.delete(id);
     this.sessions.delete(id);
     this.drafts.delete(id);
+    this.perms.forgetAllowed(id);
     rmSync(join(CHATS_DIR, `${id}.json`), { force: true });
     rmSync(join(MCP_DIR, `${id}.json`), { force: true });
+    rmSync(join(TAPS_DIR, `${id}.jsonl`), { force: true });
     this.bus.emit({ t: 'chat_removed', id });
   }
 
@@ -246,6 +249,7 @@ export class ChatManager {
 
   /** Raw stream line from this chat's CLI: keep it for the trace and update the live view. */
   private onLine(chatId: string, line: string): void {
+    if (!this.sessions.has(chatId)) return;
     try {
       appendFileSync(join(TAPS_DIR, `${chatId}.jsonl`), line + '\n');
     } catch {
@@ -429,6 +433,8 @@ export class ChatManager {
 
   private endTurn(s: ChatSession, turn: ChatTurn, started: number, o: { stopped?: boolean; error?: string; usage?: Usage; costUsd?: number }): void {
     this.running.delete(s.id);
+    // Deleted while it was answering: nothing to record and no one to tell.
+    if (this.sessions.get(s.id) !== s) return;
     turn.durationMs = Date.now() - started;
     if (o.usage) {
       if (s.engine === 'codex') {

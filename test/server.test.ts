@@ -101,3 +101,12 @@ test('API model authoring returns a validated draft without adding it to the cat
   assert.deepEqual((await api(`/api/runs/${result.data.run}`)).data.draftTemplate, example, 'the draft can be reopened from its authoring run');
   assert.equal((await api('/api/templates')).data.some((e: any) => e.template.id === example.id), false);
 });
+test('the HTML export of a run can never run scripts', async () => {
+  const runs = (await api('/api/runs')).data;
+  assert.ok(runs.length, 'an earlier test created a run');
+  const res = await fetch(`${origin}/api/runs/${runs[0].id}/export?format=html&token=${token}`);
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-security-policy') ?? '', /default-src 'none'/);
+  assert.doesNotMatch(res.headers.get('content-security-policy') ?? '', /script-src/);
+  assert.match(await res.text(), /<h2>Turns<\/h2>/);
+});

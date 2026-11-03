@@ -1,4 +1,5 @@
 import { signal } from '@preact/signals';
+import { Component } from 'preact';
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { desktop, MOD } from './api.ts';
 import { onCopyClick, renderMarkdown } from './md.ts';
@@ -121,7 +122,7 @@ function EditDiff({ input }: { input: any }) {
 
 function ToolRow({ b, cwd }: { b: Block; cwd: string }) {
   const [open, setOpen] = useState(false);
-  const input = parseInput(b);
+  const input = useMemo(() => parseInput(b), [b.input]);
   const s = toolSummary(b.name, b.name === 'shell' ? b.input : input, cwd);
   const isEdit = ['Edit', 'MultiEdit', 'Write'].includes(b.name ?? '');
   const isShell = b.name === 'shell' || b.name === 'Bash' || b.name === 'PowerShell';
@@ -318,6 +319,27 @@ function TurnView({ chat, turn, partner, last }: { chat: ChatSession; turn: Chat
   );
 }
 
+type TurnProps = { chat: ChatSession; turn: ChatTurn; partner?: ChatSession; last: boolean };
+
+/**
+ * A turn re-renders only when something it shows changed. Every streamed update replaces the chat
+ * object, and without this each one re-rendered (and re-parsed the tool inputs of) every earlier
+ * turn of the conversation.
+ */
+class TurnItem extends Component<TurnProps> {
+  shouldComponentUpdate(n: TurnProps): boolean {
+    const p = this.props;
+    return p.turn !== n.turn || p.last !== n.last
+      || p.chat.id !== n.chat.id || p.chat.engine !== n.chat.engine || p.chat.cwd !== n.chat.cwd
+      || (n.turn.status === 'running' && p.chat.permissions !== n.chat.permissions)
+      || p.partner?.id !== n.partner?.id || p.partner?.engine !== n.partner?.engine;
+  }
+
+  render(props: TurnProps) {
+    return <TurnView {...props} />;
+  }
+}
+
 // ── panes ────────────────────────────────────────────────────────────────
 
 const STARTERS: Record<Engine, string[]> = {
@@ -416,7 +438,7 @@ function ChatPane({ id, split, partner }: { id: string; split: boolean; partner?
       <div class="transcript" ref={scroll.ref} onClick={onCopyClick}>
         <div class="transcript-inner">
           {c.turns.length === 0 && <EmptyChat chat={c} onPick={setPick} />}
-          {c.turns.map((t, i) => <TurnView key={t.id} chat={c} turn={t} partner={other} last={i === c.turns.length - 1} />)}
+          {c.turns.map((t, i) => <TurnItem key={t.id} chat={c} turn={t} partner={other} last={i === c.turns.length - 1} />)}
         </div>
       </div>
       {scroll.away && <button type="button" class="to-bottom" onClick={scroll.toBottom} title="Jump to the latest"><Icon name="down" size={16} /></button>}

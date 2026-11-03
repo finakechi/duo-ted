@@ -14,7 +14,7 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { extname, join } from 'node:path';
-import { binVersion, runBin } from '../bins.ts';
+import { binVersion, runBinAsync } from '../bins.ts';
 import { CLAUDE_MODELS, codexCatalog, loadConfig, resolveClaudeBin, resolveCodexBin, saveConfig } from '../config.ts';
 import { liveChecks, runDoctor } from '../doctor.ts';
 import { sanitizeEnvironment } from '../env.ts';
@@ -189,25 +189,24 @@ let claudeUpdate: Promise<{ ok: boolean; output: string; }> | undefined;
 type Handler = (m: RegExpMatchArray, req: IncomingMessage, url: URL, res: ServerResponse) => Promise<unknown> | unknown;
 const routes: [string, RegExp, Handler][] = [
   ['GET', /^\/api\/state$/, () => state()],
-  ['GET', /^\/api\/quota$/, (_m, _r, url) => {
-    if (url.searchParams.get('refresh')) refreshQuota(cfg);
+  ['GET', /^\/api\/quota$/, async (_m, _r, url) => {
+    if (url.searchParams.get('refresh')) await refreshQuota(cfg);
     const q = snapshot();
     bus.emit({ t: 'quota', quota: q });
     return q;
   }],
   ['GET', /^\/api\/prefs$/, () => readPrefs()],
   ['PUT', /^\/api\/prefs$/, async (_m, req) => writePrefs(await body(req))],
-  ['GET', /^\/api\/doctor$/, (_m, _r, url) => {
+  ['GET', /^\/api\/doctor$/, async (_m, _r, url) => {
     const c = loadConfig();
-    return url.searchParams.get('live') ? [...runDoctor(c), ...liveChecks(c)] : runDoctor(c);
+    return url.searchParams.get('live') ? [...await runDoctor(c), ...await liveChecks(c)] : runDoctor(c);
   }],
   ['POST', /^\/api\/maintenance\/update-claude$/, async () => {
-    claudeUpdate ??= new Promise((resolve) => {
-      const r = runBin(bins.claude, ['update'], { encoding: 'utf8', timeout: 300_000 });
-      resolve({ ok: r.status === 0, output: `${r.stdout ?? ''}${r.stderr ?? ''}`.trim().slice(-4000) });
-    });
+    // One update at a time; a second click waits for the same one.
+    claudeUpdate ??= runBinAsync(bins.claude, ['update'], { timeout: 300_000 })
+      .then((r) => ({ ok: r.status === 0, output: `${r.stdout}${r.stderr}${r.error ? `\n${r.error.message}` : ''}`.trim().slice(-4000) }))
+      .finally(() => { claudeUpdate = undefined; });
     const out = await claudeUpdate;
-    claudeUpdate = undefined;
     return { ...out, version: binVersion(bins.claude) };
   }],
   ['GET', /^\/api\/fs\/dirs$/, (_m, _r, url) => listDirs(url.searchParams.get('path') ?? undefined, url.searchParams.get('hidden') === '1')],
@@ -268,7 +267,8 @@ const routes: [string, RegExp, Handler][] = [
   }],
   ['GET', /^\/api\/runs\/([\w.-]+)\/export$/, (m, _r, url, res) => {
     const md = url.searchParams.get('format') === 'md';
-    send(res, 200, md ? runs.markdown(m[1]) : runs.html(m[1]), md ? 'text/markdown' : 'text/html', md ? { 'Content-Disposition': `attachment; filename="${m[1]}.md"` } : {});
+    // The export opens on the app's own origin with the token in its URL: model text in it may never run.
+    send(res, 200, md ? runs.markdown(m[1]) : runs.html(m[1]), md ? 'text/markdown' : 'text/html', md ? { 'Content-Disposition': `attachment; filename="${m[1]}.md"` } : { 'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; img-src data:; frame-ancestors 'none'" });
     return undefined;
   }],
   ['PUT', /^\/api\/config$/, async (_m, req) => {

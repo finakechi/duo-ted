@@ -6,7 +6,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { binVersion, runBin, type BinSpec } from './bins.ts';
+import { binVersion, runBinAsync, type BinSpec } from './bins.ts';
 import { codexCatalog, resolveClaudeBin, resolveCodexBin, type Config } from './config.ts';
 import { errorHint } from './errors.ts';
 import { CONFIG_PATH, DUO_HOME, PROJECT_ROOT } from './paths.ts';
@@ -26,7 +26,7 @@ function version(label: string): number[] {
   return (/(\d+)\.(\d+)\.(\d+)/.exec(label) ?? []).slice(1).map(Number);
 }
 
-export function runDoctor(cfg: Config, o: { quick?: boolean } = {}): Check[] {
+export async function runDoctor(cfg: Config, o: { quick?: boolean } = {}): Promise<Check[]> {
   const out: Check[] = [];
   const add = (c: Check) => out.push(c);
 
@@ -42,7 +42,7 @@ export function runDoctor(cfg: Config, o: { quick?: boolean } = {}): Check[] {
     add({ id: 'codex', label: 'Codex CLI', level: 'fail', detail: (e as Error).message, fix: 'Run `npm install` in the duo folder (it pins a Codex CLI), or set codexBin in the config.' });
   }
   if (codex && !o.quick) {
-    const r = runBin(codex, ['login', 'status'], { encoding: 'utf8', timeout: 30_000 });
+    const r = await runBinAsync(codex, ['login', 'status'], { timeout: 30_000 });
     const text = `${r.stdout ?? ''}\n${r.stderr ?? ''}`.trim();
     const ok = r.status === 0 && /logged in/i.test(text);
     add({ id: 'codex-login', label: 'Codex login', level: ok ? 'ok' : 'fail', detail: text.split('\n').filter(Boolean).pop() ?? 'not logged in', fix: ok ? undefined : 'Log in with your ChatGPT account: run `codex login` (or sign in to the ChatGPT desktop app).' });
@@ -59,7 +59,7 @@ export function runDoctor(cfg: Config, o: { quick?: boolean } = {}): Check[] {
     add({ id: 'claude', label: 'Claude Code', level: 'fail', detail: (e as Error).message, fix: 'Install Claude Code (https://docs.claude.com/claude-code), then run `claude` once to log in.' });
   }
   if (claude && !o.quick) {
-    const r = runBin(claude, ['auth', 'status'], { encoding: 'utf8', timeout: 30_000 });
+    const r = await runBinAsync(claude, ['auth', 'status'], { timeout: 30_000 });
     let st: { loggedIn?: boolean; authMethod?: string; subscriptionType?: string } = {};
     try {
       st = JSON.parse(String(r.stdout ?? '{}'));
@@ -93,13 +93,13 @@ export function runDoctor(cfg: Config, o: { quick?: boolean } = {}): Check[] {
  * Send one tiny message through each CLI (the cheapest model on each side). `claude auth status`
  * says "logged in" even when the saved session can no longer be refreshed; only a real call shows it.
  */
-export function liveChecks(cfg: Config): Check[] {
+export async function liveChecks(cfg: Config): Promise<Check[]> {
   const out: Check[] = [];
   const cwd = mkdtempSync(join(tmpdir(), 'duo-check-'));
   try {
     try {
       const claude = resolveClaudeBin(cfg);
-      const r = runBin(claude, ['-p', '--model', 'haiku', '--no-session-persistence', '--output-format', 'stream-json', '--verbose'], { cwd, input: 'Reply with: ok', encoding: 'utf8', timeout: 120_000 });
+      const r = await runBinAsync(claude, ['-p', '--model', 'haiku', '--no-session-persistence', '--output-format', 'stream-json', '--verbose'], { cwd, input: 'Reply with: ok', timeout: 120_000 });
       let err = '';
       for (const line of String(r.stdout ?? '').split('\n')) {
         try {
@@ -117,7 +117,7 @@ export function liveChecks(cfg: Config): Check[] {
     }
     try {
       const codex = resolveCodexBin(cfg);
-      const r = runBin(codex, ['exec', '--skip-git-repo-check', '--ignore-user-config', '--ignore-rules', '-s', 'read-only', '-m', 'gpt-6-luna', '-c', 'model_reasoning_effort="low"', '--json', '-'], { cwd, input: 'Reply with: ok', encoding: 'utf8', timeout: 180_000 });
+      const r = await runBinAsync(codex, ['exec', '--skip-git-repo-check', '--ignore-user-config', '--ignore-rules', '-s', 'read-only', '-m', 'gpt-6-luna', '-c', 'model_reasoning_effort="low"', '--json', '-'], { cwd, input: 'Reply with: ok', timeout: 180_000 });
       let err = '';
       for (const line of String(r.stdout ?? '').split('\n')) {
         try {
