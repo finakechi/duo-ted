@@ -62,17 +62,33 @@ export function gitState(cwd: string) {
   } catch {
     /* no commits yet */
   }
-  const files = git(cwd, ['status', '--porcelain=v1', '-z'])
-    .split('\0')
-    .filter(Boolean)
-    .filter((l) => /^[ MADRCU?!]{2} /.test(l))
-    .map((l) => ({ status: l.slice(0, 2).trim() || '?', path: l.slice(3) }));
-  let diff = '';
-  try {
-    diff = git(cwd, ['diff', '--no-color', '--no-ext-diff', 'HEAD']);
-  } catch {
-    diff = git(cwd, ['diff', '--no-color', '--no-ext-diff', '--cached']);
+  const entries = git(cwd, ['status', '--porcelain=v1', '-z']).split('\0');
+  const files: { status: string; path: string }[] = [];
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    if (!entry) continue;
+    const status = entry.slice(0, 2);
+    files.push({ status: status.trim() || '?', path: entry.slice(3) });
+    // In -z output, renames/copies have a second NUL-delimited source path, with no status.
+    if (/[RC]/.test(status)) i++;
   }
   const limit = 400_000;
+  // Only the first `limit` characters are shown; a longer diff fills the buffer, which is not a failure.
+  const diffOf = (args: string[]) => {
+    try {
+      return git(cwd, args, limit + 64 * 1024);
+    } catch (e) {
+      const err = e as NodeJS.ErrnoException & { stdout?: string };
+      if (err.code === 'ENOBUFS' && typeof err.stdout === 'string') return err.stdout + '\n';
+      throw e;
+    }
+  };
+  let diff = '';
+  try {
+    diff = diffOf(['diff', '--no-color', '--no-ext-diff', 'HEAD']);
+  } catch {
+    // No commits yet: show what is staged.
+    diff = diffOf(['diff', '--no-color', '--no-ext-diff', '--cached']);
+  }
   return { repo: true as const, branch, head, files, diff: diff.length > limit ? diff.slice(0, limit) + '\n… (diff truncated)\n' : diff };
 }

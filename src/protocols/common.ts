@@ -89,6 +89,9 @@ export class RunContext {
   private readonly failedSeats = new Map<string, string>();
   private abortReason?: { status: 'cancelled' | 'failed'; reason: string; };
   private abortWaiters: (() => void)[] = [];
+  private readonly abortController = new AbortController();
+  /** Aborted with the run, for host work that is not a model turn (a pair check command). */
+  get signal(): AbortSignal { return this.abortController.signal; }
   private finished = false;
 
   private constructor(cfg: Config, opts: RunOptions, store: RunStore, quota: QuotaSnapshot, bins: Parameters<typeof makeEngines>[2]) {
@@ -165,6 +168,7 @@ export class RunContext {
     this.abortReason = { status, reason };
     this.log(status === 'cancelled' ? 'cancelled by the user; stopping the seats' : `stopping: ${reason}`);
     for (const w of this.abortWaiters.splice(0)) w();
+    this.abortController.abort();
     void this.engines.stopAll();
   }
 

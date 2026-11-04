@@ -398,7 +398,9 @@ function onEvent(e: any): void {
           liveTurn(e.run, e.n, (t) => ({ ...(t ?? { n: e.n, seat: e.seat, round: e.round, kind: e.turnKind, startedAt: Date.now(), blocks: [] }), blocks: mergeBlocks(t?.blocks ?? [], e.blocks) }));
           break;
         case 'turn':
-          liveTurn(e.run, e.n, (t) => (t ? { ...t, done: true, error: e.error, hint: e.hint } : undefined));
+          // The finished turn is read from the run record from now on; drop its streamed blocks so a
+          // long run does not keep every turn's live output in memory.
+          liveTurn(e.run, e.n, (t) => (t ? { ...t, done: true, error: e.error, hint: e.hint, blocks: [] } : undefined));
           refetchRunSoon(e.run);
           break;
         default:
@@ -407,6 +409,10 @@ function onEvent(e: any): void {
       break;
     case 'run_finished': {
       if (s) app.value = { ...s, runs: upsertSummary<RunSummary>(s.runs, e.run, 'createdAt') };
+      if (runLive.value[e.run.id]) {
+        const { [e.run.id]: _done, ...rest } = runLive.value;
+        runLive.value = rest;
+      }
       refetchRunSoon(e.run.id);
       gitTick.value++;
       const stop = String(e.run.outcome?.stop ?? e.run.status);

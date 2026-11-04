@@ -174,7 +174,7 @@ Override with `DUO_CONFIG` and `DUO_HOME`. `DUO_CODEX_BIN` and `DUO_CLAUDE_BIN` 
 
 ## Security
 
-The app is an Electron window over a local engine bound to `127.0.0.1`. Every API call needs a random per-launch token that only the app's own window receives; the engine refuses non-loopback `Host` headers and cross-site origins, so no web page can drive it. Model output is sanitized before it is rendered. Chats run with the permissions you pick; discussion seats are read-only; pair writers are sandboxed unless you choose full access. See [SECURITY.md](SECURITY.md).
+The app is an Electron window over a local engine bound to `127.0.0.1`. Every API call needs a random per-launch token shared with the app's window and local permission bridge; the engine refuses non-loopback `Host` headers and cross-site origins, so no web page can drive it. Model output is sanitized before it is rendered. Chats run with the permissions you pick; discussion seats are read-only; pair writers are sandboxed unless you choose full access. See [SECURITY.md](SECURITY.md).
 
 ## Using Duo from the agents
 

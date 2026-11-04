@@ -176,12 +176,40 @@ export function discardWorkspace(ws: Workspace): { ok: boolean; message: string 
   return { ok: true, message: ws.mode === 'worktree' ? `removed the worktree and branch ${ws.branch}` : 'removed duo\'s snapshot; the changes stay in the folder' };
 }
 
-/** Run the user's check command in the workspace (their command, their shell). */
-export async function runCheck(command: string, cwd: string, timeoutMs = 15 * 60_000): Promise<{ command: string; exitCode: number | null; output: string; durationMs: number; timedOut: boolean }> {
+/**
+ * End a check command and everything it started. The shell is only the top of the tree (`npm test`
+ * starts node, which starts workers), and a grandchild that survives keeps the output pipes open.
+ */
+function killTree(pid: number | undefined, signal: NodeJS.Signals): void {
+  if (!pid) return;
+  try {
+    if (process.platform === 'win32') execFileSync('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+    else process.kill(-pid, signal);
+  } catch {
+    /* already gone */
+  }
+}
+
+/** Checks still running; if duo itself exits (a second Ctrl-C, app shutdown) they go with it. */
+const liveChecks = new Set<number>();
+let exitHook = false;
+
+/**
+ * Run the user's check command in the workspace (their command, their shell). A timeout or the
+ * run's cancellation ends the whole process tree; a background process the check leaves behind
+ * cannot hold the run open.
+ */
+export async function runCheck(command: string, cwd: string, timeoutMs = 15 * 60_000, signal?: AbortSignal): Promise<{ command: string; exitCode: number | null; output: string; durationMs: number; timedOut: boolean; cancelled?: boolean }> {
   const { spawn } = await import('node:child_process');
   const started = Date.now();
   return new Promise((resolve) => {
-    const p = spawn(command, { cwd, shell: true, windowsHide: true, env: process.env });
+    // Its own process group on POSIX, so the tree can be signalled as one.
+    const p = spawn(command, { cwd, shell: true, windowsHide: true, env: process.env, detached: process.platform !== 'win32' });
+    if (p.pid) liveChecks.add(p.pid);
+    if (!exitHook) {
+      exitHook = true;
+      process.on('exit', () => { for (const pid of liveChecks) killTree(pid, 'SIGKILL'); });
+    }
     let out = '';
     const add = (d: Buffer) => {
       out += d.toString('utf8');
@@ -190,20 +218,49 @@ export async function runCheck(command: string, cwd: string, timeoutMs = 15 * 60
     p.stdout?.on('data', add);
     p.stderr?.on('data', add);
     let timedOut = false;
+    let cancelled = false;
+    let settled = false;
+    let hardKill: ReturnType<typeof setTimeout> | undefined;
+    let drain: ReturnType<typeof setTimeout> | undefined;
+    const stop = () => {
+      killTree(p.pid, 'SIGTERM');
+      hardKill ??= setTimeout(() => killTree(p.pid, 'SIGKILL'), 5000);
+    };
     const timer = setTimeout(() => {
       timedOut = true;
-      p.kill();
+      stop();
     }, timeoutMs);
+    const onAbort = () => {
+      cancelled = true;
+      stop();
+    };
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener('abort', onAbort, { once: true });
     const done = (code: number | null) => {
+      if (settled) return;
+      settled = true;
+      if (p.pid) liveChecks.delete(p.pid);
       clearTimeout(timer);
+      clearTimeout(hardKill);
+      clearTimeout(drain);
+      signal?.removeEventListener('abort', onAbort);
+      p.stdout?.destroy();
+      p.stderr?.destroy();
       const tail = out.length > 12_000 ? `…\n${out.slice(-12_000)}` : out;
-      resolve({ command, exitCode: code, output: tail, durationMs: Date.now() - started, timedOut });
+      resolve({ command, exitCode: code, output: tail, durationMs: Date.now() - started, timedOut, ...(cancelled ? { cancelled } : {}) });
     };
     p.on('error', (e) => {
       out += `\n${e.message}`;
       done(null);
     });
     p.on('close', done);
+    // The shell exited but something it started still holds the pipes: finish once its output drains.
+    p.on('exit', (code) => {
+      drain = setTimeout(() => {
+        if (!timedOut && !cancelled) killTree(p.pid, 'SIGKILL');
+        done(code);
+      }, 2000);
+    });
   });
 }
 

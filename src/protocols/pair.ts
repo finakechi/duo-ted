@@ -221,7 +221,7 @@ export async function pair(ctx: RunContext, settings: PairSettings, resume?: { s
         // ── check and diff ──
         if (settings.check) {
           ctx.log(`cycle ${cycle}: running \`${settings.check}\``);
-          lastCheck = await runCheck(settings.check, ws!.cwd);
+          lastCheck = await runCheck(settings.check, ws!.cwd, undefined, ctx.signal);
           state.checks.push({ ...lastCheck, cycle });
           c.check = { exitCode: lastCheck.exitCode, timedOut: lastCheck.timedOut, durationMs: lastCheck.durationMs };
           ctx.log(`check ${lastCheck.timedOut ? 'timed out' : lastCheck.exitCode === 0 ? 'passed' : `failed (exit ${lastCheck.exitCode})`} in ${(lastCheck.durationMs / 1000).toFixed(0)}s`);

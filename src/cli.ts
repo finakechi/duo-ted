@@ -428,9 +428,9 @@ program.command('rm').argument('<run>').description('delete a run directory').ac
 
 program.command('quota').description('Codex and Claude subscription usage (free: read from local snapshots)')
   .option('--refresh', 'ping the cheapest model on each side first for a fresh snapshot')
-  .action((o: { refresh?: boolean; }) => {
+  .action(async (o: { refresh?: boolean; }) => {
     const cfg = loadConfig();
-    if (o.refresh) refreshQuota(cfg);
+    if (o.refresh) await refreshQuota(cfg);
     const q = snapshot();
     const c = formatWindows(q.codex?.windows, cfg.warnPercent);
     const a = formatWindows(q.claude?.windows, cfg.warnPercent);
@@ -456,8 +456,8 @@ program.command('models').description("models you can seat: Codex's live catalog
     process.stdout.write('  (any full model id such as claude-opus-5-5 also works)\n');
   });
 
-program.command('doctor').description('check both CLIs, their logins and versions, git, and what setup installed').action(() => {
-  const checks = runDoctor(loadConfig());
+program.command('doctor').description('check both CLIs, their logins and versions, git, and what setup installed').action(async () => {
+  const checks = await runDoctor(loadConfig());
   for (const c of checks) {
     process.stdout.write(`${{ ok: 'ok  ', fail: 'FAIL', warn: 'warn', info: 'info' }[c.level]}  ${c.label.padEnd(20)} ${c.detail}\n`);
     if (c.fix) process.stdout.write(`      ${''.padEnd(20)} → ${c.fix}\n`);
