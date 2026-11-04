@@ -225,3 +225,168 @@ test('the fake Claude CLI without per-result usage still prices turns from its r
     delete process.env.FAKE_CLAUDE_MODE;
   }
 });
+
+// ── Accounting across turns, processes and runs ─────────────────────────────
+
+/** Run with extra environment set for the fake CLIs, and restore it afterwards. */
+async function withEnv<T>(env: Record<string, string>, fn: () => Promise<T>): Promise<T> {
+  const saved = Object.fromEntries(Object.keys(env).map((k) => [k, process.env[k]]));
+  Object.assign(process.env, env);
+  try {
+    return await fn();
+  } finally {
+    for (const [k, v] of Object.entries(saved)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
+  }
+}
+
+async function runDebate(specs: string[], rounds = 2) {
+  const { loadConfig } = await import('../src/config.ts');
+  const { RunContext } = await import('../src/protocols/common.ts');
+  const { debate } = await import('../src/protocols/debate.ts');
+  const { parseSeat } = await import('../src/seats.ts');
+  const cfg = loadConfig();
+  const seats = specs.map((s, i) => parseSeat(s, String.fromCharCode(65 + i), cfg.defaults));
+  const ctx = RunContext.create(cfg, { protocol: 'debate', title: 'accounting', brief: 'Which is larger, 2 or 3?', cwd: tmp, seats, rounds, minRounds: rounds, anon: false, quiet: true, extra: {} });
+  await debate(ctx);
+  return ctx;
+}
+
+// The fake Codex turn: 1000 input (400 cached), 50 output, 10 reasoning.
+const FAKE_TURN = { input: 1000, cached: 400, output: 50, reasoning: 10 };
+const credits = (model: string, mult = 1) => ((600 * CODEX_RATES[model].input + 400 * CODEX_RATES[model].cached + 50 * CODEX_RATES[model].output) / M) * mult;
+const close = (a: number | undefined, b: number) => assert.ok(a !== undefined && Math.abs(a - b) < 1e-9, `${a} ≠ ${b}`);
+
+test('Codex running totals become per-turn usage and credits over several turns, at each tier', async () => {
+  const ctx = await withEnv({ FAKE_CODEX_USAGE: 'cumulative' }, () => runDebate(['codex:gpt-6.1-sol+fast', 'codex:gpt-6.1-terra+tier=ultrafast']));
+  const turns = ctx.store.meta.turns;
+  for (const seat of ['A', 'B']) assert.ok(turns.filter((t) => t.seat === seat).length >= 3, `seat ${seat} took several turns`);
+  for (const t of turns) {
+    assert.deepEqual(t.usage, FAKE_TURN, `${t.seat} ${t.kind}: each turn reports its own share of the thread's total`);
+    close(t.codexCredits, t.seat === 'A' ? credits('gpt-6.1-sol', 2) : credits('gpt-6.1-terra', 6));
+  }
+  close(ctx.store.meta.totals!.codexCredits, Math.round(turns.reduce((a, t) => a + t.codexCredits!, 0) * 1000) / 1000);
+});
+
+test('a continued run carries the Codex running total, so its first turn is not billed for the earlier ones', async () => {
+  const { continueRun } = await import('../src/protocols/continue.ts');
+  const { loadConfig } = await import('../src/config.ts');
+  await withEnv({ FAKE_CODEX_USAGE: 'cumulative' }, async () => {
+    const first = await runDebate(['codex:gpt-6-sol', 'claude:sonnet'], 1);
+    let next: any;
+    await continueRun(loadConfig(), first.store.meta.id, 'Once more', { rounds: 1, quiet: true, safe: false, onContext: (c) => { next = c; } });
+    const codexTurns = next.store.meta.turns.filter((t: any) => t.seat === 'A');
+    assert.ok(codexTurns.length >= 1);
+    for (const t of codexTurns) {
+      assert.deepEqual(t.usage, FAKE_TURN);
+      close(t.codexCredits, credits('gpt-6-sol'));
+    }
+  });
+});
+
+test('a Claude CLI that dies between turns is restarted without mispricing the next turn', async () => {
+  const ctx = await withEnv({ FAKE_CLAUDE_MODE: 'die-after-1' }, () => runDebate(['codex:gpt-6-sol', 'claude:sonnet']));
+  const claude = ctx.store.meta.turns.filter((t) => t.seat === 'B');
+  assert.ok(claude.length >= 2);
+  // Each restarted process starts its running total again; the per-result figure stays right.
+  for (const t of claude) {
+    assert.equal(t.usd, 0.01, t.kind);
+    assert.deepEqual(t.usage, { input: 150, cached: 50, output: 20, reasoning: 0 });
+  }
+});
+
+/** A chat whose CLI is replaced by events the test writes; returns the chat manager and a turn runner. */
+async function scriptedChat(engine: 'claude' | 'codex', spec: string, events: (turn: number) => Record<string, unknown>[]) {
+  const { ChatManager } = await import('../src/server/chats.ts');
+  const { PermissionBroker } = await import('../src/server/permissions.ts');
+  const { loadConfig } = await import('../src/config.ts');
+  const bus = { emit: () => undefined, add: () => undefined } as any;
+  const bin = { command: process.execPath, args: [], env: {}, display: 'node' };
+  const cm = new ChatManager(bus, loadConfig(), { codex: bin, claude: bin }, new PermissionBroker(bus), { url: 'http://127.0.0.1:1', token: 't' }, 'mcp.ts');
+  const manager = (cm as any).manager;
+  await manager.shutdown();
+  const chat = cm.create({ engine, cwd: tmp, spec, access: engine === 'codex' ? 'read-only' : 'plan' });
+  let n = 0;
+  Object.assign(manager, {
+    startSession: async () => ({}), hasSession: () => true, stopSession: async () => undefined, shutdown: async () => undefined,
+    sendMessage: async () => {
+      n++;
+      for (const e of events(n)) (cm as any).onLine(chat.id, JSON.stringify(e));
+      return {};
+    },
+  });
+  const send = async (text: string) => {
+    const turn = cm.send(chat.id, text);
+    while (turn.status === 'running') await new Promise((r) => setTimeout(r, 5));
+    return turn;
+  };
+  return { cm, chat, send };
+}
+
+test('Codex chats price each turn\'s share of the thread total at that turn\'s model and tier', async () => {
+  const codexTurn = (n: number) => [
+    { type: 'thread.started', thread_id: 'thread-1' },
+    { type: 'item.completed', item: { id: `m${n}`, type: 'agent_message', text: `answer ${n}` } },
+    { type: 'turn.completed', usage: { input_tokens: 1000 * n, cached_input_tokens: 400 * n, output_tokens: 50 * n, reasoning_output_tokens: 10 * n } },
+  ];
+  const { cm, chat, send } = await scriptedChat('codex', 'codex:gpt-6-sol', codexTurn);
+  await send('one');
+  await send('two');
+  cm.update(chat.id, { spec: 'codex:gpt-6.1-sol+fast' }); // same thread, another model and tier
+  await send('three');
+  cm.update(chat.id, { spec: 'codex:gpt-7-sol' }); // a model with no published rate
+  await send('four');
+  const turns = cm.get(chat.id).turns;
+  for (const t of turns) assert.deepEqual(t.usage, FAKE_TURN);
+  close(turns[0].credits, credits('gpt-6-sol'));
+  close(turns[1].credits, credits('gpt-6-sol'));
+  close(turns[2].credits, credits('gpt-6.1-sol', 2));
+  assert.equal(turns[3].credits, undefined);
+  assert.match(turns[3].unpriced!, /gpt-7-sol/);
+  await cm.close();
+});
+
+test('a Claude chat turn the CLI could not price is saved as unpriced, not at the guessed rate', async () => {
+  const { cm, chat, send } = await scriptedChat('claude', 'claude:fable', () => [
+    { type: 'assistant', message: { id: 'm', content: [{ type: 'text', text: 'answer' }] } },
+    result({ total_cost_usd: 0.4, model_usage_since_last_result: { 'claude-fable-9': { inputTokens: 10, outputTokens: 5, costUSD: 0.4, costBasis: 'unknown' } } }),
+  ]);
+  const turn = await send('hello');
+  assert.equal(turn.status, 'done');
+  assert.equal(turn.usd, undefined);
+  assert.match(turn.unpriced!, /no price for claude-fable-9/);
+  const saved = JSON.parse(readFileSync(join(tmp, 'home', 'gui', 'chats', `${chat.id}.json`), 'utf8'));
+  assert.equal(saved.turns[0].usd, undefined);
+  assert.match(saved.turns[0].unpriced, /claude-fable-9/);
+  await cm.close();
+});
+
+test('a turn with no tokens costs zero when the model has a rate, and nothing (not "no price") when it does not', () => {
+  const none = { input: 0, cached: 0, output: 0, reasoning: 0 };
+  assert.deepEqual(codexPrice('gpt-6-sol', none), { credits: 0 });
+  assert.equal(costText({ codexCredits: 0 }), '0.00 cr', 'free is shown as zero, not hidden');
+  assert.equal(costText({ codexCredits: undefined, usd: undefined }), '');
+  assert.equal(costText({ unpriced: 'no published Codex credit rate for x' }), 'no price');
+  assert.equal(costText({ usd: 0 }), '~$0.000');
+});
+
+test('claw-orchestrator\'s own price-table warning is dropped; other warnings still print', async () => {
+  const { codexRoute, dropCodexRoute } = await import('../src/hooks.ts');
+  dropCodexRoute(codexRoute('quiet-test', { bin: { command: 'x', args: [], env: {}, display: 'x' }, overrides: [], ignoreRules: false })); // installs the hook
+  const seen: unknown[][] = [];
+  const original = console.warn;
+  // The filter wraps whatever console.warn was when it was installed; observe through stderr instead.
+  const write = process.stderr.write.bind(process.stderr);
+  (process.stderr as any).write = (chunk: unknown, ...rest: unknown[]) => { seen.push([String(chunk)]); return true; };
+  try {
+    console.warn('[models] Unknown model "gpt-6.1-sol" — falling back to gpt-5.5 pricing');
+    console.warn('[models] Partial pricing override for unregistered model "x"');
+    console.warn('something else');
+  } finally {
+    (process.stderr as any).write = write;
+    console.warn = original;
+  }
+  const out = seen.map((s) => s[0]).join('');
+  assert.doesNotMatch(out, /falling back to gpt-5\.5 pricing/);
+  assert.match(out, /Partial pricing override/);
+  assert.match(out, /something else/);
+});

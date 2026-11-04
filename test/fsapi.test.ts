@@ -14,12 +14,12 @@ writeFileSync(join(repo, 'big.txt'), 'start\n');
 writeFileSync(join(repo, 'small.txt'), 'one\n');
 git('add', '-A'); git('commit', '-qm', 'init');
 
-test('the Changes panel shows a large working-tree diff truncated, not the staged diff', () => {
+test('the Changes panel shows a large working-tree diff truncated, not the staged diff', async () => {
   // Over the 4 MiB buffer git output used to be read into.
   writeFileSync(join(repo, 'big.txt'), Array.from({ length: 120_000 }, (_, i) => `changed line ${i} ${'x'.repeat(30)}`).join('\n'));
   writeFileSync(join(repo, 'small.txt'), 'two\n');
   git('add', 'small.txt'); // staged: only the small change
-  const s = gitState(repo);
+  const s = await gitState(repo);
   assert.equal(s.repo, true);
   if (!s.repo) return;
   assert.match(s.diff, /big\.txt/, 'the unstaged big change is missing from the diff');
@@ -28,15 +28,15 @@ test('the Changes panel shows a large working-tree diff truncated, not the stage
   assert.deepEqual(s.files.map((f) => f.path).sort(), ['big.txt', 'small.txt']);
 });
 
-test('a small diff is shown whole', () => {
+test('a small diff is shown whole', async () => {
   git('checkout', '--', '.'); git('reset', '-q', '--hard');
   writeFileSync(join(repo, 'small.txt'), 'three\n');
-  const s = gitState(repo);
+  const s = await gitState(repo);
   assert.ok(s.repo && /\+three/.test(s.diff) && !/truncated/.test(s.diff));
 });
 
 // Ported from the Codex maintenance review.
-test('Changes treats NUL-delimited rename sources as paths, even when they look like status entries', () => {
+test('Changes treats NUL-delimited rename sources as paths, even when they look like status entries', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'duo-git-state-'));
   const g = (...args: string[]) => execFileSync('git', ['-C', dir, ...args], { stdio: 'pipe' });
   try {
@@ -49,7 +49,7 @@ test('Changes treats NUL-delimited rename sources as paths, even when they look 
     renameSync(join(dir, source), join(dir, target));
     writeFileSync(join(dir, 'untracked.txt'), 'hello');
     g('add', '--', target, source);
-    const state = gitState(dir);
+    const state = await gitState(dir);
     assert.equal(state.repo, true);
     if (state.repo) assert.deepEqual(state.files, [{ status: 'R', path: target }, { status: '??', path: 'untracked.txt' }]);
   } finally { rmSync(dir, { recursive: true, force: true }); }

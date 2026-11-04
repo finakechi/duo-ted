@@ -14,8 +14,8 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { extname, join } from 'node:path';
-import { binVersion, runBinAsync } from '../bins.ts';
-import { CLAUDE_MODELS, codexCatalog, loadConfig, resolveClaudeBin, resolveCodexBin, saveConfig } from '../config.ts';
+import { binVersionAsync, runBinAsync } from '../bins.ts';
+import { CLAUDE_MODELS, codexCatalogAsync, loadConfig, resolveClaudeBin, resolveCodexBin, saveConfig, type CodexModel } from '../config.ts';
 import { liveChecks, runDoctor } from '../doctor.ts';
 import { sanitizeEnvironment } from '../env.ts';
 import { CONFIG_PATH, DUO_HOME, PROJECT_ROOT, SCRATCH_DIR } from '../paths.ts';
@@ -24,7 +24,7 @@ import { knownCodexRates } from '../pricing.ts';
 import { refreshQuota } from '../quota-refresh.ts';
 import { snapshot } from '../quota.ts';
 import { CLAUDE_EFFORTS, CODEX_EFFORTS } from '../seats.ts';
-import { workspaceOptions } from '../worktree.ts';
+import { workspaceOptionsAsync } from '../worktree.ts';
 import { buildGui, GUI_DIR, GUI_DIST } from './build.ts';
 import { Bus } from './bus.ts';
 import { CLAUDE_ACCESS, CODEX_ACCESS, ChatManager } from './chats.ts';
@@ -153,9 +153,18 @@ function projects(prefs: Prefs): string[] {
   return [...seen.entries()].sort((a, b) => b[1].localeCompare(a[1])).map(([p]) => p).filter((p) => existsSync(p)).slice(0, 30);
 }
 
-function state() {
+const visible = (models: CodexModel[]) => models.filter((m) => m.visibility !== 'hide');
+
+async function state() {
   const c = loadConfig();
   const prefs = readPrefs();
+  // Neither the catalog nor the versions may hold up the engine: a stale catalog is served while a
+  // fresh one loads, and the window is told when it arrives.
+  const [catalog, codexVersion, claudeVersion] = await Promise.all([
+    codexCatalogAsync(bins.codex, (models) => bus.emit({ t: 'models', codex: visible(models) })),
+    binVersionAsync(bins.codex),
+    binVersionAsync(bins.claude),
+  ]);
   return {
     version: JSON.parse(readFileSync(join(PROJECT_ROOT, 'package.json'), 'utf8')).version,
     platform: process.platform,
@@ -171,10 +180,10 @@ function state() {
       claude: Object.fromEntries(Object.entries(CLAUDE_ACCESS).map(([k, v]) => [k, v.label])),
       codex: Object.fromEntries(Object.entries(CODEX_ACCESS).map(([k, v]) => [k, v.label])),
     },
-    models: { codex: codexCatalog(bins.codex).filter((m) => m.visibility !== 'hide'), claude: CLAUDE_MODELS },
+    models: { codex: visible(catalog), claude: CLAUDE_MODELS },
     rates: knownCodexRates(),
     efforts: { codex: CODEX_EFFORTS, claude: CLAUDE_EFFORTS },
-    versions: { codex: binVersion(bins.codex), claude: binVersion(bins.claude) },
+    versions: { codex: codexVersion, claude: claudeVersion },
     quota: snapshot(),
     chats: chats.list(),
     runs: runs.list(),
@@ -184,13 +193,15 @@ function state() {
   };
 }
 
+/** Aborted on shutdown: model pings for the quota and the live sign-in check stop with the engine. */
+const maintenance = new AbortController();
 let claudeUpdate: Promise<{ ok: boolean; output: string; }> | undefined;
 
 type Handler = (m: RegExpMatchArray, req: IncomingMessage, url: URL, res: ServerResponse) => Promise<unknown> | unknown;
 const routes: [string, RegExp, Handler][] = [
   ['GET', /^\/api\/state$/, () => state()],
   ['GET', /^\/api\/quota$/, async (_m, _r, url) => {
-    if (url.searchParams.get('refresh')) await refreshQuota(cfg);
+    if (url.searchParams.get('refresh')) await refreshQuota(cfg, maintenance.signal);
     const q = snapshot();
     bus.emit({ t: 'quota', quota: q });
     return q;
@@ -199,18 +210,19 @@ const routes: [string, RegExp, Handler][] = [
   ['PUT', /^\/api\/prefs$/, async (_m, req) => writePrefs(await body(req))],
   ['GET', /^\/api\/doctor$/, async (_m, _r, url) => {
     const c = loadConfig();
-    return url.searchParams.get('live') ? [...await runDoctor(c), ...await liveChecks(c)] : runDoctor(c);
+    return url.searchParams.get('live') ? [...await runDoctor(c), ...await liveChecks(c, maintenance.signal)] : runDoctor(c);
   }],
   ['POST', /^\/api\/maintenance\/update-claude$/, async () => {
     // One update at a time; a second click waits for the same one.
-    claudeUpdate ??= runBinAsync(bins.claude, ['update'], { timeout: 300_000 })
+    // An update is left to finish even if duo quits meanwhile: stopping it halfway could break the install.
+    claudeUpdate ??= runBinAsync(bins.claude, ['update'], { timeout: 300_000, outlive: true })
       .then((r) => ({ ok: r.status === 0, output: `${r.stdout}${r.stderr}${r.error ? `\n${r.error.message}` : ''}`.trim().slice(-4000) }))
       .finally(() => { claudeUpdate = undefined; });
     const out = await claudeUpdate;
-    return { ...out, version: binVersion(bins.claude) };
+    return { ...out, version: await binVersionAsync(bins.claude) };
   }],
   ['GET', /^\/api\/fs\/dirs$/, (_m, _r, url) => listDirs(url.searchParams.get('path') ?? undefined, url.searchParams.get('hidden') === '1')],
-  ['GET', /^\/api\/fs\/workspace$/, (_m, _r, url) => workspaceOptions(url.searchParams.get('cwd') ?? '')],
+  ['GET', /^\/api\/fs\/workspace$/, (_m, _r, url) => workspaceOptionsAsync(url.searchParams.get('cwd') ?? '')],
   ['GET', /^\/api\/git$/, (_m, _r, url) => gitState(url.searchParams.get('cwd') ?? '')],
   ['GET', /^\/api\/chats$/, () => chats.list()],
   ['POST', /^\/api\/chats$/, async (_m, req) => {
@@ -320,6 +332,10 @@ function ready(): void {
   chats = new ChatManager(bus, cfg, bins, perms, { url, token }, MCP_SCRIPT);
   runs = new RunManager(bus, cfg);
   process.stdout.write(JSON.stringify({ ready: true, url, token, platform: IS_WIN ? 'win32' : IS_MAC ? 'darwin' : process.platform }) + '\n');
+  // Ask both CLIs their versions in the background now, so a run started later (which records them
+  // synchronously) finds them remembered instead of starting each CLI on the engine's thread.
+  void binVersionAsync(bins.codex);
+  void binVersionAsync(bins.claude);
 }
 
 // A stable port keeps the window's origin, so the browser storage it uses survives a restart; if the
@@ -336,6 +352,7 @@ async function shutdown(): Promise<void> {
   // A second signal, or sessions that will not stop, must not keep the process alive.
   if (closing) process.exit(0);
   closing = true;
+  maintenance.abort();
   setTimeout(() => process.exit(0), 4000).unref();
   server.close();
   await Promise.all([chats?.close(), runs?.close()]);

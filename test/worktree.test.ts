@@ -100,3 +100,35 @@ test('a plain check still reports its exit code and output', async () => {
   assert.equal(bad.exitCode, 3);
   assert.equal(bad.timedOut, false);
 });
+
+test('a check whose run is already cancelled ends at once and leaves nothing running', async () => {
+  const pidFile = join(tmp, 'precancel.pid');
+  const ac = new AbortController();
+  ac.abort();
+  const r = await runCheck(nested(pidFile, ' && echo after'), tmp, 60_000, ac.signal);
+  assert.equal(r.cancelled, true);
+  assert.notEqual(r.exitCode, 0);
+  if (existsSync(pidFile)) assert.ok(await gone(pidFile), 'a child started before the kill survived');
+});
+
+test('a check that cannot start reports why instead of hanging', async () => {
+  const r = await runCheck(`${node} -e "1"`, join(tmp, 'no-such-folder'), 60_000);
+  assert.equal(r.exitCode, null);
+  assert.ok(r.output.trim(), 'the reason is in the output');
+  assert.equal(r.timedOut, false);
+});
+
+test('repeated cancellation and a timeout racing it settle once', async () => {
+  const pidFile = join(tmp, 'race.pid');
+  const ac = new AbortController();
+  const pending = runCheck(nested(pidFile, ' && echo after'), tmp, 1500, ac.signal);
+  for (let i = 0; i < 50 && !existsSync(pidFile); i++) await new Promise((r) => setTimeout(r, 100));
+  ac.abort();
+  ac.abort();
+  const r = await pending;
+  assert.equal(r.cancelled, true);
+  ac.abort();
+  assert.ok(await gone(pidFile));
+  // Wait past the timeout: nothing fires after the check settled.
+  await new Promise((r) => setTimeout(r, 1700));
+});

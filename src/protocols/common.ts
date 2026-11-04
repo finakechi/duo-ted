@@ -48,7 +48,8 @@ export class RunAborted extends Error {
 
 function git(cwd: string, args: string[]): string | undefined {
   try {
-    return execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }).trim();
+    // Recorded when a run starts, on the engine's thread: a hung repository must not hang it.
+    return execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true, timeout: 15_000, killSignal: 'SIGKILL' }).trim();
   } catch {
     return undefined;
   }

@@ -18,7 +18,7 @@ import type { CoordinationTemplate } from '../templates/types.ts';
 import { exportHtml } from '../render.ts';
 import { parseSeat, seatIds, type Seat } from '../seats.ts';
 import { deleteRun, listRuns, markInterrupted, RunStore, type RunMeta } from '../store.ts';
-import { finishWorkspace, workspaceDiff, workspaceOptions } from '../worktree.ts';
+import { finishWorkspace, workspaceDiff, workspaceOptionsAsync } from '../worktree.ts';
 import type { Bus } from './bus.ts';
 
 export type Protocol = 'debate' | 'review' | 'council' | 'ask' | 'pair' | 'custom';
@@ -143,7 +143,7 @@ export class RunManager {
     })();
   }
 
-  start(req: StartRun): { id: string; } {
+  async start(req: StartRun): Promise<{ id: string; }> {
     if (!PROTOCOLS.includes(req.protocol)) throw new Error(`unknown protocol ${req.protocol}`);
     const template = req.protocol === 'custom' ? (typeof req.template === 'string' ? getTemplate(req.template) : validateTemplate(req.template)) : undefined;
     const mode = template?.library ?? req.protocol;
@@ -169,7 +169,7 @@ export class RunManager {
     let pairSettings: PairSettings | undefined;
     if (mode === 'pair') {
       pairSettings = pairSettingsOf({ pair: req.pair ?? {} });
-      if (pairSettings.isolation === 'worktree' && !workspaceOptions(cwd).head) throw new Error(`${cwd} is not a git repository with at least one commit; choose "In place" or commit first`);
+      if (pairSettings.isolation === 'worktree' && !(await workspaceOptionsAsync(cwd)).head) throw new Error(`${cwd} is not a git repository with at least one commit; choose "In place" or commit first`);
     }
     for (const [name, value] of [['rounds', req.rounds], ['minRounds', req.minRounds]] as const) if (value !== undefined && (!Number.isInteger(value) || value < 1 || value > 1000)) throw new Error(`${name} must be 1–1000`);
     if (mode === 'debate' && (req.minRounds ?? 1) > (req.rounds ?? 3)) throw new Error('Minimum rounds cannot exceed the maximum');
@@ -279,11 +279,11 @@ export class RunManager {
   }
 
   /** The pair workspace's current diff (for the Changes tab of a pair run). */
-  diff(id: string) {
+  async diff(id: string) {
     const store = RunStore.open(id);
     const ws = store.meta.workspace;
     if (!ws || ws.state !== 'active') return { files: [], stat: '', diff: '', truncated: false, state: ws?.state };
-    return { ...workspaceDiff(ws, 400_000), state: ws.state };
+    return { ...(await workspaceDiff(ws, 400_000)), state: ws.state };
   }
 
   html(id: string): string {

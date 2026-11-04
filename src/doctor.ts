@@ -2,12 +2,12 @@
  * Setup check, shared by `duo doctor` and the GUI's Settings → Setup check: are both CLIs installed
  * and logged in, at versions that work, and is git there for pair mode.
  */
-import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { binVersion, runBinAsync, type BinSpec } from './bins.ts';
-import { codexCatalog, resolveClaudeBin, resolveCodexBin, type Config } from './config.ts';
+import { binVersionAsync, runBinAsync, type BinSpec } from './bins.ts';
+import { codexCatalogAsync, resolveClaudeBin, resolveCodexBin, type Config } from './config.ts';
+import { gitAsync } from './worktree.ts';
 import { errorHint } from './errors.ts';
 import { CONFIG_PATH, DUO_HOME, PROJECT_ROOT } from './paths.ts';
 import { saveClaudeQuota } from './quota.ts';
@@ -37,7 +37,7 @@ export async function runDoctor(cfg: Config, o: { quick?: boolean } = {}): Promi
   let codex: BinSpec | undefined;
   try {
     codex = resolveCodexBin(cfg);
-    add({ id: 'codex', label: 'Codex CLI', level: 'ok', detail: `${binVersion(codex)} · ${codex.display}` });
+    add({ id: 'codex', label: 'Codex CLI', level: 'ok', detail: `${await binVersionAsync(codex)} · ${codex.display}` });
   } catch (e) {
     add({ id: 'codex', label: 'Codex CLI', level: 'fail', detail: (e as Error).message, fix: 'Run `npm install` in the duo folder (it pins a Codex CLI), or set codexBin in the config.' });
   }
@@ -46,14 +46,14 @@ export async function runDoctor(cfg: Config, o: { quick?: boolean } = {}): Promi
     const text = `${r.stdout ?? ''}\n${r.stderr ?? ''}`.trim();
     const ok = r.status === 0 && /logged in/i.test(text);
     add({ id: 'codex-login', label: 'Codex login', level: ok ? 'ok' : 'fail', detail: text.split('\n').filter(Boolean).pop() ?? 'not logged in', fix: ok ? undefined : 'Log in with your ChatGPT account: run `codex login` (or sign in to the ChatGPT desktop app).' });
-    const cat = codexCatalog(codex);
+    const cat = await codexCatalogAsync(codex);
     add({ id: 'codex-models', label: 'Codex models', level: cat.length ? 'ok' : 'warn', detail: cat.filter((m) => m.visibility !== 'hide').map((m) => m.slug).join(', ') || 'catalog unavailable' });
   }
 
   let claude: BinSpec | undefined;
   try {
     claude = resolveClaudeBin(cfg);
-    const v = binVersion(claude);
+    const v = await binVersionAsync(claude);
     add({ id: 'claude', label: 'Claude Code', level: 'ok', detail: `${v} · ${claude.display}` });
   } catch (e) {
     add({ id: 'claude', label: 'Claude Code', level: 'fail', detail: (e as Error).message, fix: 'Install Claude Code (https://docs.claude.com/claude-code), then run `claude` once to log in.' });
@@ -71,7 +71,7 @@ export async function runDoctor(cfg: Config, o: { quick?: boolean } = {}): Promi
   }
 
   try {
-    const g = execFileSync('git', ['--version'], { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    const g = (await gitAsync(['--version'], { timeout: 10_000 })).trim();
     const [gmaj, gmin] = version(g);
     const ok = gmaj > 2 || (gmaj === 2 && gmin >= 25);
     add({ id: 'git', label: 'git', level: ok ? 'ok' : 'warn', detail: g, fix: ok ? undefined : 'Pair mode uses git worktrees; git 2.25 or newer is recommended.' });
@@ -93,13 +93,13 @@ export async function runDoctor(cfg: Config, o: { quick?: boolean } = {}): Promi
  * Send one tiny message through each CLI (the cheapest model on each side). `claude auth status`
  * says "logged in" even when the saved session can no longer be refreshed; only a real call shows it.
  */
-export async function liveChecks(cfg: Config): Promise<Check[]> {
+export async function liveChecks(cfg: Config, signal?: AbortSignal): Promise<Check[]> {
   const out: Check[] = [];
   const cwd = mkdtempSync(join(tmpdir(), 'duo-check-'));
   try {
     try {
       const claude = resolveClaudeBin(cfg);
-      const r = await runBinAsync(claude, ['-p', '--model', 'haiku', '--no-session-persistence', '--output-format', 'stream-json', '--verbose'], { cwd, input: 'Reply with: ok', timeout: 120_000 });
+      const r = await runBinAsync(claude, ['-p', '--model', 'haiku', '--no-session-persistence', '--output-format', 'stream-json', '--verbose'], { cwd, input: 'Reply with: ok', timeout: 120_000, signal });
       let err = '';
       for (const line of String(r.stdout ?? '').split('\n')) {
         try {
@@ -117,7 +117,7 @@ export async function liveChecks(cfg: Config): Promise<Check[]> {
     }
     try {
       const codex = resolveCodexBin(cfg);
-      const r = await runBinAsync(codex, ['exec', '--skip-git-repo-check', '--ignore-user-config', '--ignore-rules', '-s', 'read-only', '-m', 'gpt-6-luna', '-c', 'model_reasoning_effort="low"', '--json', '-'], { cwd, input: 'Reply with: ok', timeout: 180_000 });
+      const r = await runBinAsync(codex, ['exec', '--skip-git-repo-check', '--ignore-user-config', '--ignore-rules', '-s', 'read-only', '-m', 'gpt-6-luna', '-c', 'model_reasoning_effort="low"', '--json', '-'], { cwd, input: 'Reply with: ok', timeout: 180_000, signal });
       let err = '';
       for (const line of String(r.stdout ?? '').split('\n')) {
         try {
