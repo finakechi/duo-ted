@@ -54,13 +54,20 @@ function alive(pidFile: string): boolean {
     return false;
   }
 }
+function cleanupChild(pidFile: string): void {
+  if (!existsSync(pidFile)) return;
+  const pid = Number(readFileSync(pidFile, 'utf8'));
+  if (!Number.isSafeInteger(pid) || pid <= 0) return;
+  try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+}
 async function gone(pidFile: string): Promise<boolean> {
   for (let i = 0; i < 50 && alive(pidFile); i++) await new Promise((r) => setTimeout(r, 100));
   return !alive(pidFile);
 }
 
-test('a check that times out ends with everything it started', async () => {
+test('a check that times out ends with everything it started', async (t) => {
   const pidFile = join(tmp, 'timeout.pid');
+  t.after(() => cleanupChild(pidFile));
   const t0 = Date.now();
   const r = await runCheck(nested(pidFile, ' && echo after'), tmp, 1500);
   assert.ok(Date.now() - t0 < 10_000, `the timed-out check returned after ${Date.now() - t0} ms`);
@@ -69,8 +76,9 @@ test('a check that times out ends with everything it started', async () => {
   assert.ok(await gone(pidFile), 'the check\'s child process was left running');
 });
 
-test('cancelling the run stops a running check at once', async () => {
+test('cancelling the run stops a running check at once', async (t) => {
   const pidFile = join(tmp, 'cancel.pid');
+  t.after(() => cleanupChild(pidFile));
   const ac = new AbortController();
   const t0 = Date.now();
   const pending = runCheck(nested(pidFile, ' && echo after'), tmp, 60_000, ac.signal);
@@ -82,8 +90,9 @@ test('cancelling the run stops a running check at once', async () => {
   assert.ok(await gone(pidFile), 'the check\'s child process survived the cancel');
 });
 
-test('a background process left by a passing check does not hold the run open', { skip: process.platform === 'win32' }, async () => {
+test('a background process left by a passing check does not hold the run open', { skip: process.platform === 'win32' }, async (t) => {
   const pidFile = join(tmp, 'background.pid');
+  t.after(() => cleanupChild(pidFile));
   const t0 = Date.now();
   const r = await runCheck(`${nested(pidFile)} & echo started`, tmp, 60_000);
   assert.ok(Date.now() - t0 < 15_000, `the check returned after ${Date.now() - t0} ms`);
@@ -101,13 +110,18 @@ test('a plain check still reports its exit code and output', async () => {
   assert.equal(bad.timedOut, false);
 });
 
-test('a check whose run is already cancelled ends at once and leaves nothing running', async () => {
+test('a check whose run is already cancelled ends at once and leaves nothing running', async (t) => {
   const pidFile = join(tmp, 'precancel.pid');
+  t.after(() => cleanupChild(pidFile));
   const ac = new AbortController();
   ac.abort();
   const r = await runCheck(nested(pidFile, ' && echo after'), tmp, 60_000, ac.signal);
   assert.equal(r.cancelled, true);
   assert.notEqual(r.exitCode, 0);
+  if (process.platform === 'win32') {
+    assert.equal(r.exitCode, null);
+    assert.equal(existsSync(pidFile), false, 'a pre-cancelled check started a child');
+  }
   if (existsSync(pidFile)) assert.ok(await gone(pidFile), 'a child started before the kill survived');
 });
 
@@ -118,8 +132,9 @@ test('a check that cannot start reports why instead of hanging', async () => {
   assert.equal(r.timedOut, false);
 });
 
-test('repeated cancellation and a timeout racing it settle once', async () => {
+test('repeated cancellation and a timeout racing it settle once', async (t) => {
   const pidFile = join(tmp, 'race.pid');
+  t.after(() => cleanupChild(pidFile));
   const ac = new AbortController();
   const pending = runCheck(nested(pidFile, ' && echo after'), tmp, 1500, ac.signal);
   for (let i = 0; i < 50 && !existsSync(pidFile); i++) await new Promise((r) => setTimeout(r, 100));

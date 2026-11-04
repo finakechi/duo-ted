@@ -57,8 +57,16 @@ function family(pidFile: string, parent: 'wait' | 'exit'): BinSpec {
   const grandchild = `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000)`;
   // 'exit': the CLI exits at once (unref: Node would otherwise wait for its child) and leaves the
   // grandchild holding the pipes; 'wait': the CLI keeps running too.
-  const code = `const c = require('child_process').spawn(${JSON.stringify(node)}, ['-e', ${JSON.stringify(grandchild)}], { stdio: 'inherit' }); console.log('started'); ${parent === 'wait' ? 'setInterval(() => {}, 1000)' : 'c.unref()'}`;
+  const code = `require('fs').writeFileSync(${JSON.stringify(pidFile + '.parent')}, String(process.pid)); const c = require('child_process').spawn(${JSON.stringify(node)}, ['-e', ${JSON.stringify(grandchild)}], { stdio: 'inherit' }); console.log('started'); ${parent === 'wait' ? 'setInterval(() => {}, 1000)' : 'c.unref()'}`;
   return { command: node, args: ['-e', code], env: {}, display: 'family' };
+}
+function cleanupFamily(pidFile: string): void {
+  for (const file of [pidFile + '.parent', pidFile]) {
+    if (!existsSync(file)) continue;
+    const pid = Number(readFileSync(file, 'utf8'));
+    if (!Number.isSafeInteger(pid) || pid <= 0) continue;
+    try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+  }
 }
 const alive = (pidFile: string) => { try { process.kill(Number(readFileSync(pidFile, 'utf8')), 0); return true; } catch { return false; } };
 async function eventually(check: () => boolean, what: string): Promise<void> {
@@ -67,16 +75,22 @@ async function eventually(check: () => boolean, what: string): Promise<void> {
 }
 const started = (pidFile: string) => eventually(() => existsSync(pidFile), 'the grandchild started');
 
-test('a timeout ends the CLI and the grandchild holding its output, and the call settles', async () => {
+test('a timeout ends the CLI and the grandchild holding its output, and the call settles', async (t) => {
   const pidFile = join(tmp, 'timeout.pid');
-  const r = await runBinAsync(family(pidFile, 'wait'), [], { timeout: 800 });
+  t.after(() => cleanupFamily(pidFile));
+  const pending = runBinAsync(family(pidFile, 'wait'), [], { timeout: 800 });
+  await started(pidFile);
+  const r = await pending;
   assert.match(r.error?.message ?? '', /timed out/);
-  assert.equal(r.status, null);
+  // taskkill /F exits a Node child with code 1 on Windows; POSIX signals yield null.
+  if (process.platform === 'win32') assert.notEqual(r.status, 0, 'a forcibly ended CLI must not report success');
+  else assert.equal(r.status, null);
   await eventually(() => !alive(pidFile), 'the grandchild was left running');
 });
 
-test('an abort ends the tree; aborting again or after it settled is harmless', async () => {
+test('an abort ends the tree; aborting again or after it settled is harmless', async (t) => {
   const pidFile = join(tmp, 'abort.pid');
+  t.after(() => cleanupFamily(pidFile));
   const ac = new AbortController();
   const pending = runBinAsync(family(pidFile, 'wait'), [], { signal: ac.signal, timeout: 60_000 });
   await started(pidFile);
@@ -88,17 +102,24 @@ test('an abort ends the tree; aborting again or after it settled is harmless', a
   ac.abort();
 });
 
-test('an already-aborted signal settles at once without leaving the CLI running', async () => {
+test('an already-aborted signal settles at once without leaving the CLI running', async (t) => {
   const pidFile = join(tmp, 'pre.pid');
+  t.after(() => cleanupFamily(pidFile));
   const ac = new AbortController();
   ac.abort();
   const r = await runBinAsync(family(pidFile, 'wait'), [], { signal: ac.signal, timeout: 60_000 });
   assert.match(r.error?.message ?? '', /cancelled/);
+  if (process.platform === 'win32') {
+    assert.equal(r.status, null);
+    assert.equal(existsSync(pidFile + '.parent'), false, 'a pre-cancelled CLI was spawned');
+    assert.equal(existsSync(pidFile), false, 'a pre-cancelled CLI started its grandchild');
+  }
   if (existsSync(pidFile)) await eventually(() => !alive(pidFile), 'a grandchild started before the kill survived');
 });
 
-test('a CLI that exits but leaves a process holding its output settles with its result', async () => {
+test('a CLI that exits but leaves a process holding its output settles with its result', async (t) => {
   const pidFile = join(tmp, 'leftover.pid');
+  t.after(() => cleanupFamily(pidFile));
   const r = await runBinAsync(family(pidFile, 'exit'), [], { timeout: 60_000 });
   assert.equal(r.status, 0);
   assert.equal(r.error, undefined);
@@ -115,10 +136,11 @@ test('a CLI that cannot start settles with the error, whatever the reason', asyn
   assert.ok((await runBinAsync({ command: join(tmp, 'no-such-cli'), args: [], env: {}, display: 'x' }, [], { signal: ac.signal })).error);
 });
 
-test('Ctrl-C to duo still ends the CLIs it started, and still ends duo', { skip: process.platform === 'win32' && 'checked through POSIX signals' }, async () => {
+test('Ctrl-C to duo still ends the CLIs it started, and still ends duo', { skip: process.platform === 'win32' && 'checked through POSIX signals' }, async (t) => {
   const { spawn } = await import('node:child_process');
   const bins = join(import.meta.dirname, '..', 'src', 'bins.ts');
   const pidFile = join(tmp, 'sigint.pid');
+  t.after(() => cleanupFamily(pidFile));
   const script = `const { runBinAsync } = await import(${JSON.stringify(pathToFileURL(bins).href)});
     void runBinAsync(${JSON.stringify(family(pidFile, 'wait'))}, []);
     setInterval(() => {}, 1000);`;
@@ -130,11 +152,12 @@ test('Ctrl-C to duo still ends the CLIs it started, and still ends duo', { skip:
   await eventually(() => !alive(pidFile), 'the CLI tree survived Ctrl-C');
 });
 
-test('CLIs still running end when duo exits, except one marked to outlive it', { skip: process.platform === 'win32' && 'checked through POSIX process groups' }, async () => {
+test('CLIs still running end when duo exits, except one marked to outlive it', { skip: process.platform === 'win32' && 'checked through POSIX process groups' }, async (t) => {
   const { spawnSync } = await import('node:child_process');
   const bins = join(import.meta.dirname, '..', 'src', 'bins.ts');
   for (const outlive of [false, true]) {
     const pidFile = join(tmp, `exit-${outlive}.pid`);
+    t.after(() => cleanupFamily(pidFile));
     const fam = family(pidFile, 'wait');
     // A duo process that starts the CLI, waits for its grandchild, then exits without cleaning up.
     const script = `const { runBinAsync } = await import(${JSON.stringify(pathToFileURL(bins).href)});
