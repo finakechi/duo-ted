@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { after, test } from 'node:test';
@@ -43,7 +43,7 @@ test('a directory alias resolves into the worktree instead of escaping to the or
 // writes its pid, so the test can see whether it outlived the check.
 const node = JSON.stringify(process.execPath);
 function nested(pidFile: string, tail = ''): string {
-  const child = `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setTimeout(() => {}, 60000)`;
+  const child = `const fs = require('node:fs'); const beat = ${JSON.stringify(pidFile + '.beat')}; const stop = ${JSON.stringify(pidFile + '.stop')}; fs.writeFileSync(beat, ''); fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => { if (fs.existsSync(stop)) { fs.writeFileSync(${JSON.stringify(pidFile + '.stopped')}, ''); process.exit(0); } fs.writeFileSync(beat, ''); }, 100);`;
   return `${node} -e ${JSON.stringify(child)}${tail}`;
 }
 function alive(pidFile: string): boolean {
@@ -54,11 +54,27 @@ function alive(pidFile: string): boolean {
     return false;
   }
 }
-function cleanupChild(pidFile: string): void {
-  if (!existsSync(pidFile)) return;
-  const pid = Number(readFileSync(pidFile, 'utf8'));
-  if (!Number.isSafeInteger(pid) || pid <= 0) return;
-  try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+async function cleanupChild(pidFile: string, checks = 50): Promise<void> {
+  // The fake child observes this file itself. The PID may be stale or reused.
+  writeFileSync(pidFile + '.stop', '');
+  const beat = pidFile + '.beat';
+  for (let i = 0; i < checks; i++) {
+    if (existsSync(pidFile + '.stopped') || !existsSync(beat)) return;
+    if (existsSync(pidFile)) {
+      const pid = Number(readFileSync(pidFile, 'utf8'));
+      assert.ok(Number.isSafeInteger(pid) && pid > 0, `invalid fixture PID: ${pidFile}`);
+      try {
+        // Signal 0 only checks for absence; it never establishes ownership or kills a PID.
+        process.kill(pid, 0);
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === 'ESRCH') return;
+        throw e;
+      }
+    }
+    // A stale heartbeat is NOT proof of exit: a hung fixture may still be alive.
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.fail(`fixture did not stop: ${pidFile}`);
 }
 async function gone(pidFile: string): Promise<boolean> {
   for (let i = 0; i < 50 && alive(pidFile); i++) await new Promise((r) => setTimeout(r, 100));
@@ -146,4 +162,93 @@ test('repeated cancellation and a timeout racing it settle once', async (t) => {
   assert.ok(await gone(pidFile));
   // Wait past the timeout: nothing fires after the check settled.
   await new Promise((r) => setTimeout(r, 1700));
+});
+
+test('fixture cleanup ends a live check child after an assertion failure', async (t) => {
+  const pidFile = join(tmp, 'failure.pid');
+  t.after(() => cleanupChild(pidFile));
+  const pending = runCheck(nested(pidFile), tmp, 15_000);
+  try {
+    for (let i = 0; i < 50 && !existsSync(pidFile); i++) await new Promise((r) => setTimeout(r, 100));
+    assert.ok(existsSync(pidFile), 'fixture never started');
+    assert.throws(() => assert.fail('simulated assertion failure'), /simulated assertion failure/);
+  } finally {
+    await cleanupChild(pidFile);
+  }
+  await pending;
+  assert.equal(existsSync(pidFile + '.stopped'), true, 'child did not acknowledge shutdown');
+  assert.ok(await gone(pidFile), 'fixture survived cleanup');
+});
+
+test('cleanup of stale or reused check PID cannot stop an unrelated fake', async () => {
+  const { spawn } = await import('node:child_process');
+  const exited = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' });
+  await new Promise<void>((resolve) => exited.once('exit', () => resolve()));
+  const oldPidFile = join(tmp, 'already-exited.pid');
+  writeFileSync(oldPidFile, String(exited.pid));
+  await cleanupChild(oldPidFile);
+
+  const unrelatedStop = join(tmp, 'unrelated.stop');
+  const unrelatedReady = join(tmp, 'unrelated.ready');
+  const unrelated = spawn(process.execPath, ['-e', `const fs = require('node:fs'); fs.writeFileSync(${JSON.stringify(unrelatedReady)}, ''); setInterval(() => { if (fs.existsSync(${JSON.stringify(unrelatedStop)})) process.exit(0); }, 50)`], { stdio: 'ignore' });
+  const unrelatedExited = new Promise<void>((resolve) => unrelated.once('exit', () => resolve()));
+  try {
+    for (let i = 0; i < 50 && !existsSync(unrelatedReady); i++) await new Promise((r) => setTimeout(r, 100));
+    assert.ok(existsSync(unrelatedReady), 'unrelated fake did not start');
+    const staleFile = join(tmp, 'reused.pid');
+    writeFileSync(staleFile, String(unrelated.pid));
+    await cleanupChild(staleFile);
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(unrelated.exitCode, null, 'unrelated fake was terminated');
+    assert.equal(unrelated.signalCode, null, 'unrelated fake received a signal');
+  } finally {
+    writeFileSync(unrelatedStop, '');
+    await unrelatedExited;
+  }
+});
+
+// Run a separate test process so an actual failed assertion does not fail this suite.
+const worktreeCleanupProbe = process.env.DUO_WORKTREE_CLEANUP_PROBE;
+if (worktreeCleanupProbe) {
+  test('probe: failed assertion triggers worktree t.after', async (t) => {
+    t.after(() => cleanupChild(worktreeCleanupProbe));
+    void runCheck(nested(worktreeCleanupProbe), tmp, 15_000);
+    for (let i = 0; i < 50 && !existsSync(worktreeCleanupProbe); i++) await new Promise((r) => setTimeout(r, 100));
+    assert.ok(existsSync(worktreeCleanupProbe), 'fixture never started');
+    assert.fail('intentional worktree assertion failure');
+  });
+}
+
+test('t.after cleans a check child after a real failed assertion', async (t) => {
+  const { spawnSync } = await import('node:child_process');
+  const pidFile = join(tmp, 'actual-failure.pid');
+  t.after(() => cleanupChild(pidFile));
+  const r = spawnSync(process.execPath, ['--test', '--test-name-pattern=^probe: failed assertion triggers worktree t.after$', join(import.meta.dirname, 'worktree.test.ts')], {
+    encoding: 'utf8', timeout: 15_000, windowsHide: true,
+    // A nested test runner must not inherit Node's test-worker marker.
+    env: { ...process.env, NODE_TEST_CONTEXT: undefined, DUO_WORKTREE_CLEANUP_PROBE: pidFile },
+  });
+  assert.ifError(r.error);
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stdout + r.stderr, /intentional worktree assertion failure/);
+  assert.equal(existsSync(pidFile + '.stopped'), true, 'cleanup hook did not run');
+  assert.ok(await gone(pidFile), 'subprocess fixture survived');
+});
+
+test('a stale heartbeat cannot conceal a still-running fake check child', async () => {
+  const { spawn } = await import('node:child_process');
+  const pidFile = join(tmp, 'unresponsive.pid');
+  const release = pidFile + '.release';
+  const script = `const fs = require('node:fs'); fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); fs.writeFileSync(${JSON.stringify(pidFile + '.beat')}, ''); setInterval(() => { if (fs.existsSync(${JSON.stringify(release)})) process.exit(0); }, 50);`;
+  const child = spawn(process.execPath, ['-e', script], { stdio: 'ignore' });
+  const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
+  try {
+    for (let i = 0; i < 50 && !existsSync(pidFile + '.beat'); i++) await new Promise((r) => setTimeout(r, 100));
+    assert.ok(existsSync(pidFile + '.beat'), 'fake check child did not start');
+    utimesSync(pidFile + '.beat', 1, 1);
+    await assert.rejects(cleanupChild(pidFile, 2), /fixture did not stop/);
+  } finally {
+    writeFileSync(release, '');
+    await exited;
+  }
 });
