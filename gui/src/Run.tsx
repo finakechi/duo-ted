@@ -12,7 +12,7 @@ import { SeatPicker } from './SeatPicker.tsx';
 import { parseSpec, shortSpec } from './spec.ts';
 import { app, cancelRun, confirmAction, continueRun, deleteRun, go, guard, loadRun, prefs, project, runLive, runLogs, runs, startRun, toast, updateClaude, workspaceAction } from './store.ts';
 import type { LiveTurn, PairCycle, Protocol, RunDetails, RunTurnMeta, StartRun } from './types.ts';
-import { base, Dropdown, dur, Elapsed, Empty, EngineMark, Icon, IntegerInput, Kbd, kfmt, MenuItem, MenuSeparator, Modal, money, Segmented, Spinner, Tabs, Toggle, untilText } from './ui.tsx';
+import { base, Cost, CREDIT_NOTE, Dropdown, dur, Elapsed, Empty, EngineMark, Icon, IntegerInput, Kbd, kfmt, MenuItem, MenuSeparator, Modal, money, Segmented, Spinner, Tabs, Toggle, untilText, USD_NOTE } from './ui.tsx';
 
 export const PROTOCOLS: Record<Protocol, { icon: string; label: string; help: string; mode: ModeId; }> = {
   pair: { icon: 'pair', label: 'Pair', help: MODES.pair.tagline, mode: 'pair' },
@@ -114,7 +114,7 @@ function TurnCard({ t, onOpen }: { t: RunTurnMeta; onOpen: () => void; }) {
       <div class="tc-top"><span class="tc-kind">{t.kind}</span><span class="muted small">{dur(t.durationMs)}</span></div>
       <div class="tc-bottom">
         {t.verdict && <span class={`verdict v-${t.verdict.replace('/', '').replace('_', '-')}`}>{t.verdict.replace('_', ' ')}</span>}
-        {t.error ? <span class="badge bad">error</span> : <span class="muted small">{kfmt(t.usage.output)} out{money(t.codexCredits, t.usd) ? ` · ${money(t.codexCredits, t.usd)}` : ''}</span>}
+        {t.error ? <span class="badge bad">error</span> : <span class="muted small">{kfmt(t.usage.output)} out{(money(t.codexCredits, t.usd) || t.unpriced) && <> · <Cost credits={t.codexCredits} usd={t.usd} unpriced={t.unpriced} /></>}</span>}
         {t.warnings?.length ? <span class="badge warn" title={t.warnings.join('\n')}>{t.warnings.length} warning{t.warnings.length > 1 ? 's' : ''}</span> : null}
       </div>
     </button>
@@ -401,7 +401,7 @@ function TurnModal({ runId, n, onClose }: { runId: string; n: number; onClose: (
             {tab === 'thinking' && (t.thinking ? <pre class="io tall">{t.thinking}</pre> : <p class="muted">The model did not expose its reasoning for this turn.</p>)}
           </div>
           <div class="muted small turn-meta">
-            {dur(t.meta.durationMs)} · {kfmt(t.meta.usage.input)} in ({kfmt(t.meta.usage.cached)} cached) · {kfmt(t.meta.usage.output)} out ({kfmt(t.meta.usage.reasoning)} reasoning){money(t.meta.codexCredits, t.meta.usd) ? ` · ${money(t.meta.codexCredits, t.meta.usd)}` : ''}
+            {dur(t.meta.durationMs)} · {kfmt(t.meta.usage.input)} in ({kfmt(t.meta.usage.cached)} cached) · {kfmt(t.meta.usage.output)} out ({kfmt(t.meta.usage.reasoning)} reasoning){(money(t.meta.codexCredits, t.meta.usd) || t.meta.unpriced) && <> · <Cost credits={t.meta.codexCredits} usd={t.meta.usd} unpriced={t.meta.unpriced} /></>}
             {t.meta.error && <div class="bad-text">error: {t.meta.error}</div>}
             {t.meta.warnings?.map((w: string) => <div class="warn-text">warning: {w}</div>)}
           </div>
@@ -508,7 +508,7 @@ export function RunView({ id }: { id: string; }) {
           <SeatChips d={d} />
           <span class="meta-item" title={m.cwd}><Icon name={m.options.workspace === false ? 'folder-off' : 'folder'} size={13} /> {m.options.workspace === false ? 'no folder' : base(m.cwd)}</span>
           {running ? <span class="meta-item"><Icon name="clock" size={13} /> <Elapsed since={new Date(m.createdAt).getTime()} /></span> : t && <span class="meta-item"><Icon name="clock" size={13} /> {dur(t.durationMs)}</span>}
-          {t && (t.codexCredits > 0 || t.usd > 0) && <span class="meta-item" title="Codex plan credits and Claude API-equivalent cost">{t.codexCredits > 0 ? `${t.codexCredits} cr` : ''}{t.codexCredits > 0 && t.usd > 0 ? ' · ' : ''}{t.usd > 0 ? `~$${t.usd}` : ''}</span>}
+          {t && (t.codexCredits > 0 || t.usd > 0 || !!t.unpricedTurns) && <span class="meta-item" title={`${CREDIT_NOTE}\n${USD_NOTE}${t.unpricedTurns ? `\n${t.unpricedTurns} turn(s) have no price and are not counted.` : ''}`}>{t.codexCredits > 0 ? `${t.codexCredits} cr` : ''}{t.codexCredits > 0 && t.usd > 0 ? ' · ' : ''}{t.usd > 0 ? `~$${t.usd}` : ''}{t.unpricedTurns ? <span class="unpriced">{t.codexCredits > 0 || t.usd > 0 ? ' + ' : ''}{t.unpricedTurns} unpriced</span> : null}</span>}
           <Progress d={d} running={running} />
         </div>
         {stop && !running && (

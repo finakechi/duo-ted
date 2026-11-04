@@ -16,10 +16,11 @@ import { claudeRoute, claudeSink, codexRoute, dropCodexRoute } from '../hooks.ts
 import { ClaudeTranslator, CodexTranslator, type Block } from '../live.ts';
 import { DUO_HOME } from '../paths.ts';
 import { nodeRunner } from '../platform.ts';
-import { codexCredits } from '../pricing.ts';
+import { codexPrice } from '../pricing.ts';
 import { saveClaudeQuota, snapshot } from '../quota.ts';
 import { codexOverrides, parseSeat, type Seat } from '../seats.ts';
 import type { Usage } from '../store.ts';
+import type { ClaudeTurnCost } from '../tap.ts';
 import type { Bus } from './bus.ts';
 import type { PermissionBroker } from './permissions.ts';
 
@@ -55,8 +56,12 @@ export interface ChatTurn {
   status: 'running' | 'done' | 'error' | 'stopped';
   durationMs?: number;
   usage?: Usage;
+  /** Codex: plan credits at the published rate. */
   credits?: number;
+  /** Claude: Claude Code's API-equivalent estimate at list prices. */
   usd?: number;
+  /** Why the turn has no cost (no published rate, unknown tier, or the CLI only guessed). */
+  unpriced?: string;
   error?: string;
   hint?: string;
 }
@@ -465,10 +470,10 @@ export class ChatManager {
     // Match run turns: explicit CLI completion can supersede a recoverable transport error,
     // while partial text alone cannot turn a failure into a success.
     const completed = f.completed && turn.blocks.some((b) => b.kind === 'text' && b.text);
-    this.endTurn(s, turn, started, { stopped, error: f.error ?? (completed ? undefined : error), usage: f.usage, costUsd: f.costUsd });
+    this.endTurn(s, turn, started, { stopped, error: f.error ?? (completed ? undefined : error), usage: f.usage, costUsd: f.costUsd, claudeTurn: f.turn });
   }
 
-  private endTurn(s: ChatSession, turn: ChatTurn, started: number, o: { stopped?: boolean; error?: string; usage?: Usage; costUsd?: number }): void {
+  private endTurn(s: ChatSession, turn: ChatTurn, started: number, o: { stopped?: boolean; error?: string; usage?: Usage; costUsd?: number; claudeTurn?: ClaudeTurnCost }): void {
     this.running.delete(s.id);
     turn.durationMs = Date.now() - started;
     if (o.usage) {
@@ -480,15 +485,24 @@ export class ChatManager {
           ? { input: o.usage.input - prev.input, cached: Math.max(0, o.usage.cached - prev.cached), output: Math.max(0, o.usage.output - prev.output), reasoning: Math.max(0, o.usage.reasoning - prev.reasoning) }
           : o.usage;
         const seat = parseSeat(turn.spec, 'A', this.cfg.defaults);
-        turn.credits = codexCredits(seat.model, turn.usage, seat.tier);
+        const price = codexPrice(seat.model, turn.usage, seat.tier);
+        turn.credits = price.credits;
+        if (price.unpriced && turn.usage.input + turn.usage.output > 0) turn.unpriced = price.unpriced;
       } else {
         turn.usage = o.usage;
       }
     }
     if (o.costUsd !== undefined) {
+      // Older CLIs state only the process's running total; difference it for this turn's share.
       const prev = s.claudeCost ?? 0;
       turn.usd = o.costUsd >= prev ? o.costUsd - prev : o.costUsd;
       s.claudeCost = o.costUsd;
+    }
+    // Newer CLIs state the turn's own cost, which stays right across model switches and restarts.
+    if (o.claudeTurn?.usd !== undefined) turn.usd = o.claudeTurn.usd;
+    if (o.claudeTurn?.unpriced) {
+      turn.usd = undefined;
+      turn.unpriced = o.claudeTurn.unpriced;
     }
     turn.status = o.stopped ? 'stopped' : o.error ? 'error' : 'done';
     if (!o.stopped && o.error) {

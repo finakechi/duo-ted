@@ -17,7 +17,10 @@ export interface ParsedTurn {
   usage?: Usage;
   /** Codex: cumulative for the thread. Claude: this turn. */
   usageIsCumulative: boolean;
+  /** Claude: the CLI's running total for the process (see claudeTurnCost for this turn's share). */
   costUsd?: number;
+  /** Claude: this turn's cost and usage as the CLI stated them, when it states them per result. */
+  turn?: ClaudeTurnCost;
   threadId?: string;
   sessionId?: string;
   model?: string;
@@ -158,6 +161,8 @@ export function parseClaudeStream(raw: string): ParsedTurn {
           reasoning: 0,
         };
         t.costUsd = ev.total_cost_usd;
+        t.turn = claudeTurnCost(ev);
+        if (t.turn.usage) t.usage = t.turn.usage;
         if (ev.structured_output !== undefined) t.structured = ev.structured_output;
         t.reply = typeof ev.result === 'string' ? ev.result : '';
         if (ev.is_error || (ev.subtype && ev.subtype !== 'success')) t.error = String(ev.result || ev.subtype || 'error');
@@ -168,6 +173,48 @@ export function parseClaudeStream(raw: string): ParsedTurn {
   if (!t.reply && t.interim.length) t.reply = t.interim[t.interim.length - 1];
   t.interim = t.interim.filter((x) => x !== t.reply);
   return t;
+}
+
+export interface ClaudeTurnCost {
+  /** This turn's API-equivalent cost, when the CLI states it per result and priced every model. */
+  usd?: number;
+  /** All of the turn's model calls (subagents included), when the CLI states them per result. */
+  usage?: Usage;
+  /** Why the cost cannot be shown: the CLI had no price for a model and guessed. */
+  unpriced?: string;
+}
+
+type ModelUsage = Record<string, { inputTokens?: number; outputTokens?: number; cacheReadInputTokens?: number; cacheCreationInputTokens?: number; thinkingTokens?: number; costUSD?: number; costBasis?: string; canonicalModel?: string }>;
+
+/**
+ * A Claude turn's own cost from its `result` event. Claude Code states each result's calls in
+ * `model_usage_since_last_result`, which is what to sum: `total_cost_usd` and `modelUsage` are
+ * running totals that a resume, restart or crash can restart or carry over, so differencing them
+ * misprices the turns after a model switch or a restarted process. `usage` covers the main loop
+ * only (no subagents). A `costBasis` of "unknown" means Claude Code had no price for the model and
+ * used its default model's rate; that figure is not shown as this model's cost. Older CLIs send
+ * neither field; the caller then falls back to differencing the running total.
+ */
+export function claudeTurnCost(ev: Record<string, any>): ClaudeTurnCost {
+  const unknown = (m: ModelUsage | undefined) => Object.entries(m ?? {}).filter(([, v]) => v?.costBasis === 'unknown').map(([k, v]) => v.canonicalModel ?? k);
+  const note = (models: string[]) => `this Claude Code has no price for ${models.join(', ')} and estimated it at another model's rate; update Claude Code`;
+  const delta = ev.model_usage_since_last_result as ModelUsage | undefined;
+  if (delta && typeof delta === 'object') {
+    const usage: Usage = { input: 0, cached: 0, output: 0, reasoning: 0 };
+    let usd = 0;
+    for (const m of Object.values(delta)) {
+      usage.input += (m.inputTokens ?? 0) + (m.cacheReadInputTokens ?? 0) + (m.cacheCreationInputTokens ?? 0);
+      usage.cached += m.cacheReadInputTokens ?? 0;
+      usage.output += m.outputTokens ?? 0;
+      usage.reasoning += m.thinkingTokens ?? 0;
+      usd += m.costUSD ?? 0;
+    }
+    const guessed = unknown(delta);
+    return guessed.length ? { usage, unpriced: note(guessed) } : { usd, usage };
+  }
+  // Older CLIs: only running totals. costBasis there is the latest request's, which is this turn's.
+  const guessed = unknown(ev.modelUsage as ModelUsage | undefined);
+  return guessed.length ? { unpriced: note(guessed) } : {};
 }
 
 /** Pull a JSON object out of a model reply (tolerates code fences and surrounding prose). */

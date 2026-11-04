@@ -79,8 +79,12 @@ export interface TurnRecord {
   thinking: string[];
   tools: ToolCall[];
   usage: Usage;
+  /** Codex: plan credits at the published rate. */
   codexCredits?: number;
+  /** Claude: Claude Code's API-equivalent estimate at list prices (not a subscription charge). */
   usd?: number;
+  /** Why the turn has no cost: no published rate for the model or tier, or the CLI only guessed. */
+  unpriced?: string;
   rateLimits?: unknown;
   verdict?: string;
   error?: string;
@@ -104,7 +108,7 @@ export interface RunMeta {
   turns: Omit<TurnRecord, 'reply' | 'structured' | 'thinking' | 'tools'>[];
   outcome?: Record<string, unknown>;
   quota?: { before?: QuotaSnapshot; after?: QuotaSnapshot; };
-  totals?: Usage & { codexCredits: number; usd: number; durationMs: number; turns: number; };
+  totals?: Usage & { codexCredits: number; usd: number; durationMs: number; turns: number; /** Turns left out of the cost totals because they have no price. */ unpricedTurns?: number; };
   error?: string;
   continuedFrom?: string;
   /** Pair runs: where the writer works, and what became of it (applied, kept, discarded). */

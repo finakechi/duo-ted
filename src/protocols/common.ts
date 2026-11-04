@@ -275,6 +275,7 @@ export class RunContext {
       usd: Math.round(sum((t) => t.usd) * 10000) / 10000,
       durationMs: Date.now() - this.started,
       turns: turns.length,
+      unpricedTurns: turns.filter((t) => t.unpriced).length,
     };
     this.store.meta.quota = { before: this.quotaBefore, after };
     this.store.meta.status = status;
@@ -283,7 +284,7 @@ export class RunContext {
     this.store.save();
     await this.engines.close();
     const tot = this.store.meta.totals;
-    this.log(`done in ${(tot.durationMs / 1000).toFixed(0)}s · ${tot.turns} turns · ${tot.codexCredits} Codex credits · ~$${tot.usd} Claude API-equivalent`);
+    this.log(`done in ${(tot.durationMs / 1000).toFixed(0)}s · ${tot.turns} turns · ${tot.codexCredits} Codex credits · ~$${tot.usd} Claude API-equivalent${tot.unpricedTurns ? ` · ${tot.unpricedTurns} turn(s) without a price not counted` : ''}`);
     this.log(`quota codex ${formatDelta(this.quotaBefore.codex?.windows, after.codex?.windows)} | claude ${formatDelta(this.quotaBefore.claude?.windows, after.claude?.windows)}`);
     this.emit({ kind: 'done', status, outcome });
   }
