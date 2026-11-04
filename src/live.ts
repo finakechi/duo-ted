@@ -3,6 +3,7 @@
  * reasoning, tool calls with outputs, patches, plans). Chats and runs both use it.
  */
 import { classifyError } from './errors.ts';
+import { claudeTurnCost, type ClaudeTurnCost } from './tap.ts';
 
 export interface Block {
   id: string;
@@ -24,6 +25,8 @@ export interface TurnFacts {
   completed?: boolean;
   usage?: { input: number; cached: number; output: number; reasoning: number };
   costUsd?: number;
+  /** Claude: this turn's own cost and usage, when the CLI states them per result. */
+  turn?: ClaudeTurnCost;
   threadId?: string;
   sessionId?: string;
   rateLimits?: unknown;
@@ -131,6 +134,8 @@ export class ClaudeTranslator extends Translator {
           reasoning: 0,
         };
         this.facts.costUsd = ev.total_cost_usd;
+        this.facts.turn = claudeTurnCost(ev);
+        if (this.facts.turn.usage) this.facts.usage = this.facts.turn.usage;
         this.facts.completed = !ev.is_error && (!ev.subtype || ev.subtype === 'success');
         this.facts.error = this.facts.completed ? undefined : String(ev.result || ev.subtype || 'error');
         for (const b of this.blocks) if (b.status === 'running') { b.status = 'done'; changed.add(b); }

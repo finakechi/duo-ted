@@ -11,9 +11,10 @@ function defaultsFor(engine: Engine): SpecParts {
   return parseSpec(engine === 'claude' ? s.gui.claude.spec : s.gui.codex.spec);
 }
 
-function rateLabel(slug: string): string | undefined {
-  const r = app.value?.rates[slug];
-  return r ? `${r[0]} / ${r[2]} cr per 1M in/out` : undefined;
+/** The published Standard credit rate; a model without one says so instead of borrowing another's. */
+function rateLabel(slug: string): string {
+  const r = app.value?.rates[slug.toLowerCase()];
+  return r ? `${r[0]} / ${r[2]} cr per 1M in/out` : 'no published credit rate in this version of Duo';
 }
 
 /** Model + effort + options for one seat. `seat` shows the read-only-seat options (Claude web search). */
@@ -57,7 +58,7 @@ export function SeatPicker({ spec, onChange, engineLocked, seat, align = 'left',
                   <button type="button" class={`model-row ${m.slug === p.model ? 'on' : ''}`} onClick={() => apply({ ...p, model: m.slug, effort: m.efforts.includes(p.effort ?? '') ? p.effort : m.defaultEffort })}>
                     <span class="model-name">{m.display}{m.slug === p.model && <Icon name="check" size={13} />}</span>
                     <span class="model-desc">{m.description}</span>
-                    {rateLabel(m.slug) && <span class="model-rate">{rateLabel(m.slug)}</span>}
+                    <span class="model-rate" title="Codex plan credits at the published Standard rate">{rateLabel(m.slug)}</span>
                   </button>
                 ))
               : s.models.claude.map((m) => (

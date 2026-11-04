@@ -311,6 +311,16 @@ export function untilText(epochSec: number): string {
 
 export function money(credits?: number, usd?: number): string {
   if (credits !== undefined) return `${credits < 10 ? credits.toFixed(2) : credits.toFixed(1)} cr`;
-  if (usd !== undefined) return `$${usd < 1 ? usd.toFixed(3) : usd.toFixed(2)}`;
+  if (usd !== undefined) return `~$${usd < 1 ? usd.toFixed(3) : usd.toFixed(2)}`;
   return '';
+}
+
+export const CREDIT_NOTE = 'Codex plan credits at the published Standard rate (Fast counts double). Not dollars, and not the share of your plan’s included usage.';
+export const USD_NOTE = 'API-equivalent estimate from Claude Code’s list prices. Not what a Claude subscription charges.';
+
+/** A turn's cost in its own unit and labelled as such; "no price" with the reason when it has none. */
+export function Cost({ credits, usd, unpriced, class: cls = '' }: { credits?: number; usd?: number; unpriced?: string; class?: string }) {
+  if (unpriced) return <span class={`${cls} unpriced`} title={`No price: ${unpriced}`}>no price</span>;
+  const text = money(credits, usd);
+  return text ? <span class={cls} title={credits !== undefined ? CREDIT_NOTE : USD_NOTE}>{text}</span> : null;
 }

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Pricing: GPT-6.1 Terra has its published credit rate; it previously showed no cost at all. Model ids match regardless of case, an `openai/` prefix or a dated snapshot suffix.
+- Pricing: a model, variant or service tier without a published rate shows as **no price** with the reason, and is left out of totals (with a note). Before, newer versions silently borrowed a neighbour's rate: `gpt-6.2-luna` was priced as GPT-6 Luna, and `gpt-6-sol-mini` as GPT-6.1 Sol. Ultrafast now counts 6×; it was charged at the Standard rate.
+- Pricing: a Claude turn's cost is the per-result figure Claude Code states, so model switches and restarted CLIs no longer misprice the next turn, and subagents count towards token usage. When Claude Code has no price for a model (`costBasis: unknown`), its guess at another model's rate is not shown.
+- Costs are labelled as what they are everywhere (plan credits, or Claude's API-equivalent estimate), and the model picker says when a Codex model has no published rate.
+
 - The app engine no longer freezes while a slow CLI call runs: quota refresh, the setup and live sign-in checks, and **Update Claude Code** now run without blocking chats, runs and other requests. CLI versions are remembered until the binary changes instead of being asked on every app state call and run start.
 - Pair check commands: a timeout or **Stop** ends the whole process tree the check started (not only its shell), a background process left behind no longer keeps the run waiting, and checks still running end with Duo.
 - Deleting a chat while it is answering no longer brings it back after the turn ends; its stream trace is removed with it.

@@ -9,9 +9,15 @@ export function kfmt(n: number | undefined): string {
   return v >= 1000 ? `${(v / 1000).toFixed(1)}K` : String(v);
 }
 
-export function fmtTurnLine(t: Pick<TurnRecord, 'round' | 'kind' | 'durationMs' | 'usage' | 'codexCredits' | 'usd' | 'verdict'> & { tools: unknown[] | number }, label: string): string {
+/** A turn's cost: Codex credits, Claude's API-equivalent estimate (~$), or "no price". */
+export function costText(t: Pick<TurnRecord, 'codexCredits' | 'usd' | 'unpriced'>): string {
+  if (t.unpriced) return 'no price';
+  return t.codexCredits !== undefined ? `${t.codexCredits.toFixed(2)} cr` : t.usd !== undefined ? `~$${t.usd.toFixed(3)}` : '';
+}
+
+export function fmtTurnLine(t: Pick<TurnRecord, 'round' | 'kind' | 'durationMs' | 'usage' | 'codexCredits' | 'usd' | 'unpriced' | 'verdict'> & { tools: unknown[] | number }, label: string): string {
   const tools = Array.isArray(t.tools) ? t.tools.length : t.tools;
-  const cost = t.codexCredits !== undefined ? `${t.codexCredits.toFixed(2)} cr` : t.usd !== undefined ? `$${t.usd.toFixed(3)}` : '';
+  const cost = costText(t);
   return [
     `R${t.round} ${label} ${t.kind}`,
     `${(t.durationMs / 1000).toFixed(0)}s`,
@@ -182,9 +188,10 @@ export function reviewReport(meta: RunMeta, findings: MergedFinding[], summaries
 }
 
 export function usageSection(meta: RunMeta): string {
-  const bySeat = new Map<string, { turns: number; ms: number; input: number; cached: number; output: number; reasoning: number; credits: number; usd: number }>();
+  const bySeat = new Map<string, { turns: number; ms: number; input: number; cached: number; output: number; reasoning: number; credits: number; usd: number; unpriced: number }>();
   for (const t of meta.turns) {
-    const s = bySeat.get(t.seat) ?? { turns: 0, ms: 0, input: 0, cached: 0, output: 0, reasoning: 0, credits: 0, usd: 0 };
+    const s = bySeat.get(t.seat) ?? { turns: 0, ms: 0, input: 0, cached: 0, output: 0, reasoning: 0, credits: 0, usd: 0, unpriced: 0 };
+    if (t.unpriced) s.unpriced++;
     s.turns++;
     s.ms += t.durationMs;
     s.input += t.usage.input;
@@ -198,7 +205,12 @@ export function usageSection(meta: RunMeta): string {
   const specs = Object.fromEntries(meta.seats.map((s) => [s.role === 'chair' && !s.customRole ? 'chair' : s.id, s.spec]));
   const out = ['## Usage', '', '| seat | spec | turns | time | input (cached) | output (reasoning) | cost |', '|---|---|---|---|---|---|---|'];
   for (const [seat, s] of [...bySeat].sort(([a], [b]) => (a === 'chair' ? 1 : b === 'chair' ? -1 : a.localeCompare(b)))) {
-    out.push(`| ${seat} | \`${specs[seat] ?? ''}\` | ${s.turns} | ${(s.ms / 1000).toFixed(0)}s | ${kfmt(s.input)} (${kfmt(s.cached)}) | ${kfmt(s.output)} (${kfmt(s.reasoning)}) | ${s.credits ? s.credits.toFixed(2) + ' cr' : ''}${s.usd ? ' ~$' + s.usd.toFixed(3) : ''} |`);
+    out.push(`| ${seat} | \`${specs[seat] ?? ''}\` | ${s.turns} | ${(s.ms / 1000).toFixed(0)}s | ${kfmt(s.input)} (${kfmt(s.cached)}) | ${kfmt(s.output)} (${kfmt(s.reasoning)}) | ${s.credits ? s.credits.toFixed(2) + ' cr' : ''}${s.usd ? ' ~$' + s.usd.toFixed(3) : ''}${s.unpriced ? ` (${s.unpriced} turn${s.unpriced > 1 ? 's' : ''} without a price)` : ''} |`);
+  }
+  if (meta.turns.some((t) => t.codexCredits || t.usd || t.unpriced)) {
+    out.push('', 'Codex costs are plan credits at the published Standard rate (Fast counts double); Claude costs (~$) are Claude Code\'s API-equivalent estimates, not subscription charges.');
+    const reasons = [...new Set(meta.turns.map((t) => t.unpriced).filter(Boolean))];
+    if (reasons.length) out.push(`Turns without a price are left out of the totals: ${reasons.join('; ')}.`);
   }
   const q = meta.quota;
   if (q?.after) {
@@ -214,7 +226,7 @@ export function traceTable(meta: RunMeta): string {
   const rows = meta.turns.map((t) => [
     String(t.n), `R${t.round}`, t.seat, specs[t.seat] ?? '', t.kind, `${(t.durationMs / 1000).toFixed(0)}s`,
     kfmt(t.usage.input), kfmt(t.usage.cached), kfmt(t.usage.output), kfmt(t.usage.reasoning),
-    t.codexCredits !== undefined ? t.codexCredits.toFixed(2) + 'cr' : t.usd !== undefined ? '$' + t.usd.toFixed(3) : '',
+    costText(t),
     t.verdict ?? '', t.error ? 'ERR' : t.parseError ? 'PARSE' : 'ok',
   ]);
   const head = ['#', 'rnd', 'seat', 'model', 'kind', 'time', 'in', 'cached', 'out', 'reason', 'cost', 'verdict', 'status'];

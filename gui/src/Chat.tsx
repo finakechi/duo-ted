@@ -7,7 +7,7 @@ import { AccessPicker, SeatPicker } from './SeatPicker.tsx';
 import { shortSpec } from './spec.ts';
 import { chats, compareWith, confirmAction, decide, deleteChat, go, patchChat, retryChat, sendTo, stopChat, toast, updateClaude, view } from './store.ts';
 import type { Block, ChatSession, ChatTurn, Engine, PermissionRequest } from './types.ts';
-import { base, Dropdown, dur, Elapsed, EngineMark, Icon, Kbd, kfmt, MenuItem, MenuSeparator, money, Spinner } from './ui.tsx';
+import { base, Cost, Dropdown, dur, Elapsed, EngineMark, Icon, Kbd, kfmt, MenuItem, MenuSeparator, Spinner } from './ui.tsx';
 
 /** Text the split view's shared composer should pick up (from "Ask the other to review"). */
 const sharedDraft = signal<{ text: string; targets: string[] } | null>(null);
@@ -230,14 +230,13 @@ function engineLabel(e: Engine): string {
 function TurnFooter({ chat, turn, partner, last }: { chat: ChatSession; turn: ChatTurn; partner?: ChatSession; last: boolean }) {
   const u = turn.usage;
   const text = finalText(turn);
-  const cost = money(turn.credits, turn.usd);
   const forReview = `Here is ${engineLabel(chat.engine)}'s answer (${shortSpec(turn.spec)}) to my last message. Review it critically: what is wrong, missing, or better done differently? Verify claims against the code where you can, and be specific.\n\n---\n\n${text}`;
   return (
     <div class="turn-foot">
       <span class="foot-meta" title={turn.spec}>{shortSpec(turn.spec)}</span>
       <span class="foot-meta">{dur(turn.durationMs)}</span>
       {u && <span class="foot-meta" title={`${u.input} input tokens (${u.cached} cached), ${u.output} output, ${u.reasoning} reasoning`}>{kfmt(u.input)} in · {kfmt(u.output)} out</span>}
-      {cost && <span class="foot-meta">{cost}</span>}
+      <Cost class="foot-meta" credits={turn.credits} usd={turn.usd} unpriced={turn.unpriced} />
       {turn.status === 'stopped' && <span class="badge">stopped</span>}
       <div class="spacer" />
       <div class="foot-actions">

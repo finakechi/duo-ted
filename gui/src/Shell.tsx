@@ -12,7 +12,7 @@ import {
 } from './store.ts';
 import type { AppState, ChatSummary, Protocol, QuotaWindow, RunSummary } from './types.ts';
 import {
-  ago, base, dayGroup, Dropdown, dur, Empty, EngineMark, Icon, Kbd, kfmt, Logo, MenuItem, MenuSeparator, Modal, money, Segmented, Spinner, Tabs, Toggle, untilText, when,
+  ago, base, Cost, dayGroup, Dropdown, dur, Empty, EngineMark, Icon, Kbd, kfmt, Logo, MenuItem, MenuSeparator, Modal, Segmented, Spinner, Tabs, Toggle, untilText, when,
 } from './ui.tsx';
 
 // ── quota ────────────────────────────────────────────────────────────────
@@ -431,11 +431,11 @@ function Trace() {
                 <thead><tr><th>#</th><th>model</th><th>time</th><th>in (cached)</th><th>out</th><th>cost</th></tr></thead>
                 <tbody>
                   {c.turns.map((t, i) => (
-                    <tr><td>{i + 1}</td><td class="nowrap">{shortSpec(t.spec)}</td><td>{dur(t.durationMs)}</td><td>{kfmt(t.usage?.input)} ({kfmt(t.usage?.cached)})</td><td>{kfmt(t.usage?.output)}</td><td>{money(t.credits, t.usd)}</td></tr>
+                    <tr><td>{i + 1}</td><td class="nowrap">{shortSpec(t.spec)}</td><td>{dur(t.durationMs)}</td><td>{kfmt(t.usage?.input)} ({kfmt(t.usage?.cached)})</td><td>{kfmt(t.usage?.output)}</td><td><Cost credits={t.credits} usd={t.usd} unpriced={t.unpriced} /></td></tr>
                   ))}
                 </tbody>
               </table>
-              <div class="muted small">Total {dur(sum((t) => t.durationMs))} · {kfmt(sum((t) => t.usage?.input))} in · {kfmt(sum((t) => t.usage?.output))} out · {c.engine === 'codex' ? `${sum((t) => t.credits).toFixed(2)} credits` : `~$${sum((t) => t.usd).toFixed(3)}`}</div>
+              <div class="muted small">Total {dur(sum((t) => t.durationMs))} · {kfmt(sum((t) => t.usage?.input))} in · {kfmt(sum((t) => t.usage?.output))} out · {c.engine === 'codex' ? `${sum((t) => t.credits).toFixed(2)} credits` : `~$${sum((t) => t.usd).toFixed(3)} API-equivalent`}{c.turns.some((t) => t.unpriced) ? ` (${c.turns.filter((t) => t.unpriced).length} turn(s) without a price not counted)` : ''}</div>
             </div>
           );
         })}
@@ -451,7 +451,7 @@ function Trace() {
           <thead><tr><th>#</th><th>R</th><th>seat</th><th>kind</th><th>time</th><th>in (cached)</th><th>out (reas.)</th><th>cost</th></tr></thead>
           <tbody>
             {d.meta.turns.map((t) => (
-              <tr class={t.error ? 'bad-row' : ''} title={t.error}><td>{t.n}</td><td>{t.round}</td><td>{t.seat}</td><td>{t.kind}</td><td>{dur(t.durationMs)}</td><td>{kfmt(t.usage.input)} ({kfmt(t.usage.cached)})</td><td>{kfmt(t.usage.output)} ({kfmt(t.usage.reasoning)})</td><td>{money(t.codexCredits, t.usd)}</td></tr>
+              <tr class={t.error ? 'bad-row' : ''} title={t.error}><td>{t.n}</td><td>{t.round}</td><td>{t.seat}</td><td>{t.kind}</td><td>{dur(t.durationMs)}</td><td>{kfmt(t.usage.input)} ({kfmt(t.usage.cached)})</td><td>{kfmt(t.usage.output)} ({kfmt(t.usage.reasoning)})</td><td><Cost credits={t.codexCredits} usd={t.usd} unpriced={t.unpriced} /></td></tr>
             ))}
           </tbody>
         </table>

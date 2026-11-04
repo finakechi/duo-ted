@@ -393,7 +393,7 @@ program.command('trace').argument('[run]', 'run id or latest', 'latest').descrip
     process.stdout.write(`seats: ${m.seats.map((s) => `${s.role === 'chair' ? 'chair' : s.id + (s.role === 'reviewer' ? '(rev)' : '')}=${s.spec}${s.codexThreadId ? ' thread=' + s.codexThreadId : ''}${s.claudeSessionId ? ' session=' + s.claudeSessionId : ''}`).join('\n       ')}\n`);
     process.stdout.write(`versions: codex ${m.versions.codex} · claude ${m.versions.claude} · claw ${m.versions.claw} · duo ${m.versions.duo}\n\n`);
     process.stdout.write(traceTable(m) + '\n\n');
-    if (t) process.stdout.write(`total: ${t.turns} turns · ${(t.durationMs / 1000).toFixed(0)}s · in ${t.input} (${t.cached} cached) · out ${t.output} (${t.reasoning} reasoning) · ${t.codexCredits} Codex credits · ~$${t.usd} Claude API-equivalent\n`);
+    if (t) process.stdout.write(`total: ${t.turns} turns · ${(t.durationMs / 1000).toFixed(0)}s · in ${t.input} (${t.cached} cached) · out ${t.output} (${t.reasoning} reasoning) · ${t.codexCredits} Codex credits · ~$${t.usd} Claude API-equivalent${t.unpricedTurns ? ` · ${t.unpricedTurns} turn(s) without a price not counted` : ''}\n`);
     if (m.outcome) process.stdout.write(`outcome: ${JSON.stringify(m.outcome)}\n`);
     process.stdout.write(`dir: ${RunStore.open(ref).dir}\n`);
   });

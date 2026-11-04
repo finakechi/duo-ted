@@ -20,7 +20,7 @@ import { DEPTH_VAR } from './env.ts';
 import { classifyError } from './errors.ts';
 import { claudeRoute, claudeSink, codexRoute, dropCodexRoute } from './hooks.ts';
 import { CLAW_LEDGER_DIR, CLAW_WF_DIR } from './paths.ts';
-import { codexCredits } from './pricing.ts';
+import { codexPrice } from './pricing.ts';
 import { saveClaudeQuota } from './quota.ts';
 import { codexOverrides, formatSeat, type Seat } from './seats.ts';
 import type { RunStore, SeatRecord, TurnRecord, Usage } from './store.ts';
@@ -312,12 +312,25 @@ export class Engines {
     if (ss.seat.engine === 'claude' && parsed.rateLimits) saveClaudeQuota(parsed.rateLimits);
 
     let usd: number | undefined;
-    if (ss.seat.engine === 'claude' && parsed.costUsd !== undefined) {
-      // Claude reports the session's running total; keep the per-turn share.
-      const prev = ss.claudeCostTotal ?? 0;
-      usd = parsed.costUsd >= prev ? parsed.costUsd - prev : parsed.costUsd;
-      ss.claudeCostTotal = parsed.costUsd;
-      ss.record.claudeCostTotal = parsed.costUsd;
+    let credits: number | undefined;
+    let unpriced: string | undefined;
+    if (ss.seat.engine === 'claude') {
+      if (parsed.costUsd !== undefined) {
+        // Older CLIs state only the process's running total; difference it for this turn's share.
+        const prev = ss.claudeCostTotal ?? 0;
+        usd = parsed.costUsd >= prev ? parsed.costUsd - prev : parsed.costUsd;
+        ss.claudeCostTotal = parsed.costUsd;
+        ss.record.claudeCostTotal = parsed.costUsd;
+      }
+      if (parsed.turn?.usd !== undefined) usd = parsed.turn.usd;
+      if (parsed.turn?.unpriced) {
+        usd = undefined;
+        unpriced = parsed.turn.unpriced;
+      }
+    } else {
+      const price = codexPrice(ss.seat.model, usage, ss.seat.tier);
+      credits = price.credits;
+      if (price.unpriced && usage.input + usage.output > 0) unpriced = price.unpriced;
     }
     // A reply the CLI completed is a success even if claw saw a recoverable error on the way.
     const transportError = res.error && !(parsed.completed && reply) ? res.error : undefined;
@@ -335,8 +348,9 @@ export class Engines {
       thinking: [...parsed.thinking, ...parsed.interim.map((x) => `(interim) ${x}`)],
       tools: parsed.tools,
       usage,
-      codexCredits: ss.seat.engine === 'codex' ? codexCredits(ss.seat.model, usage, ss.seat.tier) : undefined,
+      codexCredits: credits,
       usd,
+      ...(unpriced ? { unpriced } : {}),
       rateLimits: parsed.rateLimits,
       verdict: typeof (structured as any)?.verdict === 'string' ? (structured as any).verdict : undefined,
       ...(o.templateStep ? { templateStep: o.templateStep } : {}),
