@@ -640,6 +640,7 @@ summary.step-head::-webkit-details-marker { display: none; }
 .elapsed { font-variant-numeric: tabular-nums; color: var(--text-3); }
 .turn-foot { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 12px; color: var(--text-3); font-size: 12px; margin-top: 2px; }
 .foot-meta { white-space: nowrap; }
+.unpriced { font-style: italic; text-decoration: underline dotted; text-underline-offset: 2px; cursor: help; }
 .foot-actions { display: flex; align-items: center; gap: 2px; opacity: 0.55; transition: opacity 0.15s; }
 .turn:hover .foot-actions, .foot-actions:focus-within { opacity: 1; }
 

@@ -26,15 +26,14 @@ test('Codex flags go after exec / exec resume, and the prompt moves to stdin', (
   assert.equal(_test.claudeSessionOf(['-p', '--session-id', 'xyz']), 'xyz');
 });
 
-test('a model newer than the rate card is priced by its family and flagged, not shown as free', () => {
-  assert.deepEqual(codexRate('gpt-6.1-sol'), { rate: [50, 2.5, 250], estimated: false });
-  const est = codexRate('gpt-6.2-luna');
-  assert.equal(est?.estimated, true);
-  assert.deepEqual(est?.rate, [2.5, 0.25, 12.5]);
+test('a model newer than the rate card is reported as unpriced, never priced like an older model', () => {
+  assert.equal(codexRate('gpt-6.1-sol')?.input, 50);
+  assert.equal(codexRate('gpt-6.2-luna'), undefined);
   assert.equal(codexRate('o9-mini'), undefined);
   const u = { input: 1_000_000, cached: 500_000, output: 100_000, reasoning: 0 };
   assert.equal(codexCredits('gpt-6-sol', u), (500_000 * 50 + 500_000 * 5 + 100_000 * 250) / 1e6);
   assert.equal(codexCredits('gpt-6-sol', u, 'fast'), 2 * codexCredits('gpt-6-sol', u)!);
+  assert.equal(codexCredits('gpt-6.2-luna', u), undefined);
 });
 
 test('a Codex turn that completed after reconnects is a success with warnings', () => {

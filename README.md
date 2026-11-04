@@ -161,7 +161,7 @@ turns/NN-<seat>-r<round>-<kind>/   prompt.md reply.md reply.json thinking.md too
 taps/           the untouched CLI event stream of every seat
 ```
 
-Codex turns are priced in plan credits from the Codex rate card (`src/pricing.ts`); Claude turns show the API-equivalent cost the CLI reports.
+Codex turns are priced in plan credits from the Codex rate card (`src/pricing.ts`, Standard rate; Fast counts double). Claude turns show Claude Code's own API-equivalent estimate for that turn, at its list prices. Neither is what a subscription charges. A model without a published rate in Duo, an unknown service tier, or a model Claude Code cannot price is shown as **no price** with the reason, and left out of totals. It never borrows another model's rate. When OpenAI publishes a new model or changes a rate, add it to `CODEX_RATES` with its source; update Claude Code to price new Claude models.
 
 ## Where things live
 

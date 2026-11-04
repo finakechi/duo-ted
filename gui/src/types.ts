@@ -33,6 +33,7 @@ export interface ChatTurn {
   usage?: Usage;
   credits?: number;
   usd?: number;
+  unpriced?: string;
   error?: string;
   hint?: string;
 }
@@ -97,7 +98,7 @@ export interface RunSummary {
   finishedAt?: string;
   seats: string[];
   outcome?: Record<string, any>;
-  totals?: Usage & { codexCredits: number; usd: number; durationMs: number; turns: number; };
+  totals?: Usage & { codexCredits: number; usd: number; durationMs: number; turns: number; unpricedTurns?: number; };
   continuedFrom?: string;
   workspace?: { mode: 'worktree' | 'in-place'; state: string; branch?: string; };
 }
@@ -113,6 +114,7 @@ export interface RunTurnMeta {
   usage: Usage;
   codexCredits?: number;
   usd?: number;
+  unpriced?: string;
   verdict?: string;
   error?: string;
   warnings?: string[];
