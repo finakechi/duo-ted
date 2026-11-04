@@ -9,7 +9,7 @@ import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { PROJECT_ROOT } from './paths.ts';
-import { IS_WIN, isExecutable, nodeRunner, which } from './platform.ts';
+import { IS_WIN, isExecutable, nodeRunner, supervise, TREE_SPAWN, which } from './platform.ts';
 
 export interface BinSpec {
   command: string;
@@ -126,42 +126,28 @@ export function runBin(bin: BinSpec, args: string[], opts: SpawnSyncOptions = {}
 
 /**
  * Run a CLI without blocking the event loop (the GUI engine streams every chat and run on it).
- * Resolves with the same fields `runBin` returns; a timeout kills the process and sets `error`.
+ * Resolves with the same fields `runBin` returns. A timeout or `signal` ends the CLI and everything
+ * it started, and sets `error`; it settles soon after the CLI exits even if a process it left
+ * behind still holds its output; it ends with duo unless `outlive` (an update that must finish).
  */
-export function runBinAsync(bin: BinSpec, args: string[], opts: { cwd?: string; input?: string; timeout?: number; env?: Record<string, string> } = {}): Promise<{ status: number | null; stdout: string; stderr: string; error?: Error }> {
-  return new Promise((resolve) => {
-    let stdout = '';
-    let stderr = '';
-    let error: Error | undefined;
-    let settled = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const done = (status: number | null) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve({ status, stdout, stderr, error });
-    };
-    let p: ReturnType<typeof spawn>;
-    try {
-      p = spawn(bin.command, [...bin.args, ...args], { cwd: opts.cwd, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, ...bin.env, ...(opts.env ?? {}) } });
-    } catch (e) {
-      error = e as Error;
-      done(null);
-      return;
-    }
-    if (opts.timeout) timer = setTimeout(() => {
-      error = new Error(`timed out after ${opts.timeout} ms`);
-      p.kill('SIGKILL');
-    }, opts.timeout);
-    // Keep the tail of very chatty output, like spawnSync's maxBuffer would.
-    const cap = (s: string) => (s.length > 16 * 1024 * 1024 ? s.slice(-8 * 1024 * 1024) : s);
-    p.stdout?.setEncoding('utf8').on('data', (d: string) => { stdout = cap(stdout + d); });
-    p.stderr?.setEncoding('utf8').on('data', (d: string) => { stderr = cap(stderr + d); });
-    p.stdin?.on('error', () => undefined);
-    p.stdin?.end(opts.input ?? '');
-    p.on('error', (e) => { error = e; done(null); });
-    p.on('close', (code) => done(code));
-  });
+export async function runBinAsync(bin: BinSpec, args: string[], opts: { cwd?: string; input?: string; timeout?: number; env?: Record<string, string>; signal?: AbortSignal; outlive?: boolean } = {}): Promise<{ status: number | null; stdout: string; stderr: string; error?: Error }> {
+  let stdout = '';
+  let stderr = '';
+  let p: ReturnType<typeof spawn>;
+  try {
+    p = spawn(bin.command, [...bin.args, ...args], { cwd: opts.cwd, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, ...bin.env, ...(opts.env ?? {}) }, ...TREE_SPAWN });
+  } catch (e) {
+    return { status: null, stdout, stderr, error: e as Error };
+  }
+  // Keep the tail of very chatty output, like spawnSync's maxBuffer would.
+  const cap = (s: string) => (s.length > 16 * 1024 * 1024 ? s.slice(-8 * 1024 * 1024) : s);
+  p.stdout?.setEncoding('utf8').on('data', (d: string) => { stdout = cap(stdout + d); });
+  p.stderr?.setEncoding('utf8').on('data', (d: string) => { stderr = cap(stderr + d); });
+  p.stdin?.on('error', () => undefined);
+  p.stdin?.end(opts.input ?? '');
+  const r = await supervise(p, { timeoutMs: opts.timeout, signal: opts.signal, outlive: opts.outlive });
+  const error = r.error ?? (r.timedOut ? new Error(`timed out after ${opts.timeout} ms`) : r.cancelled ? new Error('cancelled') : undefined);
+  return { status: r.code, stdout, stderr, ...(error ? { error } : {}) };
 }
 
 /** What identifies an installed CLI: an update replaces the file (or retargets the symlink), changing these. */
@@ -194,4 +180,29 @@ export function binVersion(bin: BinSpec): string {
   if (stamp && version !== 'unknown') versions.set(key, { stamp, version });
   else versions.delete(key);
   return version;
+}
+
+const probing = new Map<string, Promise<string>>();
+
+/**
+ * binVersion for the GUI engine: the same remembered answer, but a probe that is needed runs
+ * without blocking the event loop, at most one per binary at a time, and gives up after 30 s.
+ */
+export function binVersionAsync(bin: BinSpec): Promise<string> {
+  const key = [bin.command, ...bin.args].join('\0');
+  const stamp = binStamp(bin);
+  const known = versions.get(key);
+  if (stamp && known?.stamp === stamp) return Promise.resolve(known.version);
+  let p = probing.get(key);
+  if (!p) {
+    p = runBinAsync(bin, ['--version'], { timeout: 30_000 })
+      .then((r) => {
+        const version = (r.status === 0 && !r.error && r.stdout.trim()) || 'unknown';
+        if (stamp && version !== 'unknown') versions.set(key, { stamp, version });
+        return version;
+      })
+      .finally(() => probing.delete(key));
+    probing.set(key, p);
+  }
+  return p;
 }

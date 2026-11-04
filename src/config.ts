@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { binVersion, resolveClaude, resolveCodex, runBin, type BinSpec } from './bins.ts';
+import { binVersion, binVersionAsync, resolveClaude, resolveCodex, runBin, runBinAsync, type BinSpec } from './bins.ts';
 import { CACHE_DIR, CONFIG_PATH } from './paths.ts';
 import type { SeatDefaults } from './seats.ts';
 
@@ -111,25 +111,60 @@ export interface CodexModel {
   contextWindow?: number;
 }
 
+const CATALOG_CACHE = () => join(CACHE_DIR, 'codex-models.json');
+const CATALOG_MAX_AGE_MS = 6 * 3600_000;
+
+function readCatalogCache(): { version: string; at: number; models: CodexModel[] } | undefined {
+  try {
+    const c = JSON.parse(readFileSync(CATALOG_CACHE(), 'utf8'));
+    return Array.isArray(c.models) ? c : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Codex's own model catalog for this account and client version (cached for 6h). */
 export function codexCatalog(codexBin: BinSpec, refresh = false): CodexModel[] {
-  const cache = join(CACHE_DIR, 'codex-models.json');
   const version = binVersion(codexBin);
-  if (!refresh && existsSync(cache)) {
-    try {
-      const c = JSON.parse(readFileSync(cache, 'utf8'));
-      if (c.version === version && Date.now() - c.at < 6 * 3600_000) return c.models;
-    } catch {
-      /* refetch */
-    }
-  }
-  let raw: { models?: Record<string, unknown>[] };
+  const c = refresh ? undefined : readCatalogCache();
+  if (c && c.version === version && Date.now() - c.at < CATALOG_MAX_AGE_MS) return c.models;
   try {
     const r = runBin(codexBin, ['debug', 'models'], { encoding: 'utf8', timeout: 60_000, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] });
-    raw = JSON.parse(String(r.stdout ?? ''));
+    return saveCatalog(version, String(r.stdout ?? ''));
   } catch {
     return [];
   }
+}
+
+let catalogRefresh: Promise<CodexModel[]> | undefined;
+
+/**
+ * The catalog for the GUI engine, which must never wait on `codex debug models` (it can take up to
+ * a minute): a cached catalog is returned at once, even one from another client version or older
+ * than 6h, and refreshed in the background, one refresh at a time; `onRefresh` gets the new one.
+ * Only with no catalog at all does the caller wait, and then without blocking the event loop.
+ */
+export async function codexCatalogAsync(codexBin: BinSpec, onRefresh?: (models: CodexModel[]) => void): Promise<CodexModel[]> {
+  const version = await binVersionAsync(codexBin);
+  const c = readCatalogCache();
+  if (c && c.version === version && Date.now() - c.at < CATALOG_MAX_AGE_MS) return c.models;
+  catalogRefresh ??= runBinAsync(codexBin, ['debug', 'models'], { timeout: 60_000 })
+    .then((r) => {
+      try {
+        return r.status === 0 ? saveCatalog(version, r.stdout) : [];
+      } catch {
+        return [];
+      }
+    })
+    .finally(() => (catalogRefresh = undefined));
+  if (!c) return catalogRefresh;
+  void catalogRefresh.then((models) => models.length && onRefresh?.(models));
+  return c.models;
+}
+
+/** Parse `codex debug models` output and keep it as the cached catalog for this client version. */
+function saveCatalog(version: string, stdout: string): CodexModel[] {
+  const raw: { models?: Record<string, unknown>[] } = JSON.parse(stdout);
   const models: CodexModel[] = (raw.models || []).map((m) => ({
     slug: String(m.slug),
     display: String(m.display_name ?? m.slug),
@@ -140,7 +175,8 @@ export function codexCatalog(codexBin: BinSpec, refresh = false): CodexModel[] {
     contextWindow: m.context_window as number | undefined,
   }));
   mkdirSync(CACHE_DIR, { recursive: true });
-  writeFileSync(cache, JSON.stringify({ version, at: Date.now(), models }, null, 2));
+  writeFileSync(CATALOG_CACHE() + '.tmp', JSON.stringify({ version, at: Date.now(), models }, null, 2));
+  renameSync(CATALOG_CACHE() + '.tmp', CATALOG_CACHE());
   return models;
 }
 

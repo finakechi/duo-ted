@@ -362,6 +362,10 @@ function onEvent(e: any): void {
     case 'quota':
       if (s) app.value = { ...s, quota: e.quota };
       break;
+    case 'models':
+      // The engine served a cached Codex catalog and has fetched a fresh one in the background.
+      if (s) app.value = { ...s, models: { ...s.models, codex: e.codex } };
+      break;
     case 'permission': {
       const c = chats.value[e.request.chat];
       if (c) chats.value = { ...chats.value, [c.id]: { ...c, permissions: [...c.permissions, e.request] } };

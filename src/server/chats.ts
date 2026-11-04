@@ -121,6 +121,9 @@ export class ChatManager {
     this.api = api;
     this.mcpScript = mcpScript;
     for (const d of [CHATS_DIR, TAPS_DIR, MCP_DIR]) mkdirSync(d, { recursive: true });
+    // Permission-bridge files carry the token of the launch that wrote them, and tokens are per
+    // launch: any found now were left by a launch that crashed, so they hold a dead token.
+    for (const f of readdirSync(MCP_DIR)) if (f.endsWith('.json')) rmSync(join(MCP_DIR, f), { force: true });
     this.manager = new SessionManager(
       { claudeBin: claudeRoute('gui', bins.claude), maxConcurrentSessions: 64, sessionTtlMinutes: 12 * 60 },
       nullLogger,

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- The app engine no longer waits on the Codex model catalog, CLI version checks or git: a cached catalog is shown at once and refreshed in the background (the window updates when it arrives), and the Changes panel, workspace checks and pair diffs run git without blocking chats and runs, with timeouts and size limits. Concurrent refreshes share one subprocess.
+- Stopping a CLI call (timeout, cancel or shutdown) ends everything it started, and a call settles even when a leftover process holds its output. Quota refreshes and live sign-in checks stop with the engine; a Claude Code update is left to finish.
+- Permission-bridge files left behind by a crash, with their expired token, are removed when Duo starts.
+- claw-orchestrator's "Unknown model … falling back to gpt-5.5 pricing" warning no longer appears; it came from claw's internal price table, which Duo does not use.
+- CI: job timeouts, superseded pull-request runs are cancelled, and a Linux desktop smoke check runs on every pull request. CONTRIBUTING.md lists the steps to enable Actions and protect `main`.
+
 - The bundled Codex CLI is 0.166.0 (was 0.159.0), whose model catalog offers GPT-6.1 Sol and GPT-6.1 Terra.
 - Security updates within the existing version ranges: DOMPurify 3.4.17 (critical advisory GHSA-cg2g-xh64-v4q7, plus a high one), Electron 44.10.2 (GHSA-jr5w-w6x2-84p9), marked 18.1.3 and @preact/signals 2.11.4.
 

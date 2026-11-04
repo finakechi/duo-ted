@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same pull request supersedes the run in progress.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   check:
     strategy:
@@ -16,6 +21,8 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         node: ['22', '24']
     runs-on: ${{ matrix.os }}
+    # The suite takes well under a minute; a hung engine or CLI must not hold a runner for 6 hours.
+    timeout-minutes: 20
     env:
       # The tests use fake CLIs and never open a window.
       ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
@@ -28,3 +35,19 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npm run build
+
+  # The desktop shell end to end with a real Electron binary, as the Release workflow runs it, so a
+  # shell or Electron regression shows up on the pull request rather than at tagging time. Fake model
+  # CLIs and temporary data only.
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: xvfb-run -a npm run smoke -- --no-sandbox

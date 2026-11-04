@@ -6,6 +6,8 @@ import { instance, record, valueOf } from './common.mjs';
 
 const args = process.argv.slice(2);
 if (args[0] === '--version') {
+  // FAKE_CLAUDE_VERSION_MS: a CLI slow to start (Node-based installs can take a while).
+  await new Promise((r) => setTimeout(r, Number(process.env.FAKE_CLAUDE_VERSION_MS ?? 0)));
   console.log('2.1.999 (Claude Code)');
   process.exit(0);
 }

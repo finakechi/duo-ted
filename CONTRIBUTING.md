@@ -18,6 +18,22 @@ Node.js 22.18 or newer runs the TypeScript sources directly; there is no build s
 
 Changes that only a real model can show (prompt wording, new CLI flags) should say in the pull request which models you tried them with.
 
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every pull request and every push to `main`: `npm run check` and `npm run build` on Linux, macOS and Windows with Node.js 22 and 24, plus a Linux desktop smoke check (`xvfb-run -a npm run smoke -- --no-sandbox`) with a real Electron binary. Every job uses fake CLIs and temporary data.
+
+A fork starts with GitHub Actions disabled, so a repository owner has to switch it on once:
+
+1. **Settings → Actions → General → Actions permissions**: choose *Allow all actions and reusable workflows*, then **Save**.
+2. On the repository's **Actions** tab, if GitHub asks to enable workflows for this fork, choose to enable them.
+3. Push a commit to an open pull request, or close and reopen it. Workflows only start on new events after they are enabled.
+
+To require green CI before merging, once the workflow has run at least once (GitHub only offers checks it has seen):
+
+4. **Settings → Rules → Rulesets → New ruleset → New branch ruleset**: target the default branch (`main`) and set *Enforcement status* to **Active**.
+5. Enable **Require a pull request before merging** and **Require status checks to pass**. Add the checks `check (ubuntu-latest, 22)`, `check (ubuntu-latest, 24)`, `check (macos-latest, 22)`, `check (macos-latest, 24)`, `check (windows-latest, 22)`, `check (windows-latest, 24)` and `smoke`.
+6. Enable **Block force pushes** and **Restrict deletions**, then **Create**.
+
 ## Style
 
 - TypeScript in strict mode with `erasableSyntaxOnly` (no enums, no parameter properties): the sources must run under Node's type stripping.

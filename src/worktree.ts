@@ -9,10 +9,11 @@
  *             folders that are not git repositories, and ignores any uncommitted work already
  *             there).
  */
-import { execFileSync, type ExecFileSyncOptions } from 'node:child_process';
+import { execFile, execFileSync, spawn, type ExecFileSyncOptions } from 'node:child_process';
 import { existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { WORKTREES_DIR } from './paths.ts';
+import { supervise, TREE_SPAWN } from './platform.ts';
 
 export interface Workspace {
   mode: 'worktree' | 'in-place';
@@ -43,12 +44,41 @@ export interface WorkspaceDiff {
 const ID = ['-c', 'user.name=duo', '-c', 'user.email=duo@localhost', '-c', 'commit.gpgsign=false', '-c', 'core.autocrlf=false'];
 
 function git(args: string[], opts: ExecFileSyncOptions & { input?: string } = {}): string {
-  return String(execFileSync('git', args, { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, ...opts }));
+  // Bounded by default: a hung repository must not hang the engine forever. Callers that copy a
+  // whole folder (add -A) pass their own limit.
+  return String(execFileSync('git', args, { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, timeout: 300_000, killSignal: 'SIGKILL', ...opts }));
 }
 
 function tryGit(args: string[]): string | undefined {
   try {
     return git(args).trim();
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * git without blocking the event loop: the GUI engine streams every chat and run on it, and a
+ * large repository can keep `status`, `diff` or `add -A` busy for seconds. A timeout ends git; with
+ * `limit`, output past that many characters is dropped instead of failing the call.
+ */
+export function gitAsync(args: string[], o: { timeout?: number; limit?: number; input?: string } = {}): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const maxBuffer = o.limit !== undefined ? o.limit + 64 * 1024 : 256 * 1024 * 1024;
+    const p = execFile('git', args, { encoding: 'utf8', maxBuffer, timeout: o.timeout ?? 120_000, killSignal: 'SIGKILL', windowsHide: true }, (err, stdout, stderr) => {
+      if (!err) return resolve(stdout);
+      const code = (err as NodeJS.ErrnoException).code;
+      if (o.limit !== undefined && (code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' || code === 'ENOBUFS')) return resolve(stdout);
+      reject(Object.assign(err, { stdout, stderr }));
+    });
+    p.stdin?.on('error', () => undefined);
+    p.stdin?.end(o.input ?? '');
+  });
+}
+
+async function tryGitAsync(args: string[], limit?: number): Promise<string | undefined> {
+  try {
+    return (await gitAsync(args, { timeout: 30_000, limit })).trim();
   } catch {
     return undefined;
   }
@@ -65,6 +95,15 @@ export function workspaceOptions(cwd: string): { git: boolean; head: boolean; di
   const head = !!tryGit(['-C', cwd, 'rev-parse', '--verify', '-q', 'HEAD']);
   const dirty = !!tryGit(['-C', cwd, 'status', '--porcelain']);
   return { git: true, head, dirty, root };
+}
+
+/** workspaceOptions for the GUI engine, without blocking it. */
+export async function workspaceOptionsAsync(cwd: string): Promise<{ git: boolean; head: boolean; dirty: boolean; root?: string }> {
+  const root = await tryGitAsync(['-C', cwd, 'rev-parse', '--show-toplevel']);
+  if (!root) return { git: false, head: false, dirty: false };
+  // Only whether there is any change matters, so a huge status listing is cut short.
+  const [head, dirty] = await Promise.all([tryGitAsync(['-C', cwd, 'rev-parse', '--verify', '-q', 'HEAD']), tryGitAsync(['-C', cwd, 'status', '--porcelain'], 1)]);
+  return { git: true, head: !!head, dirty: !!dirty, root };
 }
 
 const SHADOW_EXCLUDES = [
@@ -109,21 +148,26 @@ function gitArgs(ws: Workspace): string[] {
 }
 
 /** Everything the writer changed since the start, new files included. */
-export function workspaceDiff(ws: Workspace, maxChars = 120_000): WorkspaceDiff {
+export async function workspaceDiff(ws: Workspace, maxChars = 120_000): Promise<WorkspaceDiff> {
   const g = gitArgs(ws);
-  git([...g, ...ID, 'add', '-A'], { timeout: 120_000 });
-  const files = git([...g, 'diff', '--cached', '--name-status', ws.base])
+  await gitAsync([...g, ...ID, 'add', '-A'], { timeout: 120_000 });
+  const [names, stat, full] = await Promise.all([
+    gitAsync([...g, 'diff', '--cached', '--name-status', ws.base], { timeout: 60_000 }),
+    gitAsync([...g, 'diff', '--cached', '--stat', ws.base], { timeout: 60_000 }),
+    // Only maxChars of the diff are kept, so git's output beyond that is never held in memory.
+    gitAsync([...g, 'diff', '--cached', '--no-color', '--no-ext-diff', ws.base], { timeout: 60_000, limit: maxChars + 1 }),
+  ]);
+  const files = names
     .split('\n')
     .filter(Boolean)
     .map((l) => {
       const [status, ...rest] = l.split('\t');
       return { status: status.trim(), path: rest[rest.length - 1] };
     });
-  const stat = git([...g, 'diff', '--cached', '--stat', ws.base]).trim();
-  let diff = git([...g, 'diff', '--cached', '--no-color', '--no-ext-diff', ws.base]);
+  let diff = full;
   const truncated = diff.length > maxChars;
   if (truncated) diff = diff.slice(0, maxChars) + `\n\n[diff truncated at ${maxChars} characters; read the files directly]\n`;
-  return { files, stat, diff, truncated };
+  return { files, stat: stat.trim(), diff, truncated };
 }
 
 /**
@@ -177,91 +221,34 @@ export function discardWorkspace(ws: Workspace): { ok: boolean; message: string 
 }
 
 /**
- * End a check command and everything it started. The shell is only the top of the tree (`npm test`
- * starts node, which starts workers), and a grandchild that survives keeps the output pipes open.
- */
-function killTree(pid: number | undefined, signal: NodeJS.Signals): void {
-  if (!pid) return;
-  try {
-    if (process.platform === 'win32') execFileSync('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
-    else process.kill(-pid, signal);
-  } catch {
-    /* already gone */
-  }
-}
-
-/** Checks still running; if duo itself exits (a second Ctrl-C, app shutdown) they go with it. */
-const liveChecks = new Set<number>();
-let exitHook = false;
-
-/**
  * Run the user's check command in the workspace (their command, their shell). A timeout or the
- * run's cancellation ends the whole process tree; a background process the check leaves behind
- * cannot hold the run open.
+ * run's cancellation ends the whole process tree (`npm test` starts node, which starts workers); a
+ * background process the check leaves behind cannot hold the run open; checks still running end
+ * with duo. See supervise() in platform.ts.
  */
 export async function runCheck(command: string, cwd: string, timeoutMs = 15 * 60_000, signal?: AbortSignal): Promise<{ command: string; exitCode: number | null; output: string; durationMs: number; timedOut: boolean; cancelled?: boolean }> {
-  const { spawn } = await import('node:child_process');
   const started = Date.now();
-  return new Promise((resolve) => {
-    // Its own process group on POSIX, so the tree can be signalled as one.
-    const p = spawn(command, { cwd, shell: true, windowsHide: true, env: process.env, detached: process.platform !== 'win32' });
-    if (p.pid) liveChecks.add(p.pid);
-    if (!exitHook) {
-      exitHook = true;
-      process.on('exit', () => { for (const pid of liveChecks) killTree(pid, 'SIGKILL'); });
-    }
-    let out = '';
-    const add = (d: Buffer) => {
-      out += d.toString('utf8');
-      if (out.length > 400_000) out = out.slice(-200_000);
-    };
-    p.stdout?.on('data', add);
-    p.stderr?.on('data', add);
-    let timedOut = false;
-    let cancelled = false;
-    let settled = false;
-    let hardKill: ReturnType<typeof setTimeout> | undefined;
-    let drain: ReturnType<typeof setTimeout> | undefined;
-    const stop = () => {
-      killTree(p.pid, 'SIGTERM');
-      hardKill ??= setTimeout(() => killTree(p.pid, 'SIGKILL'), 5000);
-    };
-    const timer = setTimeout(() => {
-      timedOut = true;
-      stop();
-    }, timeoutMs);
-    const onAbort = () => {
-      cancelled = true;
-      stop();
-    };
-    if (signal?.aborted) onAbort();
-    else signal?.addEventListener('abort', onAbort, { once: true });
-    const done = (code: number | null) => {
-      if (settled) return;
-      settled = true;
-      if (p.pid) liveChecks.delete(p.pid);
-      clearTimeout(timer);
-      clearTimeout(hardKill);
-      clearTimeout(drain);
-      signal?.removeEventListener('abort', onAbort);
-      p.stdout?.destroy();
-      p.stderr?.destroy();
-      const tail = out.length > 12_000 ? `…\n${out.slice(-12_000)}` : out;
-      resolve({ command, exitCode: code, output: tail, durationMs: Date.now() - started, timedOut, ...(cancelled ? { cancelled } : {}) });
-    };
-    p.on('error', (e) => {
-      out += `\n${e.message}`;
-      done(null);
-    });
-    p.on('close', done);
-    // The shell exited but something it started still holds the pipes: finish once its output drains.
-    p.on('exit', (code) => {
-      drain = setTimeout(() => {
-        if (!timedOut && !cancelled) killTree(p.pid, 'SIGKILL');
-        done(code);
-      }, 2000);
-    });
-  });
+  let out = '';
+  const finish = (exitCode: number | null, timedOut: boolean, cancelled: boolean) => {
+    const tail = out.length > 12_000 ? '\u2026\n' + out.slice(-12_000) : out;
+    return { command, exitCode, output: tail, durationMs: Date.now() - started, timedOut, ...(cancelled ? { cancelled } : {}) };
+  };
+  let p: ReturnType<typeof spawn>;
+  try {
+    p = spawn(command, { cwd, shell: true, windowsHide: true, env: process.env, ...TREE_SPAWN });
+  } catch (e) {
+    out = (e as Error).message;
+    return finish(null, false, false);
+  }
+  const add = (d: Buffer) => {
+    out += d.toString('utf8');
+    if (out.length > 400_000) out = out.slice(-200_000);
+  };
+  p.stdout?.on('data', add);
+  p.stderr?.on('data', add);
+  const r = await supervise(p, { timeoutMs, signal });
+  if (r.error) out += '\n' + r.error.message;
+  return finish(r.code, r.timedOut, r.cancelled);
 }
 
 /** In place: put the folder back the way the snapshot found it (files the writer added are deleted). */

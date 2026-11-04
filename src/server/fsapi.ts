@@ -1,9 +1,9 @@
 /** Folder browsing and git state for the GUI's project picker and Changes panel. */
-import { execFileSync } from 'node:child_process';
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { IS_WIN } from '../platform.ts';
+import { gitAsync } from '../worktree.ts';
 
 /** Windows drive roots that exist (C:\, D:\, ...), for browsing above a drive. */
 function drives(): string[] {
@@ -39,30 +39,40 @@ export function listDirs(path?: string, showHidden = false) {
   return { path: p, parent: up !== p ? up : IS_WIN ? '::drives' : undefined, home: homedir(), git: existsSync(join(p, '.git')), dirs };
 }
 
-function git(cwd: string, args: string[], max = 4 * 1024 * 1024): string {
-  return execFileSync('git', ['-C', cwd, '--no-pager', ...args], { encoding: 'utf8', maxBuffer: max, stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+/** Each git call the Changes panel makes is bounded: a hung or very slow repository gives up. */
+const GIT_TIMEOUT_MS = 30_000;
+
+function git(cwd: string, args: string[], limit?: number): Promise<string> {
+  return gitAsync(['-C', cwd, '--no-pager', ...args], { timeout: GIT_TIMEOUT_MS, limit });
 }
 
-export function gitState(cwd: string) {
+type GitState = { repo: false } | { repo: true; branch: string; head: string; files: { status: string; path: string }[]; diff: string };
+
+/** One refresh per folder at a time: windows and turns that ask at once share it. */
+const inFlight = new Map<string, Promise<GitState>>();
+
+export function gitState(cwd: string): Promise<GitState> {
+  let p = inFlight.get(cwd);
+  if (!p) {
+    p = readGitState(cwd).finally(() => inFlight.delete(cwd));
+    inFlight.set(cwd, p);
+  }
+  return p;
+}
+
+async function readGitState(cwd: string): Promise<GitState> {
   if (!cwd || !existsSync(cwd)) return { repo: false as const };
   try {
-    git(cwd, ['rev-parse', '--is-inside-work-tree']);
+    await git(cwd, ['rev-parse', '--is-inside-work-tree']);
   } catch {
     return { repo: false as const };
   }
-  let branch = '';
-  try {
-    branch = git(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).trim();
-  } catch {
-    branch = '(no commits)';
-  }
-  let head = '';
-  try {
-    head = git(cwd, ['log', '-1', '--format=%h %s']).trim();
-  } catch {
-    /* no commits yet */
-  }
-  const entries = git(cwd, ['status', '--porcelain=v1', '-z']).split('\0');
+  const [branch, head, status] = await Promise.all([
+    git(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).then((s) => s.trim(), () => '(no commits)'),
+    git(cwd, ['log', '-1', '--format=%h %s']).then((s) => s.trim(), () => ''),
+    git(cwd, ['status', '--porcelain=v1', '-z'], 4 * 1024 * 1024),
+  ]);
+  const entries = status.split('\0');
   const files: { status: string; path: string }[] = [];
   for (let i = 0; i < entries.length; i++) {
     const entry = entries[i];
@@ -73,22 +83,13 @@ export function gitState(cwd: string) {
     if (/[RC]/.test(status)) i++;
   }
   const limit = 400_000;
-  // Only the first `limit` characters are shown; a longer diff fills the buffer, which is not a failure.
-  const diffOf = (args: string[]) => {
-    try {
-      return git(cwd, args, limit + 64 * 1024);
-    } catch (e) {
-      const err = e as NodeJS.ErrnoException & { stdout?: string };
-      if (err.code === 'ENOBUFS' && typeof err.stdout === 'string') return err.stdout + '\n';
-      throw e;
-    }
-  };
+  // Only the first `limit` characters are shown; git's output past that is dropped, not a failure.
   let diff = '';
   try {
-    diff = diffOf(['diff', '--no-color', '--no-ext-diff', 'HEAD']);
+    diff = await git(cwd, ['diff', '--no-color', '--no-ext-diff', 'HEAD'], limit + 1);
   } catch {
     // No commits yet: show what is staged.
-    diff = diffOf(['diff', '--no-color', '--no-ext-diff', '--cached']);
+    diff = await git(cwd, ['diff', '--no-color', '--no-ext-diff', '--cached'], limit + 1);
   }
   return { repo: true as const, branch, head, files, diff: diff.length > limit ? diff.slice(0, limit) + '\n… (diff truncated)\n' : diff };
 }

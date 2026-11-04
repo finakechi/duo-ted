@@ -227,7 +227,7 @@ export async function pair(ctx: RunContext, settings: PairSettings, resume?: { s
           ctx.log(`check ${lastCheck.timedOut ? 'timed out' : lastCheck.exitCode === 0 ? 'passed' : `failed (exit ${lastCheck.exitCode})`} in ${(lastCheck.durationMs / 1000).toFixed(0)}s`);
           ctx.checkpoint();
         }
-        const d = workspaceDiff(ws!, Math.floor(ctx.cfg.maxDiffChars / 2));
+        const d = await workspaceDiff(ws!, Math.floor(ctx.cfg.maxDiffChars / 2));
         c.diff = { files: d.files.length, stat: d.stat };
         save();
 

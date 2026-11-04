@@ -112,9 +112,26 @@ export function rewriteCodexArgs(args: readonly string[], route: Pick<CodexRoute
   return { args: out, stdin: prompt ?? '' };
 }
 
+/**
+ * claw-orchestrator keeps its own USD price table for its internal session stats, and prints
+ * `[models] Unknown model "gpt-6.1-sol" — falling back to gpt-5.5 pricing` with a bare
+ * console.warn whenever a model is newer than that table. duo never uses claw's prices (it
+ * prices turns itself, see pricing.ts, and says "no price" when it cannot), so in duo the line
+ * only suggests a mispricing that is not there. It is dropped; every other warning passes.
+ */
+const CLAW_PRICING_WARNING = /^\[models\] Unknown model ".*" — falling back to .* pricing$/;
+function quietClawPricingWarnings(): void {
+  const warn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    if (args.length === 1 && typeof args[0] === 'string' && CLAW_PRICING_WARNING.test(args[0])) return;
+    warn.apply(console, args);
+  };
+}
+
 function install(): void {
   if (installed) return;
   installed = true;
+  quietClawPricingWarnings();
   const realSpawn = childProcess.spawn;
   const hooked = function spawn(this: unknown, command: string, a?: unknown, b?: unknown): ChildProcess {
     const args = (Array.isArray(a) ? a : []) as string[];
