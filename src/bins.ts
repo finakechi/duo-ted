@@ -133,6 +133,10 @@ export function runBin(bin: BinSpec, args: string[], opts: SpawnSyncOptions = {}
 export async function runBinAsync(bin: BinSpec, args: string[], opts: { cwd?: string; input?: string; timeout?: number; env?: Record<string, string>; signal?: AbortSignal; outlive?: boolean } = {}): Promise<{ status: number | null; stdout: string; stderr: string; error?: Error }> {
   let stdout = '';
   let stderr = '';
+  // taskkill can miss a descendant created while a newly spawned Windows process starts.
+  // With an already-aborted signal, there is no reason to start that process at all.
+  if (IS_WIN && opts.signal?.aborted) return { status: null, stdout, stderr, error: new Error('cancelled') };
+
   let p: ReturnType<typeof spawn>;
   try {
     p = spawn(bin.command, [...bin.args, ...args], { cwd: opts.cwd, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, ...bin.env, ...(opts.env ?? {}) }, ...TREE_SPAWN });

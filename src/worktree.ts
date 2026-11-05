@@ -13,7 +13,7 @@ import { execFile, execFileSync, spawn, type ExecFileSyncOptions } from 'node:ch
 import { existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { WORKTREES_DIR } from './paths.ts';
-import { supervise, TREE_SPAWN } from './platform.ts';
+import { IS_WIN, supervise, TREE_SPAWN } from './platform.ts';
 
 export interface Workspace {
   mode: 'worktree' | 'in-place';
@@ -233,6 +233,10 @@ export async function runCheck(command: string, cwd: string, timeoutMs = 15 * 60
     const tail = out.length > 12_000 ? '\u2026\n' + out.slice(-12_000) : out;
     return { command, exitCode, output: tail, durationMs: Date.now() - started, timedOut, ...(cancelled ? { cancelled } : {}) };
   };
+  // A pre-cancelled Windows check must not start cmd.exe: it can create descendants
+  // while taskkill is walking the process tree, leaving one behind.
+  if (IS_WIN && signal?.aborted) return finish(null, false, true);
+
   let p: ReturnType<typeof spawn>;
   try {
     p = spawn(command, { cwd, shell: true, windowsHide: true, env: process.env, ...TREE_SPAWN });
