@@ -32,9 +32,12 @@ export function electronBinary(): string {
 
 const MAIN = () => join(PROJECT_ROOT, 'desktop', 'main.cjs');
 
-/** Open the desktop app, detached from this terminal. */
+/**
+ * Open the desktop app, detached from this terminal. It gets this terminal's environment, which is
+ * already what a login shell would build, so it does not run the shell's startup files again.
+ */
 export function launchGui(): void {
-  const child = spawn(electronBinary(), [MAIN()], { detached: true, stdio: 'ignore', windowsHide: false, env: { ...process.env, DUO_NODE: process.execPath } });
+  const child = spawn(electronBinary(), [MAIN()], { detached: true, stdio: 'ignore', windowsHide: false, env: { ...process.env, DUO_NODE: process.execPath, DUO_ENV_FROM_TERMINAL: '1' } });
   child.unref();
 }
 

@@ -16,6 +16,9 @@ const { loginShellEnv } = require('./shell-env.cjs');
 
 const ROOT = path.resolve(__dirname, '..');
 const SMOKE = process.env.DUO_DESKTOP_SMOKE === '1';
+// Set by `duo gui`: this environment came from the user's terminal, so it already has their PATH.
+const FROM_TERMINAL = process.env.DUO_ENV_FROM_TERMINAL === '1';
+delete process.env.DUO_ENV_FROM_TERMINAL;
 const IS_WIN = process.platform === 'win32';
 const IS_MAC = process.platform === 'darwin';
 
@@ -43,7 +46,7 @@ let shown = false;
 // The login shell's startup files are the slowest part of a launch from the menu, so they run while
 // Electron itself starts up.
 const probe = new AbortController();
-const shellEnvReady = PRIMARY && !SMOKE && !IS_WIN
+const shellEnvReady = PRIMARY && !SMOKE && !IS_WIN && !FROM_TERMINAL
   ? loginShellEnv({ shell: process.env.SHELL || (IS_MAC ? '/bin/zsh' : '/bin/bash'), node: process.execPath, signal: probe.signal })
   : Promise.resolve({});
 
