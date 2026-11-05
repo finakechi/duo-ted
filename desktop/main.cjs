@@ -190,10 +190,12 @@ async function createWindow() {
     show: false,
     webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, sandbox: true, nodeIntegration: false },
   });
-  win.once('ready-to-show', () => {
+  const reveal = () => {
+    if (shown || win.isDestroyed()) return;
     shown = true;
     if (!SMOKE) win.show();
-  });
+  };
+  win.once('ready-to-show', reveal);
   // Links out of the app open in the real browser; the app itself never navigates away.
   win.webContents.setWindowOpenHandler(({ url: target }) => {
     if (target.startsWith(origin + '/api/runs/')) return { action: 'allow' };
@@ -207,6 +209,10 @@ async function createWindow() {
     }
   });
   await win.loadURL(`${origin}/#${token}`);
+  // A hidden window on Wayland gets no frame callbacks, so a page whose first paint is empty may
+  // never paint again and 'ready-to-show' never comes (seen on a wlroots compositor: no window at
+  // all). Once the page has loaded, show it regardless.
+  setTimeout(reveal, 200);
   if (SMOKE) {
     await new Promise((r) => setTimeout(r, 4000));
     const ok = await win.webContents.executeJavaScript("document.title === 'Duo' && !!document.querySelector('.app .hero-composer textarea') && !!document.querySelector('.sidebar')");
