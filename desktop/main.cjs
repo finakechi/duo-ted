@@ -26,13 +26,18 @@ if (process.platform === 'linux') {
   app.commandLine.appendSwitch('ozone-platform-hint', 'auto');
   app.commandLine.appendSwitch('enable-features', 'WaylandWindowDecorations');
 }
-if (!SMOKE && !app.requestSingleInstanceLock()) app.quit();
+// A second launch only hands over to the running window: it must not probe the shell or start an
+// engine of its own (`ready` still fires after app.quit(), and an engine's startup sweeps files
+// the running engine owns).
+const PRIMARY = SMOKE || app.requestSingleInstanceLock();
+if (!PRIMARY) app.quit();
 
 let server = null;
 let win = null;
 let origin = '';
 let token = '';
 let quitting = false;
+let shown = false;
 
 /** The environment of the user's login shell (PATH above all), so the engine finds node, claude and git. */
 function shellEnv() {
@@ -195,6 +200,7 @@ async function createWindow() {
     webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, sandbox: true, nodeIntegration: false },
   });
   win.once('ready-to-show', () => {
+    shown = true;
     if (!SMOKE) win.show();
   });
   // Links out of the app open in the real browser; the app itself never navigates away.
@@ -245,14 +251,16 @@ ipcMain.handle('duo:notify', (_e, o) => {
   return true;
 });
 
-app.whenReady().then(createWindow).catch((e) => {
+if (PRIMARY) app.whenReady().then(createWindow).catch((e) => {
   if (SMOKE) process.stderr.write(`Duo could not start: ${String((e && e.message) || e)}\n`);
   else dialog.showErrorBox('Duo could not start', String((e && e.message) || e));
   app.exit(1);
 });
 app.on('second-instance', () => {
-  if (win) {
+  // Before its first paint the window is about to show itself anyway.
+  if (win && !win.isDestroyed() && shown) {
     if (win.isMinimized()) win.restore();
+    win.show();
     win.focus();
   }
 });
