@@ -8,10 +8,11 @@
  * Homebrew and ~/.local/bin live), then the PATH this process has.
  */
 const { app, BrowserWindow, dialog, ipcMain, nativeTheme, Notification, shell } = require('electron');
-const { execFileSync, spawn } = require('node:child_process');
+const { execFile, spawn } = require('node:child_process');
 const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
+const { loginShellEnv } = require('./shell-env.cjs');
 
 const ROOT = path.resolve(__dirname, '..');
 const SMOKE = process.env.DUO_DESKTOP_SMOKE === '1';
@@ -39,26 +40,12 @@ let token = '';
 let quitting = false;
 let shown = false;
 
-/** The environment of the user's login shell (PATH above all), so the engine finds node, claude and git. */
-function shellEnv() {
-  if (IS_WIN) return {};
-  const sh = process.env.SHELL || (IS_MAC ? '/bin/zsh' : '/bin/bash');
-  const mark = '__DUO_ENV__';
-  try {
-    const out = execFileSync(sh, ['-ilc', `printf '${mark}'; "${process.execPath}" -p 'JSON.stringify(process.env)'; printf '${mark}'`], {
-      encoding: 'utf8',
-      timeout: 10_000,
-      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', DISABLE_AUTO_UPDATE: 'true' },
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    const json = out.split(mark)[1];
-    const env = JSON.parse(json);
-    delete env.ELECTRON_RUN_AS_NODE;
-    return env;
-  } catch {
-    return {};
-  }
-}
+// The login shell's startup files are the slowest part of a launch from the menu, so they run while
+// Electron itself starts up.
+const probe = new AbortController();
+const shellEnvReady = PRIMARY && !SMOKE && !IS_WIN
+  ? loginShellEnv({ shell: process.env.SHELL || (IS_MAC ? '/bin/zsh' : '/bin/bash'), node: process.execPath, signal: probe.signal })
+  : Promise.resolve({});
 
 function which(name, envPath) {
   const exts = IS_WIN ? ['.exe', '.cmd', ''] : [''];
@@ -76,18 +63,18 @@ function which(name, envPath) {
 }
 
 function nodeVersionOk(bin) {
-  try {
-    const v = execFileSync(bin, ['-p', 'process.versions.node'], { encoding: 'utf8', timeout: 10_000, windowsHide: true }).trim();
-    const [maj, min] = v.split('.').map(Number);
-    return maj > 22 || (maj === 22 && min >= 18) ? v : undefined;
-  } catch {
-    return undefined;
-  }
+  return new Promise((resolve) => {
+    execFile(bin, ['-p', 'process.versions.node'], { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL', windowsHide: true }, (err, out) => {
+      const v = err ? '' : String(out).trim();
+      const [maj, min] = v.split('.').map(Number);
+      resolve(maj > 22 || (maj === 22 && min >= 18) ? v : undefined);
+    });
+  });
 }
 
-function findNode(env) {
+async function findNode(env) {
   const candidates = [process.env.DUO_NODE, which('node', env.PATH), which('node', process.env.PATH)];
-  for (const c of candidates) if (c && nodeVersionOk(c)) return c;
+  for (const c of candidates) if (c && (await nodeVersionOk(c))) return c;
   return undefined;
 }
 
@@ -98,11 +85,11 @@ function preferredPort() {
   return 47100 + (h % 700);
 }
 
-function startEngine() {
+async function startEngine() {
+  const env = { ...process.env, ...(await shellEnvReady) };
+  delete env.ELECTRON_RUN_AS_NODE;
+  const node = await findNode(env);
   return new Promise((resolve, reject) => {
-    const env = SMOKE ? { ...process.env } : { ...process.env, ...shellEnv() };
-    delete env.ELECTRON_RUN_AS_NODE;
-    const node = findNode(env);
     if (!node) {
       reject(new Error('Duo needs Node.js 22.18 or newer. Install it from https://nodejs.org (or with nvm, mise, Homebrew), then open Duo again. You can also point DUO_NODE at a node binary.'));
       return;
@@ -159,6 +146,7 @@ function startEngine() {
 
 /** Ask the engine to stop its sessions; if it does not answer quickly, end it. */
 function stopEngine() {
+  probe.abort();
   return new Promise((resolve) => {
     if (!server || server.exitCode !== null) return resolve();
     const done = () => resolve();
