@@ -375,34 +375,65 @@ function Title({ chat }: { chat: ChatSession }) {
   return <span class="pane-title" title="Double-click to rename" onDblClick={() => { setValue(chat.title); setEditing(true); }}>{chat.title}</span>;
 }
 
-function useStickToBottom(dep: unknown) {
+/**
+ * Keep the transcript at its end while the user is there. It follows the content's size (a reply
+ * streaming in, a new turn, an off-screen turn getting its real height) from a ResizeObserver,
+ * which runs after layout: reading scrollHeight on every streamed update instead forced a full
+ * layout of the conversation each time. Only the user leaves the end (wheel, touch, keys, the
+ * scrollbar): a scroll the content causes, such as a turn settling to its real height, does not.
+ */
+function useStickToBottom(key: string) {
   const ref = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
   const [away, setAway] = useState(false);
   useEffect(() => {
     const el = ref.current;
-    if (!el) return;
+    const inner = el?.firstElementChild;
+    if (!el || !inner) return;
+    stick.current = true;
+    setAway(false);
+    let userAt = -Infinity;
+    const byUser = () => (userAt = performance.now());
+    // Keys scroll the transcript from wherever focus is, except while typing.
+    const byKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (/^(PageUp|PageDown|Home|End|ArrowUp|ArrowDown| )$/.test(e.key) && !t?.closest('input, textarea, select, [contenteditable]')) byUser();
+    };
     const onScroll = () => {
+      if (stick.current && performance.now() - userAt > 1000) return;
       const near = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
       stick.current = near;
       setAway(!near);
     };
+    const ro = new ResizeObserver(() => {
+      if (stick.current) el.scrollTop = el.scrollHeight;
+    });
+    ro.observe(inner);
+    const input = ['wheel', 'touchmove', 'pointerdown'] as const;
+    for (const t of input) el.addEventListener(t, byUser, { passive: true });
+    window.addEventListener('keydown', byKey, true);
     el.addEventListener('scroll', onScroll, { passive: true });
-    return () => el.removeEventListener('scroll', onScroll);
-  }, []);
-  useLayoutEffect(() => {
-    if (stick.current && ref.current) ref.current.scrollTop = ref.current.scrollHeight;
-  }, [dep]);
+    return () => {
+      ro.disconnect();
+      for (const t of input) el.removeEventListener(t, byUser);
+      window.removeEventListener('keydown', byKey, true);
+      el.removeEventListener('scroll', onScroll);
+    };
+  }, [key]);
   const toBottom = () => {
     const el = ref.current;
-    if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+    if (!el) return;
+    stick.current = true;
+    setAway(false);
+    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
   };
   return { ref, away, toBottom };
 }
 
 function ChatPane({ id, split, partner }: { id: string; split: boolean; partner?: string }) {
   const c = chats.value[id];
-  const scroll = useStickToBottom(c ? JSON.stringify(c.turns.map((t) => [t.id, t.status, t.blocks.length, t.blocks[t.blocks.length - 1]?.text?.length, c.permissions.length])) : '');
+  // A new turn (the user just sent) goes back to the end; scrolling up during a reply stays put.
+  const scroll = useStickToBottom(c ? `${c.id}:${c.turns.length}` : '');
   const [pick, setPick] = useState<string | undefined>();
   if (!c) return <section class="pane loading"><Spinner /></section>;
   const running = c.turns.some((t) => t.status === 'running');

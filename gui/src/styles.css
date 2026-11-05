@@ -561,6 +561,8 @@ button.chip:hover { background: var(--hover); }
 .starter:hover { border-color: var(--border-2); color: var(--text); transform: translateY(-1px); }
 
 .turn { display: flex; flex-direction: column; gap: 14px; animation: rise 0.25s var(--ease); }
+/* Off-screen turns skip layout and paint (a long conversation re-laid out every turn on each streamed update). */
+.transcript .turn { content-visibility: auto; contain-intrinsic-size: auto 600px; }
 .user-row { display: flex; justify-content: flex-end; }
 .user-bubble { max-width: 82%; background: var(--bg-sunken); border: 1px solid var(--border); padding: 9px 14px; border-radius: 18px 18px 6px 18px; white-space: pre-wrap; word-break: break-word; }
 .assistant { display: flex; flex-direction: column; gap: 8px; }

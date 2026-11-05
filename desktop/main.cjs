@@ -8,13 +8,17 @@
  * Homebrew and ~/.local/bin live), then the PATH this process has.
  */
 const { app, BrowserWindow, dialog, ipcMain, nativeTheme, Notification, shell } = require('electron');
-const { execFileSync, spawn } = require('node:child_process');
+const { execFile, spawn } = require('node:child_process');
 const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
+const { loginShellEnv } = require('./shell-env.cjs');
 
 const ROOT = path.resolve(__dirname, '..');
 const SMOKE = process.env.DUO_DESKTOP_SMOKE === '1';
+// Set by `duo gui`: this environment came from the user's terminal, so it already has their PATH.
+const FROM_TERMINAL = process.env.DUO_ENV_FROM_TERMINAL === '1';
+delete process.env.DUO_ENV_FROM_TERMINAL;
 const IS_WIN = process.platform === 'win32';
 const IS_MAC = process.platform === 'darwin';
 
@@ -26,34 +30,25 @@ if (process.platform === 'linux') {
   app.commandLine.appendSwitch('ozone-platform-hint', 'auto');
   app.commandLine.appendSwitch('enable-features', 'WaylandWindowDecorations');
 }
-if (!SMOKE && !app.requestSingleInstanceLock()) app.quit();
+// A second launch only hands over to the running window: it must not probe the shell or start an
+// engine of its own (`ready` still fires after app.quit(), and an engine's startup sweeps files
+// the running engine owns).
+const PRIMARY = SMOKE || app.requestSingleInstanceLock();
+if (!PRIMARY) app.quit();
 
 let server = null;
 let win = null;
 let origin = '';
 let token = '';
 let quitting = false;
+let shown = false;
 
-/** The environment of the user's login shell (PATH above all), so the engine finds node, claude and git. */
-function shellEnv() {
-  if (IS_WIN) return {};
-  const sh = process.env.SHELL || (IS_MAC ? '/bin/zsh' : '/bin/bash');
-  const mark = '__DUO_ENV__';
-  try {
-    const out = execFileSync(sh, ['-ilc', `printf '${mark}'; "${process.execPath}" -p 'JSON.stringify(process.env)'; printf '${mark}'`], {
-      encoding: 'utf8',
-      timeout: 10_000,
-      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', DISABLE_AUTO_UPDATE: 'true' },
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    const json = out.split(mark)[1];
-    const env = JSON.parse(json);
-    delete env.ELECTRON_RUN_AS_NODE;
-    return env;
-  } catch {
-    return {};
-  }
-}
+// The login shell's startup files are the slowest part of a launch from the menu, so they run while
+// Electron itself starts up.
+const probe = new AbortController();
+const shellEnvReady = PRIMARY && !SMOKE && !IS_WIN && !FROM_TERMINAL
+  ? loginShellEnv({ shell: process.env.SHELL || (IS_MAC ? '/bin/zsh' : '/bin/bash'), node: process.execPath, signal: probe.signal })
+  : Promise.resolve({});
 
 function which(name, envPath) {
   const exts = IS_WIN ? ['.exe', '.cmd', ''] : [''];
@@ -71,18 +66,18 @@ function which(name, envPath) {
 }
 
 function nodeVersionOk(bin) {
-  try {
-    const v = execFileSync(bin, ['-p', 'process.versions.node'], { encoding: 'utf8', timeout: 10_000, windowsHide: true }).trim();
-    const [maj, min] = v.split('.').map(Number);
-    return maj > 22 || (maj === 22 && min >= 18) ? v : undefined;
-  } catch {
-    return undefined;
-  }
+  return new Promise((resolve) => {
+    execFile(bin, ['-p', 'process.versions.node'], { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL', windowsHide: true }, (err, out) => {
+      const v = err ? '' : String(out).trim();
+      const [maj, min] = v.split('.').map(Number);
+      resolve(maj > 22 || (maj === 22 && min >= 18) ? v : undefined);
+    });
+  });
 }
 
-function findNode(env) {
+async function findNode(env) {
   const candidates = [process.env.DUO_NODE, which('node', env.PATH), which('node', process.env.PATH)];
-  for (const c of candidates) if (c && nodeVersionOk(c)) return c;
+  for (const c of candidates) if (c && (await nodeVersionOk(c))) return c;
   return undefined;
 }
 
@@ -93,11 +88,11 @@ function preferredPort() {
   return 47100 + (h % 700);
 }
 
-function startEngine() {
+async function startEngine() {
+  const env = { ...process.env, ...(await shellEnvReady) };
+  delete env.ELECTRON_RUN_AS_NODE;
+  const node = await findNode(env);
   return new Promise((resolve, reject) => {
-    const env = SMOKE ? { ...process.env } : { ...process.env, ...shellEnv() };
-    delete env.ELECTRON_RUN_AS_NODE;
-    const node = findNode(env);
     if (!node) {
       reject(new Error('Duo needs Node.js 22.18 or newer. Install it from https://nodejs.org (or with nvm, mise, Homebrew), then open Duo again. You can also point DUO_NODE at a node binary.'));
       return;
@@ -154,6 +149,7 @@ function startEngine() {
 
 /** Ask the engine to stop its sessions; if it does not answer quickly, end it. */
 function stopEngine() {
+  probe.abort();
   return new Promise((resolve) => {
     if (!server || server.exitCode !== null) return resolve();
     const done = () => resolve();
@@ -194,9 +190,12 @@ async function createWindow() {
     show: false,
     webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, sandbox: true, nodeIntegration: false },
   });
-  win.once('ready-to-show', () => {
+  const reveal = () => {
+    if (shown || win.isDestroyed()) return;
+    shown = true;
     if (!SMOKE) win.show();
-  });
+  };
+  win.once('ready-to-show', reveal);
   // Links out of the app open in the real browser; the app itself never navigates away.
   win.webContents.setWindowOpenHandler(({ url: target }) => {
     if (target.startsWith(origin + '/api/runs/')) return { action: 'allow' };
@@ -210,6 +209,10 @@ async function createWindow() {
     }
   });
   await win.loadURL(`${origin}/#${token}`);
+  // A hidden window on Wayland gets no frame callbacks, so a page whose first paint is empty may
+  // never paint again and 'ready-to-show' never comes (seen on a wlroots compositor: no window at
+  // all). Once the page has loaded, show it regardless.
+  setTimeout(reveal, 200);
   if (SMOKE) {
     await new Promise((r) => setTimeout(r, 4000));
     const ok = await win.webContents.executeJavaScript("document.title === 'Duo' && !!document.querySelector('.app .hero-composer textarea') && !!document.querySelector('.sidebar')");
@@ -230,29 +233,40 @@ ipcMain.handle('duo:open-path', (_e, p) => {
   if (!fs.existsSync(target) || !fs.statSync(target).isDirectory()) return 'not a folder';
   return shell.openPath(target);
 });
+// A notification nothing references is garbage collected, and its click handler with it: clicking
+// it later (from the notification history, say) would do nothing. Keep the recent ones.
+const notifications = new Set();
 ipcMain.handle('duo:notify', (_e, o) => {
   if (!Notification.isSupported() || (win && win.isFocused())) return false;
   const n = new Notification({ title: String(o?.title ?? 'Duo').slice(0, 120), body: String(o?.body ?? '').slice(0, 300), silent: false });
+  const forget = () => notifications.delete(n);
   n.on('click', () => {
-    if (win) {
+    forget();
+    if (win && !win.isDestroyed()) {
       if (win.isMinimized()) win.restore();
       win.show();
       win.focus();
       if (o?.route) win.webContents.send('duo:navigate', String(o.route));
     }
   });
+  n.on('close', forget);
+  n.on('failed', forget);
+  notifications.add(n);
+  if (notifications.size > 30) notifications.delete(notifications.values().next().value);
   n.show();
   return true;
 });
 
-app.whenReady().then(createWindow).catch((e) => {
+if (PRIMARY) app.whenReady().then(createWindow).catch((e) => {
   if (SMOKE) process.stderr.write(`Duo could not start: ${String((e && e.message) || e)}\n`);
   else dialog.showErrorBox('Duo could not start', String((e && e.message) || e));
   app.exit(1);
 });
 app.on('second-instance', () => {
-  if (win) {
+  // Before its first paint the window is about to show itself anyway.
+  if (win && !win.isDestroyed() && shown) {
     if (win.isMinimized()) win.restore();
+    win.show();
     win.focus();
   }
 });
