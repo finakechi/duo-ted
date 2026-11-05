@@ -227,17 +227,26 @@ ipcMain.handle('duo:open-path', (_e, p) => {
   if (!fs.existsSync(target) || !fs.statSync(target).isDirectory()) return 'not a folder';
   return shell.openPath(target);
 });
+// A notification nothing references is garbage collected, and its click handler with it: clicking
+// it later (from the notification history, say) would do nothing. Keep the recent ones.
+const notifications = new Set();
 ipcMain.handle('duo:notify', (_e, o) => {
   if (!Notification.isSupported() || (win && win.isFocused())) return false;
   const n = new Notification({ title: String(o?.title ?? 'Duo').slice(0, 120), body: String(o?.body ?? '').slice(0, 300), silent: false });
+  const forget = () => notifications.delete(n);
   n.on('click', () => {
-    if (win) {
+    forget();
+    if (win && !win.isDestroyed()) {
       if (win.isMinimized()) win.restore();
       win.show();
       win.focus();
       if (o?.route) win.webContents.send('duo:navigate', String(o.route));
     }
   });
+  n.on('close', forget);
+  n.on('failed', forget);
+  notifications.add(n);
+  if (notifications.size > 30) notifications.delete(notifications.values().next().value);
   n.show();
   return true;
 });
