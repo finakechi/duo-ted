@@ -23,6 +23,7 @@ export interface BinSpec {
 export interface BinOverrides {
   codexBin?: string;
   claudeBin?: string;
+  qwenBin?: string;
 }
 
 const CODEX_TARGETS: Record<string, [string, string]> = {
@@ -117,6 +118,20 @@ export function resolveClaude(o: BinOverrides = {}): BinSpec {
     if (b) return b;
   }
   throw new Error('no Claude Code CLI found: install it (https://docs.claude.com/claude-code), or set claudeBin in the config');
+}
+
+/** Qwen Code is optional until a Qwen seat is selected. */
+export function resolveQwen(o: BinOverrides = {}): BinSpec {
+  for (const explicit of [process.env.DUO_QWEN_BIN, o.qwenBin]) {
+    if (!explicit) continue;
+    const b = fromPath(explicit);
+    if (b) return b;
+    throw new Error(`qwen binary not found or not executable: ${explicit}`);
+  }
+  const found = which('qwen');
+  const bin = found && fromPath(found);
+  if (bin) return bin;
+  throw new Error('no Qwen Code CLI found: install Qwen Code, or set qwenBin in the Duo config');
 }
 
 /** Run a CLI synchronously (version checks, model catalog, login status). */

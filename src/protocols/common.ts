@@ -1,14 +1,14 @@
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { binVersion, resolveClaudeBin, resolveCodexBin, type Config } from '../config.ts';
+import { binVersion, resolveClaudeBin, resolveCodexBin, resolveQwenBin, type Config } from '../config.ts';
 import { Engines, type LiveUpdate, type SeatSession, type SendOpts } from '../engine.ts';
 import { classifyError, errorHint } from '../errors.ts';
 import type { Block } from '../live.ts';
 import { PROJECT_ROOT } from '../paths.ts';
 import { formatDelta, formatWindows, snapshot } from '../quota.ts';
 import { fmtTurnLine } from '../render.ts';
-import { formatSeat, seatLabel, type Seat } from '../seats.ts';
+import { formatSeat, parseSeat, seatLabel, type Seat } from '../seats.ts';
 import { RunStore, type QuotaSnapshot, type RunMeta, type TurnRecord } from '../store.ts';
 
 export type RunEvent =
@@ -17,7 +17,8 @@ export type RunEvent =
   | { kind: 'live'; seat: string; n: number; round: number; turnKind: string; blocks: Block[]; }
   | { kind: 'turn'; seat: string; n: number; label: string; round: number; turnKind: string; durationMs: number; verdict?: string; error?: string; hint?: string; note?: string; }
   | { kind: 'round'; round: number; stats: unknown; }
-  | { kind: 'done'; status: string; outcome: Record<string, unknown>; };
+  | { kind: 'done'; status: string; outcome: Record<string, unknown>; }
+  | { kind: 'control'; state: 'running' | 'pause_requested' | 'paused'; };
 
 export interface RunOptions {
   protocol: string;
@@ -94,6 +95,13 @@ export class RunContext {
   /** Aborted with the run, for host work that is not a model turn (a pair check command). */
   get signal(): AbortSignal { return this.abortController.signal; }
   private finished = false;
+  private controlState: 'running' | 'pause_requested' | 'paused' = 'running';
+  private resumeWaiters: (() => void)[] = [];
+  private pendingInstructions: { target: string; text: string; at: string }[] = [];
+  private pendingOverrides: { target: string; spec: string; at: string }[] = [];
+  private appliedOverrides: { target: string; from: string; to: string; at: string }[] = [];
+  private coordinatorNotes: string[] = [];
+  private deliveredInstructions: { target: string; text: string; at: string }[] = [];
 
   private constructor(cfg: Config, opts: RunOptions, store: RunStore, quota: QuotaSnapshot, bins: Parameters<typeof makeEngines>[2]) {
     this.cfg = cfg;
@@ -104,7 +112,9 @@ export class RunContext {
   }
 
   static create(cfg: Config, opts: RunOptions, continuedFrom?: RunStore): RunContext {
-    const bins = { codex: resolveCodexBin(cfg), claude: resolveClaudeBin(cfg) };
+    const hasQwen = [...opts.seats, ...(opts.chair ? [opts.chair] : [])].some((seat) => seat.engine === 'qwen');
+    const optionalQwen = (() => { try { return resolveQwenBin(cfg); } catch (e) { if (hasQwen) throw e; return undefined; } })();
+    const bins = { codex: resolveCodexBin(cfg), claude: resolveClaudeBin(cfg), ...(optionalQwen ? { qwen: optionalQwen } : {}) };
     const quota = snapshot();
     const head = opts.workspace === false ? undefined : git(opts.cwd, ['rev-parse', 'HEAD']);
     const meta: Omit<RunMeta, 'id' | 'createdAt' | 'status' | 'turns'> = {
@@ -119,6 +129,7 @@ export class RunContext {
         claw: pkgVersion(join(PROJECT_ROOT, 'node_modules/@enderfga/claw-orchestrator/package.json')),
         codex: binVersion(bins.codex),
         claude: binVersion(bins.claude),
+        ...(bins.qwen ? { qwen: binVersion(bins.qwen), qwenBin: bins.qwen.display } : {}),
         node: process.version,
         platform: `${process.platform}-${process.arch}`,
         codexBin: bins.codex.display,
@@ -130,6 +141,7 @@ export class RunContext {
     };
     const store = RunStore.create(meta);
     const ctx = new RunContext(cfg, opts, store, quota, bins);
+    if (continuedFrom) ctx.recoverControl(continuedFrom);
     ctx.log(`${bold(store.meta.id)}`);
     ctx.log(`seats ${opts.seats.map((s) => `${s.id}=${formatSeat(s)}`).join('  ')}${opts.chair ? `  chair=${formatSeat(opts.chair)}` : ''}`);
     const cq = formatWindows(quota.codex?.windows, cfg.warnPercent);
@@ -163,6 +175,134 @@ export class RunContext {
     return !!this.abortReason;
   }
 
+  /** A pause is cooperative and takes effect only before a subsequent agent turn. */
+  pause(): boolean {
+    if (this.finished || this.aborted || this.controlState !== 'running') return false;
+    this.controlState = 'pause_requested';
+    this.persistControl();
+    this.emit({ kind: 'control', state: this.controlState });
+    return true;
+  }
+
+  resume(): boolean {
+    if (this.controlState === 'running') return false;
+    this.controlState = 'running';
+    this.persistControl();
+    this.emit({ kind: 'control', state: this.controlState });
+    for (const wake of this.resumeWaiters.splice(0)) wake();
+    return true;
+  }
+
+  instruct(target: string, text: string): void {
+    const note = text.trim();
+    if (!note || note.length > 4000) throw new Error('instruction must contain 1–4000 characters');
+    if (target !== 'coordinator' && !this.opts.seats.some((s) => s.id === target)) throw new Error(`unknown agent ${target}`);
+    if (this.finished || this.aborted) throw new Error('run is not active');
+    this.pendingInstructions.push({ target, text: note, at: new Date().toISOString() });
+    this.persistControl();
+  }
+
+  /** Queue a replacement for this seat's next turn. Role permissions, worktree and
+   * reviewer isolation come from the existing session, never the requested spec. */
+  override(target: string, spec: string): void {
+    if (this.finished || this.aborted) throw new Error('run is not active');
+    const seat = this.opts.seats.find((s) => s.id === target);
+    if (!seat) throw new Error(`unknown or non-overridable agent ${target}`);
+    const next = parseSeat(spec, target, this.cfg.defaults);
+    if (next.engine === 'qwen') {
+      resolveQwenBin(this.cfg);
+      if (next.profile && (!this.cfg.qwenProfiles[next.profile] || this.cfg.qwenProfiles[next.profile].model !== next.model)) throw new Error('unknown Qwen profile or mismatched model');
+    }
+    if (next.engine === 'claude') resolveClaudeBin(this.cfg);
+    if (next.engine === 'codex') resolveCodexBin(this.cfg);
+    // A newer override supersedes an earlier *pending* one; completed decisions remain.
+    this.pendingOverrides = this.pendingOverrides.filter((o) => o.target !== target);
+    this.pendingOverrides.push({ target, spec: formatSeat(next), at: new Date().toISOString() });
+    this.persistControl();
+    this.emit({ kind: 'control', state: this.controlState });
+  }
+
+  /** On an explicitly requested continuation, carry forward undelivered user
+   * choices. Never resume an in-flight process or a paused state automatically. */
+  private recoverControl(previous: RunStore): void {
+    let state: Record<string, unknown>;
+    try { state = JSON.parse(previous.readFile('control.json') ?? '{}'); } catch { return; }
+    const entries = (value: unknown) => Array.isArray(value) ? value.slice(-100).filter((x) => x && typeof x === 'object') as Record<string, unknown>[] : [];
+    const eligible = (target: unknown) => typeof target === 'string' && this.opts.seats.some((s) => s.id === target);
+    this.pendingInstructions = entries(state.pending).filter((e) => (eligible(e.target) || e.target === 'coordinator') && typeof e.text === 'string' && e.text.length <= 4000)
+      .map((e) => ({ target: String(e.target), text: String(e.text), at: String(e.at ?? '') }));
+    this.coordinatorNotes = Array.isArray(state.coordinatorNotes) ? state.coordinatorNotes.filter((v) => typeof v === 'string' && v.length <= 4000).slice(-100) : [];
+    this.deliveredInstructions = entries(state.delivered).filter((e) => typeof e.target === 'string' && typeof e.text === 'string')
+      .map((e) => ({ target: String(e.target), text: String(e.text), at: String(e.at ?? '') }));
+    this.pendingOverrides = entries(state.pendingOverrides).filter((e) => eligible(e.target) && typeof e.spec === 'string' && e.spec.length <= 1000)
+      .map((e) => ({ target: String(e.target), spec: String(e.spec), at: String(e.at ?? '') }));
+    this.appliedOverrides = entries(state.appliedOverrides).filter((e) => typeof e.target === 'string' && typeof e.from === 'string' && typeof e.to === 'string')
+      .map((e) => ({ target: String(e.target), from: String(e.from), to: String(e.to), at: String(e.at ?? '') }));
+    this.persistControl();
+  }
+
+  private persistControl(): void {
+    this.store.writeFile('control.json', JSON.stringify({ state: this.controlState, pending: this.pendingInstructions,
+      coordinatorNotes: this.coordinatorNotes, delivered: this.deliveredInstructions,
+      pendingOverrides: this.pendingOverrides, appliedOverrides: this.appliedOverrides }, null, 2));
+  }
+
+  private async applyOverride(ss: SeatSession): Promise<string> {
+    const pending = this.pendingOverrides.find((o) => o.target === ss.seat.id);
+    if (!pending) return '';
+    const from = formatSeat(ss.seat);
+    const next = parseSeat(pending.spec, ss.seat.id, this.cfg.defaults);
+    await this.engines.reassign(ss, next);
+    const original = this.opts.seats.find((seat) => seat.id === next.id);
+    if (original) Object.assign(original, next);
+    this.pendingOverrides = this.pendingOverrides.filter((o) => o !== pending);
+    this.appliedOverrides.push({ target: next.id, from, to: pending.spec, at: pending.at });
+    this.persistControl();
+    this.recordSeats([ss]);
+    this.log(`${next.id}: assignment changed ${from} → ${pending.spec} for future turns`);
+    // The new provider has no old provider session. Supply a bounded summary of
+    // this seat's completed replies, in addition to the workflow's own state.
+    const earlier: { store: RunStore; turn: RunMeta['turns'][number] }[] = this.store.meta.turns.filter((t) => t.seat === next.id).map((turn) => ({ store: this.store, turn }));
+    let previousId = this.store.meta.continuedFrom;
+    for (let depth = 0; previousId && earlier.length < 3 && depth < 8; depth++) {
+      try {
+        const prev = RunStore.open(previousId);
+        earlier.unshift(...prev.meta.turns.filter((t) => t.seat === next.id).map((turn) => ({ store: prev, turn })));
+        previousId = prev.meta.continuedFrom;
+      } catch { break; }
+    }
+    if (!earlier.length) return '';
+    const history = earlier.slice(-3).map(({ store, turn: t }) => `Round ${t.round} (${t.kind}): ${(store.readFile(join(t.dir, 'reply.md')) ?? '').slice(0, 3000)}`).join('\n\n');
+    return `<completed_prior_agent_work>\n${history}\n</completed_prior_agent_work>\n\n`;
+  }
+
+  private async boundary(): Promise<void> {
+    if (this.controlState === 'running') return;
+    if (this.controlState === 'pause_requested') {
+      this.controlState = 'paused';
+      this.persistControl();
+      this.emit({ kind: 'control', state: 'paused' });
+      this.log('paused at an agent-turn boundary; existing completed work is retained');
+    }
+    await new Promise<void>((resolve) => this.resumeWaiters.push(resolve));
+    this.checkpoint();
+  }
+
+  private withInstructions(target: string, original: string): string {
+    const accepted = this.pendingInstructions.filter((n) => n.target === target || n.target === 'coordinator');
+    if (accepted.length) {
+      this.pendingInstructions = this.pendingInstructions.filter((n) => !accepted.includes(n));
+      for (const note of accepted) {
+        if (note.target === 'coordinator') this.coordinatorNotes.push(note.text);
+        this.deliveredInstructions.push(note);
+      }
+      this.persistControl();
+    }
+    const seatNotes = accepted.filter((n) => n.target === target).map((n) => n.text);
+    const notes = [...this.coordinatorNotes, ...seatNotes];
+    return notes.length ? `${original}\n\n<user_intervention>\n${notes.join('\n\n')}\n</user_intervention>` : original;
+  }
+
   /** Stop the run: every seat's process is stopped, and the protocol ends at its next check. */
   abort(status: 'cancelled' | 'failed', reason: string): void {
     if (this.abortReason || this.finished) return;
@@ -170,6 +310,8 @@ export class RunContext {
     this.log(status === 'cancelled' ? 'cancelled by the user; stopping the seats' : `stopping: ${reason}`);
     for (const w of this.abortWaiters.splice(0)) w();
     this.abortController.abort();
+    for (const wake of this.resumeWaiters.splice(0)) wake();
+    this.persistControl();
     void this.engines.stopAll();
   }
 
@@ -216,6 +358,10 @@ export class RunContext {
    */
   async send(ss: SeatSession, message: string, o: SendOpts, check?: (t: TurnRecord) => string | boolean | undefined): Promise<TurnRecord> {
     this.checkpoint();
+    await this.boundary();
+    this.checkpoint();
+    const history = await this.applyOverride(ss);
+    message = history + this.withInstructions(ss.seat.id, message);
     this.countSend();
     const t = await this.engines.send(ss, message, o);
     if (this.aborted) return t;

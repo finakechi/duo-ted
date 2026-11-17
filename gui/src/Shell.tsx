@@ -200,6 +200,7 @@ function Sidebar() {
               <>
                 <MenuItem onClick={() => { close(); void openNewChat('claude'); }} hint={shortSpec(s.gui.claude.spec)}><span class="mi-mark"><EngineMark engine="claude" size={16} /></span> Claude</MenuItem>
                 <MenuItem onClick={() => { close(); void openNewChat('codex'); }} hint={shortSpec(s.gui.codex.spec)}><span class="mi-mark"><EngineMark engine="codex" size={16} /></span> Codex</MenuItem>
+                <MenuItem onClick={() => { close(); void openNewChat('qwen'); }} hint={shortSpec(s.gui.qwen.spec)}><span class="mi-mark"><EngineMark engine="qwen" size={16} /></span> Qwen Code</MenuItem>
                 <MenuItem icon="split" onClick={() => { close(); void openSideBySide(); }} hint={`${MOD}+Shift+N`}>Side by side</MenuItem>
               </>
             )}
@@ -239,11 +240,12 @@ function Sidebar() {
 
 // ── home ─────────────────────────────────────────────────────────────────
 
-type HomeTarget = 'claude' | 'codex' | 'both' | Protocol;
+type HomeTarget = 'claude' | 'codex' | 'qwen' | 'both' | Protocol;
 
-const HOME_TARGETS: { id: HomeTarget; label: string; icon?: string; engine?: 'claude' | 'codex'; }[] = [
+const HOME_TARGETS: { id: HomeTarget; label: string; icon?: string; engine?: 'claude' | 'codex' | 'qwen'; }[] = [
   { id: 'claude', label: 'Claude', engine: 'claude' },
   { id: 'codex', label: 'Codex', engine: 'codex' },
+  { id: 'qwen', label: 'Qwen', engine: 'qwen' },
   { id: 'both', label: 'Both', icon: 'split' },
   { id: 'pair', label: 'Pair', icon: 'pair' },
   { id: 'debate', label: 'Debate', icon: 'debate' },
@@ -297,7 +299,7 @@ function Home() {
   };
   const submit = () => {
     const t = text.trim();
-    if (target === 'claude' || target === 'codex') {
+    if (target === 'claude' || target === 'codex' || target === 'qwen') {
       if (!t) return void openNewChat(target);
       save('');
       void openNewChat(target, t);
@@ -319,19 +321,19 @@ function Home() {
     else if (m === 'split') void openSideBySide();
     else go({ kind: 'new-run', draft: { protocol: info.protocol } });
   };
-  const runTarget = !['claude', 'codex', 'both'].includes(target);
+  const runTarget = !['claude', 'codex', 'qwen', 'both'].includes(target);
   return (
     <div class="home">
       <div class="home-inner">
         <div class="hero">
           <Logo size={44} />
           <h1>{greeting()}. What are we working on?</h1>
-          <p class="muted">Claude Code and Codex in one window: chat with either, or let them pair, debate and review each other.</p>
+          <p class="muted">Claude Code, Codex and Qwen Code in one window: chat, pair, debate and review.</p>
         </div>
         <SetupBanner />
         <div class="hero-composer">
           <AutoTextarea value={text} onInput={save} onSubmit={submit} autoFocus max={0.3}
-            placeholder={runTarget ? `Describe the ${target === 'pair' ? 'task' : 'question'}; you choose the seats next` : target === 'both' ? 'Ask Claude and Codex at once' : `Ask ${target === 'claude' ? 'Claude' : 'Codex'} anything`} />
+            placeholder={runTarget ? `Describe the ${target === 'pair' ? 'task' : 'question'}; you choose the seats next` : target === 'both' ? 'Ask Claude and Codex at once' : `Ask ${target === 'claude' ? 'Claude' : target === 'qwen' ? 'Qwen' : 'Codex'} anything`} />
           <div class="hero-bar">
             <div class="target-chips">
               {HOME_TARGETS.map((t) => (
@@ -541,19 +543,20 @@ function Settings({ tab: initial }: { tab?: 'general' | 'presets' | 'setup' | 'a
   const [gui, setGui] = useState<AppState['gui']>(structuredClone(s.gui));
   const [warn, setWarn] = useState(s.warnPercent);
   const [presets, setPresets] = useState(JSON.stringify(s.presets, null, 2));
+  const [qwenProfiles, setQwenProfiles] = useState(JSON.stringify(s.qwenProfiles, null, 2));
+  const [qwenChecks, setQwenChecks] = useState<Record<string, string>>({});
   const [err, setErr] = useState('');
   const close = () => (modal.value = null);
   const save = async () => {
     let p: unknown;
     try {
       p = JSON.parse(presets);
+      JSON.parse(qwenProfiles);
     } catch (e) {
-      setErr(`Presets are not valid JSON: ${(e as Error).message}`);
-      setTab('presets');
+      setErr(`Invalid presets or Qwen profiles JSON: ${(e as Error).message}`);
       return;
     }
-    await saveSettings({ gui, presets: p, warnPercent: warn });
-    close();
+    if (await saveSettings({ gui, presets: p, qwenProfiles: JSON.parse(qwenProfiles), warnPercent: warn })) close();
   };
   const dirty = tab === 'general' || tab === 'presets';
   return (
@@ -577,6 +580,29 @@ function Settings({ tab: initial }: { tab?: 'general' | 'presets' | 'setup' | 'a
                 <AccessPicker engine="codex" access={gui.codex.access} onChange={(access) => setGui({ ...gui, codex: { ...gui.codex, access } })} />
                 <Toggle checked={gui.codex.useConfig} onChange={(v) => setGui({ ...gui, codex: { ...gui.codex, useConfig: v } })} label="Load my Codex config" hint="plugins and MCP servers from ~/.codex/config.toml" />
               </div>
+            </section>
+            <section>
+              <h3>New Qwen Code chats</h3>
+              <div class="row"><SeatPicker spec={gui.qwen.spec} engineLocked onChange={(spec) => setGui({ ...gui, qwen: { ...gui.qwen, spec } })} /><AccessPicker engine="qwen" access={gui.qwen.access} onChange={(access) => setGui({ ...gui, qwen: { ...gui.qwen, access } })} /></div>
+              <p class="muted small">Qwen uses its existing authentication. Write access requires Linux Bubblewrap.</p>
+            </section>
+            <section>
+              <h3>Qwen endpoint profiles</h3>
+              <p class="muted small">Add hosted or local OpenAI-compatible endpoints by ID. Only reference API-key environment variable names, never their values. Example: <code>{'{"local":{"name":"Ollama","kind":"local","model":"qwen3-coder","baseUrl":"http://127.0.0.1:11434/v1"}}'}</code></p>
+              <textarea class="mono" rows={5} spellcheck={false} value={qwenProfiles} onInput={(e) => { setQwenProfiles((e.target as HTMLTextAreaElement).value); setErr(''); }} />
+              {err && <div class="callout bad" role="alert"><Icon name="alert" size={14} /> {err}</div>}
+              {Object.entries(s.qwenProfiles).map(([id, profile]) => <div class="row wrap" key={id}>
+                <span class="muted small">{profile.name} ({profile.model})</span>
+                <button type="button" class="btn small" onClick={async () => {
+                  setQwenChecks((c) => ({ ...c, [id]: 'Testing endpoint and file-reading tool…' }));
+                  try {
+                    const r = await api<{ reachable: boolean; modelListed?: boolean; toolUse: string; detail: string }>('/api/qwen/test', { method: 'POST', body: { profile: id } });
+                    setQwenChecks((c) => ({ ...c, [id]: `${r.reachable ? 'Connected' : 'Unavailable'} · tool use ${r.toolUse}: ${r.detail}` }));
+                  } catch (e) { setQwenChecks((c) => ({ ...c, [id]: (e as Error).message })); }
+                }}>Test saved profile</button>
+                {qwenChecks[id] && <span class="muted small" role="status">{qwenChecks[id]}</span>}
+              </div>)}
+              <p class="muted small">Save changes and reopen Settings to test new profiles. A reachable endpoint does not prove coding-agent tool use.</p>
             </section>
             <section>
               <h3>Appearance</h3>
@@ -661,7 +687,7 @@ interface Command {
   label: string;
   hint?: string;
   icon?: string;
-  engine?: 'claude' | 'codex';
+  engine?: 'claude' | 'codex' | 'qwen';
   run: () => void;
 }
 
@@ -670,6 +696,7 @@ function commands(): Command[] {
   const out: Command[] = [
     { id: 'new-claude', label: 'New Claude chat', icon: 'chat', engine: 'claude', hint: `${MOD} N`, run: () => void openNewChat('claude') },
     { id: 'new-codex', label: 'New Codex chat', icon: 'chat', engine: 'codex', run: () => void openNewChat('codex') },
+    { id: 'new-qwen', label: 'New Qwen chat', icon: 'chat', engine: 'qwen', run: () => void openNewChat('qwen') },
     { id: 'split', label: 'Side by side: Claude and Codex', icon: 'split', hint: `${MOD} Shift N`, run: () => void openSideBySide() },
     ...(['pair', 'debate', 'review', 'council', 'ask', 'custom'] as Protocol[]).map((p) => ({ id: `run-${p}`, label: `New ${PROTOCOLS[p].label.toLowerCase()} run`, icon: PROTOCOLS[p].icon, run: () => go({ kind: 'new-run', draft: { protocol: p } }) })),
     { id: 'home', label: 'Go home', icon: 'home', run: () => go({ kind: 'home' }) },
@@ -684,7 +711,7 @@ function commands(): Command[] {
     { id: 'shortcuts', label: 'Keyboard shortcuts', icon: 'keyboard', hint: `${MOD} /`, run: () => (modal.value = { kind: 'shortcuts' }) },
   ];
   for (const p of s.projects.slice(0, 8)) out.push({ id: `proj-${p}`, label: `Project: ${base(p)}`, hint: p.replace(s.home, '~'), icon: 'folder', run: () => setProject(p) });
-  for (const c of s.chats.slice(0, 30)) out.push({ id: `chat-${c.id}`, label: c.title, hint: `${c.engine === 'claude' ? 'Claude' : 'Codex'} · ${ago(c.updatedAt)}`, engine: c.engine, run: () => go({ kind: 'chat', panes: [c.id] }) });
+  for (const c of s.chats.slice(0, 30)) out.push({ id: `chat-${c.id}`, label: c.title, hint: `${c.engine === 'claude' ? 'Claude' : c.engine === 'qwen' ? 'Qwen' : 'Codex'} · ${ago(c.updatedAt)}`, engine: c.engine, run: () => go({ kind: 'chat', panes: [c.id] }) });
   for (const r of s.runs.slice(0, 30)) out.push({ id: `runv-${r.id}`, label: r.title, hint: `${PROTOCOLS[r.protocol]?.label ?? r.protocol} · ${ago(r.createdAt)}`, icon: PROTOCOLS[r.protocol]?.icon, run: () => go({ kind: 'run', id: r.id }) });
   return out;
 }

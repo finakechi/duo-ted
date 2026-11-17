@@ -2,7 +2,7 @@
 export type Condition =
   | { all: Condition[]; } | { any: Condition[]; } | { not: Condition; }
   | { path: string; op: 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte' | 'exists' | 'includes' | 'every' | 'some'; value?: unknown; valuePath?: string; where?: Condition; };
-export interface Selector { ids?: string[]; engine?: 'codex' | 'claude'; model?: string; fromRole?: string; count?: number; rankBy?: { step: string; path: string; direction?: 'asc' | 'desc'; }; }
+export interface Selector { ids?: string[]; engine?: 'codex' | 'claude' | 'qwen'; model?: string; fromRole?: string; count?: number; rankBy?: { step: string; path: string; direction?: 'asc' | 'desc'; }; }
 export interface Role { instructions: string; access?: 'read' | 'sandboxed' | 'sandboxed-network'; schema?: Record<string, unknown>; }
 export interface Assignment { role: string; select: Selector; }
 export interface Route {

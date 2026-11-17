@@ -1,6 +1,6 @@
 # Duo
 
-**Claude Code and Codex in one desktop app.** Chat with either, run them side by side, or let them work on the same problem together: one writes the code while the other reviews it, they debate until every claim is agreed, or they cross-check each other's code reviews. Every prompt, tool call, token and credit is recorded.
+**Claude Code, Codex and experimental Qwen Code in one desktop app.** Chat with an agent, run them side by side, or let them work on the same problem together: one writes the code while another reviews it, they debate until every claim is agreed, or they cross-check each other's code reviews. Agent prompts and tool calls are recorded; token/price reporting depends on provider support.
 
 Duo drives the official CLIs you already use, signed in with your own plans: [Claude Code](https://docs.claude.com/claude-code) (Claude subscription) and the [Codex CLI](https://github.com/openai/codex) (ChatGPT subscription). Nothing goes through a third-party server.
 
@@ -12,7 +12,7 @@ Runs on Linux, macOS and Windows.
 
 | Mode | What happens |
 |---|---|
-| **Chat** | Claude Code or Codex in a project folder (or none), streaming: thinking, commands with their output, file edits as diffs, plans. Pick model, effort and permissions per chat. |
+| **Chat** | Claude Code, Codex or Qwen Code in a project folder (or none), with streaming agent progress where supported. Pick model and permissions per chat. |
 | **Side by side** | One message, two answers. Hand either answer to the other for a critical review in one click. |
 | **Pair** | One model writes the code in its own git worktree, the other reviews every change, and they cycle until the writer says done, the reviewer approves, and your check command passes. You then apply the result, keep the branch, or discard it. |
 | **Debate** | Blind first answers, then cross-examination over a claim ledger. After discussion ends, every model reviews the frozen ledger and records agreement or disagreement on every peer claim. File citations are verified against your code. |
@@ -45,6 +45,33 @@ For a versioned release, download the source bundle and `SHA256SUMS` from [GitHu
 `duo setup` adds an app launcher (the application menu on Linux, `~/Applications/Duo.app` on macOS, the Start menu on Windows), the `duo` and `duo-safe` commands, a `/duo` skill for Claude Code, a `$duo` skill for Codex, and a Codex rule that pre-approves `duo-safe`. `duo setup --uninstall` removes all of it.
 
 Then open **Duo** from your launcher, or run `duo gui`.
+
+### Qwen Code (experimental, Linux)
+
+Install [Qwen Code](https://github.com/QwenLM/qwen-code) separately and sign in using its supported authentication, or select a Duo-managed OpenAI-compatible endpoint profile. Qwen must be on `PATH`, or set `DUO_QWEN_BIN` to its executable/script (an optional `qwenBin` in Duo's JSON config also works). Qwen integration currently **requires Linux with `/usr/bin/bwrap` (Bubblewrap)** and fails closed if that sandbox is unavailable; macOS/Windows Qwen sessions are not yet supported. Claude and Codex behavior on those platforms is unchanged.
+
+Under **Settings → General → Qwen endpoint profiles**, save a profile such as:
+
+```json
+{
+  "local": {
+    "name": "My Ollama server",
+    "kind": "local",
+    "model": "qwen3-coder",
+    "baseUrl": "http://127.0.0.1:11434/v1"
+  }
+}
+```
+
+This configuration does not install a model. Start the inference server and make sure its model is already available and supports agent tool calling. Hosted endpoints require HTTPS; set `"kind": "hosted"`, your provider's `/v1` base URL, and optionally `"keyEnv": "MY_QWEN_API_KEY"`. Export that environment variable **before starting Duo**; do not paste its value into Duo's config. For a local server requiring a token, `keyEnv` can refer to that token's variable as well. To use Qwen Code's own current login/provider configuration, pick the plain Qwen model without a Duo endpoint profile.
+
+Save and reopen Settings, then click **Test saved profile**. The result distinguishes HTTP reachability/model listing from a real file-reading agent tool invocation. Automatic assignment includes a Qwen profile only after this tool-use test passes in the current Duo server session; test again after restarting Duo or changing the profile.
+
+In **New run**, choose Qwen under a seat's model picker. In Pair, put Qwen in the Writer or Reviewer position, choose a Git worktree and a verification command, and review the changes before applying. You can also choose Manual, Automatic, or Hybrid assignment. Automatic uses available agent CLIs and tool-verified Qwen profiles; Hybrid lets you pin individual seat assignments while Duo fills the rest. Local First prefers verified local Qwen profiles, Cloud First favors Codex/Claude then verified hosted Qwen, and Best Fit uses a fixed eligible-provider order (Codex, Claude, verified Qwen), **not** fabricated quality or price scores. Pair review uses a separate engine when automatically assigned.
+
+During an active run, **Pause next turn** waits until the next agent-turn boundary, **Queue instruction** targets an agent or future coordinator turns, **Queue assignment** replaces a selected agent/model before its next eligible turn while retaining its access restrictions, and **Resume** releases the boundary. A cross-provider assignment starts a fresh agent session but supplies bounded prior completed replies and keeps workflow decisions. An active tool call is not interrupted by Pause; **Stop** cancels it. Completed turns, run files and the instruction/assignment ledger are retained. After a process crash or app restart, the prior active execution is **not resumable in place**: inspect the saved run/worktree and use **Continue** for supported protocols to start a new run with saved session identifiers, pending instructions and pending overrides. Do not assume an interrupted in-flight tool action is safe to replay automatically. Some modes without Continue support require a new run.
+
+Qwen's adapter uses non-interactive structured streaming, Qwen session IDs for subsequent turns, CLI model selection, and a separately configured Bubblewrap tool sandbox. Qwen writers receive workspace-write access with network closed; reviewers receive read-only access and excluded write/shell tools. Qwen's own permission modes are not a substitute for that host-enforced sandbox. Live-provider behavior (including Qwen version-specific flags, endpoint authentication, tool calls and resume) must be checked on your machine: repository tests use fake CLI processes and do not verify a real hosted/local inference model.
 
 Notes:
 

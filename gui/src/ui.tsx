@@ -95,15 +95,17 @@ export function IntegerInput({ value, onChange, min = 1, max = 12 }: { value: nu
 }
 
 export function EngineDot({ engine }: { engine: Engine }) {
-  return <span class={`dot dot-${engine}`} title={engine === 'claude' ? 'Claude' : 'Codex'} />;
+  return <span class={`dot dot-${engine}`} title={engine === 'claude' ? 'Claude' : engine === 'codex' ? 'Codex' : 'Qwen'} />;
 }
 
 /** The round engine mark used for avatars and seat chips. */
 export function EngineMark({ engine, size = 22 }: { engine: Engine; size?: number }) {
   return (
-    <span class={`mark mark-${engine}`} style={{ width: size, height: size }} aria-label={engine === 'claude' ? 'Claude' : 'Codex'}>
+    <span class={`mark mark-${engine}`} style={{ width: size, height: size }} aria-label={engine === 'claude' ? 'Claude' : engine === 'codex' ? 'Codex' : 'Qwen'}>
       {engine === 'claude' ? (
         <svg viewBox="0 0 24 24" width={size * 0.62} height={size * 0.62} fill="currentColor"><path d="M12 2.5l1.6 6.2 6-2.4-4.3 4.9 5.2 3.6-6.4.3.9 6.4L12 16l-3 5.5.9-6.4-6.4-.3 5.2-3.6-4.3-4.9 6 2.4z" /></svg>
+      ) : engine === 'qwen' ? (
+        <span style={{ fontWeight: 800, fontSize: size * 0.56, lineHeight: 1 }}>Q</span>
       ) : (
         <svg viewBox="0 0 24 24" width={size * 0.6} height={size * 0.6} fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 7l-5 5 5 5M16 7l5 5-5 5" /></svg>
       )}
@@ -112,7 +114,7 @@ export function EngineMark({ engine, size = 22 }: { engine: Engine; size?: numbe
 }
 
 export function EngineName({ engine }: { engine: Engine }) {
-  return <span class={`engine-name ${engine}`}>{engine === 'claude' ? 'Claude' : 'Codex'}</span>;
+  return <span class={`engine-name ${engine}`}>{engine === 'claude' ? 'Claude' : engine === 'codex' ? 'Codex' : 'Qwen'}</span>;
 }
 
 /** The Duo logo: two overlapping marks in the engines' colors. */

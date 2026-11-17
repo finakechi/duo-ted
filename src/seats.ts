@@ -12,7 +12,7 @@ import { seatId } from './seat-ids.ts';
 import { readFileSync } from 'node:fs';
 import { expandHome } from './platform.ts';
 
-export type Engine = 'codex' | 'claude';
+export type Engine = 'codex' | 'claude' | 'qwen';
 
 export const CODEX_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
 export const CLAUDE_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
@@ -23,6 +23,7 @@ const WEB_MODES = ['live', 'cached', 'indexed', 'disabled'];
 const ENGINE_ALIASES: Record<string, Engine> = {
   codex: 'codex', cx: 'codex', gpt: 'codex', openai: 'codex',
   claude: 'claude', cl: 'claude', anthropic: 'claude',
+  qwen: 'qwen', qw: 'qwen',
 };
 
 /**
@@ -54,11 +55,14 @@ export interface Seat {
   // claude
   fetch?: boolean;
   addDirs: string[];
+  /** Optional Duo-managed Qwen endpoint profile; never contains a credential. */
+  profile?: string;
 }
 
 export interface SeatDefaults {
   codexModel: string;
   claudeModel: string;
+  qwenModel?: string;
   claudeEffort?: string;
   codexEffort?: string;
 }
@@ -72,17 +76,17 @@ export function parseSeat(spec: string, id: string, defaults: SeatDefaults, opts
   const m = /^([a-z]+)(?::([^@]+))?(?:@([a-z]+))?$/i.exec(head);
   if (!m) throw new SeatError(`bad seat "${spec}": expected engine[:model][@effort][+option...]`);
   const engine = ENGINE_ALIASES[m[1].toLowerCase()];
-  if (!engine) throw new SeatError(`unknown engine "${m[1]}" in "${spec}" (use codex or claude)`);
+  if (!engine) throw new SeatError(`unknown engine "${m[1]}" in "${spec}" (use codex, claude or qwen)`);
 
   const seat: Seat = {
     id,
     engine,
-    model: m[2] || (engine === 'codex' ? defaults.codexModel : defaults.claudeModel),
-    effort: m[3]?.toLowerCase() || (engine === 'codex' ? defaults.codexEffort : defaults.claudeEffort),
+    model: m[2] || (engine === 'codex' ? defaults.codexModel : engine === 'claude' ? defaults.claudeModel : (defaults.qwenModel ?? 'qwen3-coder-plus')),
+    effort: m[3]?.toLowerCase() || (engine === 'codex' ? defaults.codexEffort : engine === 'claude' ? defaults.claudeEffort : undefined),
     cfg: {},
     addDirs: [],
   };
-  const ladder = engine === 'codex' ? CODEX_EFFORTS : CLAUDE_EFFORTS;
+  const ladder = engine === 'codex' ? CODEX_EFFORTS : engine === 'claude' ? CLAUDE_EFFORTS : [];
   if (seat.effort && !ladder.includes(seat.effort)) {
     throw new SeatError(`effort "${seat.effort}" is not valid for ${engine} (${ladder.join(', ')})`);
   }
@@ -112,6 +116,9 @@ function applyOption(seat: Seat, key: string, value: string, spec: string, safe:
   };
   const claudeOnly = (k: string) => {
     if (seat.engine !== 'claude') throw new SeatError(`option "${k}" is Claude-only (in "${spec}")`);
+  };
+  const qwenOnly = (k: string) => {
+    if (seat.engine !== 'qwen') throw new SeatError(`option "${k}" is Qwen-only (in "${spec}")`);
   };
   if (key.startsWith('cfg:')) {
     codexOnly('cfg:');
@@ -149,6 +156,13 @@ function applyOption(seat: Seat, key: string, value: string, spec: string, safe:
       seat.fetch = true;
       return;
     case 'dir': claudeOnly(key); seat.addDirs.push(expandHome(need(value, key, spec))); return;
+    case 'profile': {
+      qwenOnly(key);
+      const name = need(value, key, spec);
+      if (!/^[a-zA-Z][\w-]{0,63}$/.test(name)) throw new SeatError('Qwen profile id must be 1–64 letters, digits, _ or -');
+      seat.profile = name;
+      return;
+    }
     default:
       throw new SeatError(`unknown option "${key}" in "${spec}"`);
   }
@@ -166,6 +180,7 @@ export function formatSeat(seat: Seat): string {
   for (const [k, v] of Object.entries(seat.cfg)) s += `+cfg:${k}=${v}`;
   if (seat.name) s += `+name=${seat.name}`;
   if (seat.timeoutSec) s += `+timeout=${seat.timeoutSec}`;
+  if (seat.profile) s += `+profile=${seat.profile}`;
   return s;
 }
 
@@ -177,7 +192,7 @@ export function seatLabel(seat: Seat): string {
 
 /** Human name used when talking to peers ("Codex (gpt-6-sol)"). */
 export function seatPeerName(seat: Seat): string {
-  const vendor = seat.engine === 'codex' ? 'Codex' : 'Claude';
+  const vendor = seat.engine === 'codex' ? 'Codex' : seat.engine === 'claude' ? 'Claude' : 'Qwen';
   return seat.name ? `${seat.name} — ${vendor} ${seat.model}` : `${vendor} ${seat.model}`;
 }
 

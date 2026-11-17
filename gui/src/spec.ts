@@ -11,7 +11,7 @@ export interface SpecParts {
 export function parseSpec(spec: string): SpecParts {
   const [head, ...rest] = spec.trim().split('+');
   const m = /^([a-z]+)(?::([^@]+))?(?:@([a-z]+))?$/i.exec(head) ?? [];
-  const engine = (m[1] === 'codex' || m[1] === 'cx' ? 'codex' : 'claude') as Engine;
+  const engine = (m[1] === 'codex' || m[1] === 'cx' ? 'codex' : m[1] === 'qwen' || m[1] === 'qw' ? 'qwen' : 'claude') as Engine;
   const opts = rest.filter(Boolean).map((o): [string, string] => {
     const i = o.indexOf('=');
     return i < 0 ? [o, ''] : [o.slice(0, i), o.slice(i + 1)];

@@ -19,6 +19,7 @@ Object.assign(process.env, {
   CLAUDE_CONFIG_DIR: join(tmp, 'claude-home'),
   DUO_CODEX_BIN: join(import.meta.dirname, 'fakes', 'codex.mjs'),
   DUO_CLAUDE_BIN: join(import.meta.dirname, 'fakes', 'claude.mjs'),
+  DUO_QWEN_BIN: join(import.meta.dirname, 'fakes', 'qwen.mjs'),
   FAKE_LOG: LOG,
 });
 delete process.env.DUO_DEPTH;
@@ -26,8 +27,10 @@ delete process.env.DUO_DEPTH;
 const { loadConfig } = await import('../src/config.ts');
 const { RunContext } = await import('../src/protocols/common.ts');
 const { ask } = await import('../src/protocols/ask.ts');
+const { continueRun } = await import('../src/protocols/continue.ts');
 const { debate } = await import('../src/protocols/debate.ts');
 const { pair } = await import('../src/protocols/pair.ts');
+const { review } = await import('../src/protocols/review.ts');
 const { parseSeat } = await import('../src/seats.ts');
 const { finishWorkspace } = await import('../src/worktree.ts');
 
@@ -61,6 +64,180 @@ test('ask: both CLIs answer; the Codex prompt goes through stdin with the seat f
   const codexTurn = m.turns.find((t) => t.seat === 'A')!;
   assert.equal(codexTurn.usage.input, 1000);
   assert.ok((codexTurn.codexCredits ?? 0) > 0, 'priced from the rate card');
+});
+
+test('ask: a Qwen seat participates and emits recorded tool events and a resumable session', { skip: process.platform !== 'linux' || !existsSync('/usr/bin/bwrap') }, async () => {
+  const ctx = ctxFor('ask', ['qwen:qwen3-coder-plus', 'codex:gpt-6-sol@low']);
+  await ask(ctx);
+  assert.equal(ctx.store.meta.status, 'completed', String(ctx.store.meta.outcome?.stop));
+  const turn = ctx.store.meta.turns.find((t) => t.seat === 'A')!;
+  assert.ok(!turn.error, turn.error);
+  const tools = JSON.parse(readFileSync(join(ctx.store.dir, turn.dir, 'tools.json'), 'utf8'));
+  assert.equal(tools[0]?.name, 'read_file');
+  assert.ok(ctx.store.meta.seats.find((s) => s.id === 'A')?.qwenSessionId);
+  const call = calls().find((c) => c.cli === 'qwen' && c.cwd === tmp);
+  assert.ok(call);
+  assert.equal(call.args.includes('--approval-mode'), true);
+});
+
+test('run intervention pauses at a turn boundary, queues instructions, then resumes without losing the run', { skip: process.platform !== 'linux' || !existsSync('/usr/bin/bwrap') }, async () => {
+  rmSync(LOG, { force: true });
+  const ctx = ctxFor('ask', ['qwen:qwen3-coder-plus']);
+  assert.equal(ctx.pause(), true);
+  const work = ask(ctx);
+  for (let i = 0; i < 100; i++) {
+    const control = JSON.parse(readFileSync(join(ctx.store.dir, 'control.json'), 'utf8'));
+    if (control.state === 'paused') break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  const paused = JSON.parse(readFileSync(join(ctx.store.dir, 'control.json'), 'utf8'));
+  assert.equal(paused.state, 'paused');
+  assert.equal(ctx.store.meta.turns.length, 0, 'no model turn executes before resume');
+  ctx.instruct('A', 'Include the unique phrase: verified intervention');
+  assert.equal(ctx.resume(), true);
+  await work;
+  assert.equal(ctx.store.meta.status, 'completed');
+  assert.ok(calls().some((c) => c.cli === 'qwen' && c.prompt.includes('verified intervention')));
+  const recorded = JSON.parse(readFileSync(join(ctx.store.dir, 'control.json'), 'utf8'));
+  assert.equal(recorded.pending.length, 0);
+  assert.equal(recorded.delivered.length, 1);
+});
+
+test('future assignment override changes provider at a safe boundary without losing completed context or reviewer restrictions', { skip: process.platform !== 'linux' || !existsSync('/usr/bin/bwrap') }, async () => {
+  rmSync(LOG, { force: true });
+  const ctx = ctxFor('ask', ['claude:sonnet@low']);
+  const seat = ctx.opts.seats[0];
+  const ss = await ctx.engines.openSeat(seat, 'participant', { system: 'Answer carefully', cwd: tmp });
+  ctx.recordSeats([ss]);
+  const first = await ctx.send(ss, 'First decision: preserve the source files.', { round: 1, kind: 'answer' });
+  assert.ok(!first.error, first.error);
+  ctx.override('A', 'codex:gpt-6-sol@low');
+  ctx.override('A', 'qwen:qwen3-coder-plus'); // the later pending override wins
+  const queued = JSON.parse(readFileSync(join(ctx.store.dir, 'control.json'), 'utf8'));
+  assert.equal(queued.pendingOverrides.length, 1);
+  const second = await ctx.send(ss, 'Continue the earlier work.', { round: 2, kind: 'answer' });
+  assert.ok(!second.error, second.error);
+  assert.equal(ss.seat.engine, 'qwen');
+  assert.equal(ss.record.engine, 'qwen');
+  assert.ok(ss.record.qwenSessionId);
+  const qwen = calls().filter((call) => call.cli === 'qwen').at(-1);
+  assert.match(qwen?.prompt || '', /completed_prior_agent_work/);
+  assert.match(qwen?.prompt || '', /Round 1 \(answer\)/);
+  const policy = JSON.parse(readFileSync(qwen.systemPolicy, 'utf8'));
+  assert.equal(policy.tools.executionSandbox.filesystem, 'read-only');
+  const recorded = JSON.parse(readFileSync(join(ctx.store.dir, 'control.json'), 'utf8'));
+  assert.equal(recorded.pendingOverrides.length, 0);
+  assert.deepEqual(recorded.appliedOverrides.map((o: any) => o.to), ['qwen:qwen3-coder-plus']);
+  await ctx.finish('completed', { changed: true }, [ss]);
+  assert.equal(ctx.store.meta.turns.length, 2);
+  assert.equal(ctx.store.meta.seats.find((s) => s.id === 'A')?.engine, 'qwen');
+});
+
+test('overrides reject unknown seats and unconfigured Qwen profiles', async () => {
+  const ctx = ctxFor('ask', ['claude:sonnet@low']);
+  assert.throws(() => ctx.override('Z', 'qwen:qwen3-coder-plus'), /unknown or non-overridable/);
+  assert.throws(() => ctx.override('A', 'qwen:qwen3-coder-plus+profile=missing'), /unknown Qwen profile/);
+  ctx.cancel();
+  await ctx.fail(new Error('cancelled'), []);
+});
+
+test('Qwen continuation recovers pending instructions and a future assignment from the previous run', { skip: process.platform !== 'linux' || !existsSync('/usr/bin/bwrap') }, async () => {
+  rmSync(LOG, { force: true });
+  const original = ctxFor('ask', ['qwen:qwen3-coder-plus']);
+  const ss = await original.engines.openSeat(original.opts.seats[0], 'participant', { system: 'Be precise', cwd: tmp });
+  original.recordSeats([ss]);
+  const turn = await original.send(ss, 'Remember our original decision.', { round: 1, kind: 'answer' });
+  assert.ok(!turn.error, turn.error);
+  original.instruct('A', 'Keep the previously established decisions.');
+  original.override('A', 'claude:sonnet@low');
+  await original.finish('completed', { preserved: true }, [ss]);
+  let resumed: ReturnType<typeof ctxFor> | undefined;
+  await continueRun(cfg, original.store.meta.id, 'Continue the original answer.', { rounds: 1, quiet: true, safe: false, onContext: (ctx) => { resumed = ctx; } });
+  assert.ok(resumed);
+  assert.equal(resumed.store.meta.status, 'completed');
+  assert.equal(resumed.store.meta.continuedFrom, original.store.meta.id);
+  const control = JSON.parse(readFileSync(join(resumed.store.dir, 'control.json'), 'utf8'));
+  assert.equal(control.pending.length, 0);
+  assert.equal(control.pendingOverrides.length, 0);
+  assert.equal(control.appliedOverrides.at(-1).to, 'claude:sonnet@low');
+  const c = calls().filter((call) => call.cli === 'claude' && call.prompt?.includes('Continue the original answer')).at(-1);
+  assert.ok(c);
+  assert.match(c.prompt, /Qwen answered/);
+  assert.match(c.prompt, /Keep the previously established decisions/);
+});
+
+test('cancelling a paused run releases the boundary and retains a cancelled run record', { skip: process.platform !== 'linux' || !existsSync('/usr/bin/bwrap') }, async () => {
+  const ctx = ctxFor('ask', ['qwen:qwen3-coder-plus']);
+  ctx.pause();
+  const work = ask(ctx);
+  for (let i = 0; i < 100; i++) {
+    if (JSON.parse(readFileSync(join(ctx.store.dir, 'control.json'), 'utf8')).state === 'paused') break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  ctx.cancel();
+  await work;
+  assert.equal(ctx.store.meta.status, 'cancelled');
+  assert.equal(ctx.store.meta.turns.length, 0);
+  assert.ok(existsSync(join(ctx.store.dir, 'control.json')));
+});
+
+test('pair: Qwen writer works in isolated worktree with an independent Claude reviewer', { skip: process.platform !== 'linux' || !existsSync('/usr/bin/bwrap') }, async () => {
+  const repo = join(tmp, 'qwen-pair');
+  execFileSync('git', ['init', '-q', repo]);
+  writeFileSync(join(repo, 'README.md'), '# demo\n');
+  execFileSync('git', ['-C', repo, 'add', '-A']);
+  execFileSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'init']);
+  process.env.FAKE_QWEN_WRITE = '1';
+  try {
+    const ctx = ctxFor('pair', ['qwen:qwen3-coder-plus', 'claude:sonnet@low'], { cwd: repo, rounds: 2, brief: 'Add a Qwen file.' });
+    await pair(ctx, { isolation: 'worktree', writerAccess: 'sandboxed' });
+    const ws = ctx.store.meta.workspace!;
+    assert.ok(existsSync(join(ws.cwd, 'duo-qwen-fake.txt')));
+    assert.ok(!existsSync(join(repo, 'duo-qwen-fake.txt')));
+    assert.equal(ctx.store.meta.seats.find((s) => s.id === 'B')?.engine, 'claude');
+    assert.ok(ctx.store.meta.turns.some((t) => t.seat === 'B'));
+    const result = finishWorkspace(ws, 'discard', 'test');
+    assert.ok(result.ok, result.message);
+  } finally { delete process.env.FAKE_QWEN_WRITE; }
+});
+
+test('pair: a Qwen reviewer is read-only while a separate Codex writer owns the worktree', { skip: process.platform !== 'linux' || !existsSync('/usr/bin/bwrap') }, async () => {
+  const repo = join(tmp, 'qwen-reviewer');
+  execFileSync('git', ['init', '-q', repo]);
+  writeFileSync(join(repo, 'README.md'), '# reviewer isolation\n');
+  execFileSync('git', ['-C', repo, 'add', '-A']);
+  execFileSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'init']);
+  const ctx = ctxFor('pair', ['codex:gpt-6-sol@low', 'qwen:qwen3-coder-plus'], { cwd: repo, rounds: 1, brief: 'Review these changes.' });
+  await pair(ctx, { isolation: 'worktree', writerAccess: 'sandboxed' });
+  const reviewer = ctx.store.meta.turns.find((t) => t.seat === 'B');
+  assert.ok(reviewer, 'independent Qwen review turn ran');
+  const call = calls().filter((c) => c.cli === 'qwen').at(-1);
+  assert.ok(call?.systemPolicy);
+  const policy = JSON.parse(readFileSync(call.systemPolicy, 'utf8'));
+  assert.equal(policy.tools.executionSandbox.filesystem, 'read-only');
+  assert.ok(call?.args.includes('--exclude-tools'));
+  assert.ok(call?.args.includes('--safe-mode'));
+  const result = finishWorkspace(ctx.store.meta.workspace!, 'discard', 'test');
+  assert.ok(result.ok, result.message);
+});
+
+test('review: Qwen performs independent Review without write permission', { skip: process.platform !== 'linux' || !existsSync('/usr/bin/bwrap') }, async () => {
+  const repo = join(tmp, 'qwen-independent-review');
+  execFileSync('git', ['init', '-q', repo]);
+  writeFileSync(join(repo, 'README.md'), '# before\n');
+  execFileSync('git', ['-C', repo, 'add', '-A']);
+  execFileSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'init']);
+  writeFileSync(join(repo, 'README.md'), '# after\n');
+  const ctx = ctxFor('review', ['qwen:qwen3-coder-plus', 'codex:gpt-6-sol@low'], { cwd: repo, rounds: 1 });
+  const report = await review(ctx, { kind: 'uncommitted' });
+  assert.equal(ctx.store.meta.status, 'completed');
+  assert.ok(ctx.store.meta.turns.some((t) => t.seat === 'A' && t.kind === 'review'));
+  assert.match(report, /Review|review/i);
+  const call = calls().filter((c) => c.cli === 'qwen' && c.cwd === repo).at(-1);
+  assert.ok(call?.systemPolicy);
+  const policy = JSON.parse(readFileSync(call.systemPolicy, 'utf8'));
+  assert.equal(policy.tools.executionSandbox.filesystem, 'read-only');
+  assert.equal(readFileSync(join(repo, 'README.md'), 'utf8'), '# after\n');
 });
 
 test('debate: each turn records only its own tool calls (no carry-over from the previous turn)', async () => {

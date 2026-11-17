@@ -12,20 +12,23 @@
  */
 import { SessionManager, nullLogger } from '@enderfga/claw-orchestrator';
 import { createHash, randomUUID } from 'node:crypto';
+import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { BinSpec } from './bins.ts';
-import type { Config } from './config.ts';
+import type { Config, QwenProfile } from './config.ts';
 import { DEPTH_VAR } from './env.ts';
 import { classifyError } from './errors.ts';
 import { claudeRoute, claudeSink, codexRoute, dropCodexRoute } from './hooks.ts';
 import { CLAW_LEDGER_DIR, CLAW_WF_DIR } from './paths.ts';
+import { killTree } from './platform.ts';
 import { codexPrice } from './pricing.ts';
 import { saveClaudeQuota } from './quota.ts';
+import { executeQwen } from './qwen.ts';
 import { codexOverrides, formatSeat, type Seat } from './seats.ts';
 import type { RunStore, SeatRecord, TurnRecord, Usage } from './store.ts';
-import { extractJson, parseClaudeStream, parseCodexStream, type ParsedTurn } from './tap.ts';
-import { ClaudeTranslator, CodexTranslator, type Block } from './live.ts';
+import { extractJson, parseClaudeStream, parseCodexStream, parseQwenStream, type ParsedTurn } from './tap.ts';
+import { ClaudeTranslator, CodexTranslator, QwenTranslator, type Block } from './live.ts';
 
 /** What a seat may do in the workspace. Discussion seats read; a pair-mode writer writes. */
 export type SeatAccess =
@@ -48,6 +51,11 @@ export interface SeatSession {
   live?: { n: number; round: number; kind: string; translator: ClaudeTranslator | CodexTranslator; pending: Set<Block>; timer?: ReturnType<typeof setTimeout>; };
   codexRouteName?: string;
   claudeSinkId?: string;
+  qwen?: { cwd: string; system: string; schema?: object; access: 'read' | 'write'; profile?: QwenProfile; process?: ChildProcessWithoutNullStreams; };
+  /** Kept so a future seat can change providers without widening this role's permissions. */
+  setup?: { role: SeatRecord['role']; opts: Parameters<Engines['openSeat']>[2]; };
+  /** The protocol retains the original handle; new turns go to the replacement session. */
+  redirect?: SeatSession;
 }
 
 export interface SendOpts {
@@ -80,12 +88,12 @@ export class Engines {
   private readonly runTag: string;
   private readonly run: RunStore;
   private readonly cfg: Config;
-  private readonly bins: { codex: BinSpec; claude: BinSpec; };
+  private readonly bins: { codex: BinSpec; claude: BinSpec; qwen?: BinSpec; };
   private readonly sessions = new Set<SeatSession>();
   private readonly hooks: EngineHooks;
   private stopped = false;
 
-  constructor(run: RunStore, cfg: Config, bins: { codex: BinSpec; claude: BinSpec; }, hooks: EngineHooks = {}) {
+  constructor(run: RunStore, cfg: Config, bins: { codex: BinSpec; claude: BinSpec; qwen?: BinSpec; }, hooks: EngineHooks = {}) {
     this.run = run;
     this.cfg = cfg;
     this.bins = bins;
@@ -119,7 +127,7 @@ export class Engines {
       access?: SeatAccess;
       /** Hide the user's installed Codex skills from the seat (discussion seats do not need them). */
       hideSkills?: boolean;
-      resume?: Pick<SeatRecord, 'codexThreadId' | 'claudeSessionId' | 'codexUsageTotals' | 'claudeCostTotal'>;
+      resume?: Pick<SeatRecord, 'codexThreadId' | 'claudeSessionId' | 'qwenSessionId' | 'codexUsageTotals' | 'claudeCostTotal'>;
     },
   ): Promise<SeatSession> {
     const access = opts.access ?? { kind: 'read' };
@@ -138,6 +146,7 @@ export class Engines {
       clawSession: clawName,
       codexThreadId: opts.resume?.codexThreadId,
       claudeSessionId: opts.resume?.claudeSessionId,
+      qwenSessionId: opts.resume?.qwenSessionId,
     };
     const ss: SeatSession = {
       seat,
@@ -148,6 +157,7 @@ export class Engines {
       claudeCostTotal: opts.resume?.claudeCostTotal,
       capture: [],
       restart: async () => undefined,
+      setup: { role, opts },
     };
     const tapFile = join(this.tapsDir, `${suffix}.jsonl`);
     const onLine = (line: string) => {
@@ -193,6 +203,13 @@ export class Engines {
         await this.manager.stopSession(clawName).catch(() => undefined);
         await start();
       };
+    } else if (seat.engine === 'qwen') {
+      if (!this.bins.qwen) throw new Error('Qwen Code CLI is not configured');
+      const profile = seat.profile ? this.cfg.qwenProfiles[seat.profile] : undefined;
+      if (seat.profile && !profile) throw new Error(`unknown Qwen profile ${seat.profile}`);
+      if (profile && profile.model !== seat.model) throw new Error(`Qwen profile ${seat.profile} uses model ${profile.model}, not ${seat.model}`);
+      ss.qwen = { cwd: opts.cwd, system: opts.system, schema: opts.schema, access: access.kind === 'read' ? 'read' : 'write', profile };
+      ss.restart = async () => undefined; // each Qwen turn is a new CLI process with --resume
     } else {
       const sessionId = opts.resume?.claudeSessionId ?? randomUUID();
       record.claudeSessionId = sessionId;
@@ -251,8 +268,29 @@ export class Engines {
     this.hooks.onLive?.({ seat: ss.record.role === 'chair' && !ss.record.customRole ? 'chair' : ss.seat.id, n: live.n, round: live.round, kind: live.kind, blocks });
   }
 
+  /** Replace an agent only between turns. Recreate it with the original role, access,
+   * worktree, schema and system constraints; never reuse another provider's session ID. */
+  async reassign(handle: SeatSession, seat: Seat): Promise<void> {
+    const current = handle.redirect ?? handle;
+    const setup = current.setup;
+    if (!setup || seat.id !== current.seat.id) throw new Error('agent assignment is not eligible for reassignment');
+    if (current.qwen?.process) throw new Error('cannot change an agent during an active Qwen operation');
+    const next = await this.openSeat(seat, setup.role, {
+      ...setup.opts,
+      sessionKey: `${current.seat.id}-override-${randomUUID().slice(0, 8)}`,
+      resume: undefined,
+    });
+    next.record.customRole = current.record.customRole;
+    await this.retire(current);
+    handle.redirect = next;
+    handle.record = next.record;
+    handle.seat = next.seat;
+    handle.setup = next.setup;
+  }
+
   /** One turn: send, then rebuild the full record from the raw stream. */
   async send(ss: SeatSession, message: string, o: SendOpts): Promise<TurnRecord> {
+    ss = ss.redirect ?? ss;
     const n = this.run.allocTurn();
     const seatKey = ss.record.role === 'chair' && !ss.record.customRole ? 'chair' : ss.seat.id;
     const dir = this.run.turnDir(n, seatKey, o.round, o.kind);
@@ -260,11 +298,22 @@ export class Engines {
     const started = Date.now();
     const timeoutSec = o.timeoutSec ?? ss.seat.timeoutSec ?? this.cfg.timeoutSec[ss.seat.engine];
     ss.capture = [];
-    ss.live = { n, round: o.round, kind: o.kind, translator: ss.seat.engine === 'claude' ? new ClaudeTranslator() : new CodexTranslator(), pending: new Set() };
+    ss.live = { n, round: o.round, kind: o.kind, translator: ss.seat.engine === 'claude' ? new ClaudeTranslator() : ss.seat.engine === 'qwen' ? new QwenTranslator() : new CodexTranslator(), pending: new Set() };
     this.hooks.onTurnStart?.(seatKey, n, o.round, o.kind);
 
     const attempt = async (): Promise<{ output: string; error?: string; sessionId?: string; }> => {
       try {
+        if (ss.qwen) {
+          const q = ss.qwen;
+          const result = await executeQwen({ bin: this.bins.qwen!, model: ss.seat.model, cwd: q.cwd, system: q.system,
+            schema: q.schema, message, timeoutSec, resumeId: ss.record.qwenSessionId, profile: q.profile,
+            access: q.access, configDir: this.run.dir, id: `${this.runTag}-${ss.seat.id}`,
+            onLine: (line) => { ss.capture.push(line); try { appendFileSync(join(this.tapsDir, `${ss.seat.id}.jsonl`), line + '\n'); } catch {} this.feedLive(ss, line); },
+            onProcess: (proc) => { q.process = proc; },
+          });
+          if (result.sessionId) ss.record.qwenSessionId = result.sessionId;
+          return result;
+        }
         const res = await this.manager.sendMessage(ss.clawName, message, { timeout: timeoutSec * 1000, parentRunId: this.run.meta.id, nodeKind: o.kind });
         return { output: res.output ?? '', error: res.error, sessionId: res.sessionId };
       } catch (e) {
@@ -293,7 +342,7 @@ export class Engines {
 
     const raw = ss.capture.join('\n');
     ss.capture = [];
-    const parsed: ParsedTurn = ss.seat.engine === 'codex' ? parseCodexStream(raw) : parseClaudeStream(raw);
+    const parsed: ParsedTurn = ss.seat.engine === 'codex' ? parseCodexStream(raw) : ss.seat.engine === 'qwen' ? parseQwenStream(raw) : parseClaudeStream(raw);
     const durationMs = Date.now() - started;
     const usage = this.turnUsage(ss, parsed);
     const reply = parsed.reply || res.output;
@@ -308,6 +357,7 @@ export class Engines {
     }
     if (parsed.threadId) ss.record.codexThreadId = parsed.threadId;
     if (parsed.sessionId) ss.record.claudeSessionId = parsed.sessionId;
+    if (ss.seat.engine === 'qwen' && parsed.sessionId) { ss.record.qwenSessionId = parsed.sessionId; ss.record.claudeSessionId = undefined; }
     if (ss.codexTotals) ss.record.codexUsageTotals = ss.codexTotals;
     if (ss.seat.engine === 'claude' && parsed.rateLimits) saveClaudeQuota(parsed.rateLimits);
 
@@ -378,7 +428,8 @@ export class Engines {
 
   /** Retire a finished custom session before opening its next fresh role context. */
   async retire(ss: SeatSession): Promise<void> {
-    await this.manager.stopSession(ss.clawName).catch(() => undefined);
+    if (ss.qwen) killTree(ss.qwen.process?.pid);
+    else await this.manager.stopSession(ss.clawName).catch(() => undefined);
     if (ss.codexRouteName) dropCodexRoute(ss.codexRouteName);
     if (ss.claudeSinkId) claudeSink(ss.claudeSinkId, undefined);
     this.sessions.delete(ss);
@@ -387,11 +438,15 @@ export class Engines {
   /** Stop every seat now (cancel, or a fatal failure that makes the run pointless). */
   async stopAll(): Promise<void> {
     this.stopped = true;
-    await Promise.all([...this.sessions].map((ss) => this.manager.stopSession(ss.clawName).catch(() => undefined)));
+    await Promise.all([...this.sessions].map((ss) => {
+      if (ss.qwen) { killTree(ss.qwen.process?.pid); return Promise.resolve(); }
+      return this.manager.stopSession(ss.clawName).catch(() => undefined);
+    }));
   }
 
   async close(): Promise<void> {
     for (const ss of this.sessions) {
+      killTree(ss.qwen?.process?.pid);
       if (ss.codexRouteName) dropCodexRoute(ss.codexRouteName);
       if (ss.claudeSinkId) claudeSink(ss.claudeSinkId, undefined);
     }

@@ -217,6 +217,38 @@ export function claudeTurnCost(ev: Record<string, any>): ClaudeTurnCost {
   return guessed.length ? { unpriced: note(guessed) } : {};
 }
 
+/** Qwen Code's headless JSONL largely follows Claude's event envelope, but
+ * exposes structured_result and may emit tool_use/tool_result at the top level. */
+export function parseQwenStream(raw: string): ParsedTurn {
+  const t = parseClaudeStream(raw);
+  const tools = new Map<string, ToolCall>();
+  let sawResult = false;
+  let malformed = 0;
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      const ev = JSON.parse(line);
+      if (ev.type === 'result') {
+        sawResult = true;
+        if (ev.structured_result !== undefined) t.structured = ev.structured_result;
+        if (typeof ev.result === 'string') t.reply = ev.result;
+        if (ev.is_error || (ev.subtype && ev.subtype !== 'success')) t.error = String(ev.result || ev.subtype || 'Qwen error');
+      }
+      if (ev.type === 'tool_use') {
+        const tool: ToolCall = { name: String(ev.name ?? ev.tool?.name ?? 'tool'), input: JSON.stringify(ev.input ?? ev.tool?.input ?? {}).slice(0, 2000) };
+        t.tools.push(tool);
+        if (typeof ev.id === 'string') tools.set(ev.id, tool);
+      }
+      if (ev.type === 'tool_result') {
+        const tool = tools.get(String(ev.tool_use_id ?? ev.id)) ?? t.tools[t.tools.length - 1];
+        if (tool) { tool.output = clip(JSON.stringify(ev.content ?? ev.result ?? '')); tool.error = !!ev.is_error; }
+      }
+    } catch { malformed++; }
+  }
+  if (!sawResult && !t.error) t.error = malformed ? `malformed Qwen output (${malformed} invalid JSONL events)` : 'Qwen did not emit a result event';
+  return t;
+}
+
 /** Pull a JSON object out of a model reply (tolerates code fences and surrounding prose). */
 export function extractJson(text: string): unknown {
   const s = text.trim();

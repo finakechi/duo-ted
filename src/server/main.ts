@@ -15,19 +15,20 @@ import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'no
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { extname, join } from 'node:path';
 import { binVersionAsync, runBinAsync } from '../bins.ts';
-import { CLAUDE_MODELS, codexCatalogAsync, loadConfig, resolveClaudeBin, resolveCodexBin, saveConfig, type CodexModel } from '../config.ts';
+import { CLAUDE_MODELS, codexCatalogAsync, loadConfig, resolveClaudeBin, resolveCodexBin, resolveQwenBin, saveConfig, validateQwenProfiles, type CodexModel } from '../config.ts';
 import { liveChecks, runDoctor } from '../doctor.ts';
 import { sanitizeEnvironment } from '../env.ts';
 import { CONFIG_PATH, DUO_HOME, PROJECT_ROOT, SCRATCH_DIR } from '../paths.ts';
 import { IS_MAC, IS_WIN, openFolder } from '../platform.ts';
 import { knownCodexRates } from '../pricing.ts';
 import { refreshQuota } from '../quota-refresh.ts';
+import { probeQwenProfile } from '../qwen.ts';
 import { snapshot } from '../quota.ts';
 import { CLAUDE_EFFORTS, CODEX_EFFORTS } from '../seats.ts';
 import { workspaceOptionsAsync } from '../worktree.ts';
 import { buildGui, GUI_DIR, GUI_DIST } from './build.ts';
 import { Bus } from './bus.ts';
-import { CLAUDE_ACCESS, CODEX_ACCESS, ChatManager } from './chats.ts';
+import { CLAUDE_ACCESS, CODEX_ACCESS, QWEN_ACCESS, ChatManager } from './chats.ts';
 import { gitState, listDirs } from './fsapi.ts';
 import { PermissionBroker } from './permissions.ts';
 import { listTemplates, getTemplate, saveTemplate, deleteTemplate } from '../templates/catalog.ts';
@@ -160,10 +161,11 @@ async function state() {
   const prefs = readPrefs();
   // Neither the catalog nor the versions may hold up the engine: a stale catalog is served while a
   // fresh one loads, and the window is told when it arrives.
-  const [catalog, codexVersion, claudeVersion] = await Promise.all([
+  const [catalog, codexVersion, claudeVersion, qwenVersion] = await Promise.all([
     codexCatalogAsync(bins.codex, (models) => bus.emit({ t: 'models', codex: visible(models) })),
     binVersionAsync(bins.codex),
     binVersionAsync(bins.claude),
+    Promise.resolve().then(() => binVersionAsync(resolveQwenBin(c))).catch(() => 'not installed'),
   ]);
   return {
     version: JSON.parse(readFileSync(join(PROJECT_ROOT, 'package.json'), 'utf8')).version,
@@ -179,11 +181,13 @@ async function state() {
     access: {
       claude: Object.fromEntries(Object.entries(CLAUDE_ACCESS).map(([k, v]) => [k, v.label])),
       codex: Object.fromEntries(Object.entries(CODEX_ACCESS).map(([k, v]) => [k, v.label])),
+      qwen: Object.fromEntries(Object.entries(QWEN_ACCESS).map(([k, v]) => [k, v.label])),
     },
     models: { codex: visible(catalog), claude: CLAUDE_MODELS },
+    qwenProfiles: c.qwenProfiles,
     rates: knownCodexRates(),
-    efforts: { codex: CODEX_EFFORTS, claude: CLAUDE_EFFORTS },
-    versions: { codex: codexVersion, claude: claudeVersion },
+    efforts: { codex: CODEX_EFFORTS, claude: CLAUDE_EFFORTS, qwen: [] },
+    versions: { codex: codexVersion, claude: claudeVersion, qwen: qwenVersion },
     quota: snapshot(),
     chats: chats.list(),
     runs: runs.list(),
@@ -260,12 +264,23 @@ const routes: [string, RegExp, Handler][] = [
   ['DELETE', /^\/api\/templates\/([\w-]+)$/, (m) => { deleteTemplate(m[1]); return { ok: true }; }],
   ['DELETE', /^\/api\/templates\/([\w-]+)\/memory\/([\w-]+)$/, (m) => { clearMemory(getTemplate(m[1]), m[2]); return { ok: true }; }],
   ['GET', /^\/api\/runs$/, () => runs.list()],
+  ['POST', /^\/api\/assignments\/suggest$/, async (_m, req) => runs.suggest(await body(req))],
   ['POST', /^\/api\/runs$/, async (_m, req) => runs.start(await body(req))],
   ['GET', /^\/api\/runs\/([\w.-]+)$/, (m) => runs.get(m[1])],
   ['DELETE', /^\/api\/runs\/([\w.-]+)$/, (m) => { runs.remove(m[1]); return { ok: true }; }],
   ['GET', /^\/api\/runs\/([\w.-]+)\/turns\/(\d+)$/, (m) => runs.turn(m[1], Number(m[2]))],
   ['GET', /^\/api\/runs\/([\w.-]+)\/diff$/, (m) => runs.diff(m[1])],
   ['POST', /^\/api\/runs\/([\w.-]+)\/cancel$/, (m) => ({ cancelled: runs.cancel(m[1]) })],
+  ['POST', /^\/api\/runs\/([\w.-]+)\/pause$/, (m) => runs.pause(m[1])],
+  ['POST', /^\/api\/runs\/([\w.-]+)\/resume$/, (m) => runs.resume(m[1])],
+  ['POST', /^\/api\/runs\/([\w.-]+)\/instruct$/, async (m, req) => {
+    const b = await body(req);
+    return runs.instruct(m[1], String(b.target ?? ''), String(b.text ?? ''));
+  }],
+  ['POST', /^\/api\/runs\/([\w.-]+)\/override$/, async (m, req) => {
+    const b = await body(req);
+    return runs.override(m[1], String(b.target ?? ''), String(b.spec ?? ''));
+  }],
   ['POST', /^\/api\/runs\/([\w.-]+)\/workspace$/, async (m, req) => {
     const a = String((await body(req)).action ?? '');
     if (!['apply', 'keep', 'discard'].includes(a)) throw new HttpError(400, 'action must be apply, keep or discard');
@@ -285,11 +300,24 @@ const routes: [string, RegExp, Handler][] = [
   }],
   ['PUT', /^\/api\/config$/, async (_m, req) => {
     const b = await body(req);
+    if (b.qwenProfiles !== undefined) {
+      try { validateQwenProfiles(b.qwenProfiles); } catch (e) { throw new HttpError(400, (e as Error).message); }
+    }
     const patch: Record<string, unknown> = {};
-    for (const k of ['gui', 'presets', 'defaults', 'warnPercent'] as const) if (b[k] !== undefined) patch[k] = b[k];
+    for (const k of ['gui', 'presets', 'defaults', 'warnPercent', 'qwenProfiles'] as const) if (b[k] !== undefined) patch[k] = b[k];
     const next = saveConfig(patch as any);
     Object.assign(cfg, next);
     return state();
+  }],
+  ['POST', /^\/api\/qwen\/test$/, async (_m, req) => {
+    const b = await body(req);
+    const profile = loadConfig().qwenProfiles[String(b.profile ?? '')];
+    if (!profile) throw new HttpError(400, 'unknown Qwen profile');
+    let cli;
+    try { cli = resolveQwenBin(loadConfig()); } catch { /* reachability is still testable */ }
+    const result = await probeQwenProfile(profile, cli);
+    if (result.toolUse === 'verified') runs.verifyQwenProfile(String(b.profile), profile);
+    return result;
   }],
   ['POST', /^\/api\/open$/, async (_m, req) => {
     const p = String((await body(req)).path ?? '');

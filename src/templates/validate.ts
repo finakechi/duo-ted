@@ -40,7 +40,7 @@ export function templateErrors(value: unknown): string[] {
     if (!object(v)) return err(`${at}: selector must be an object`);
     allowed(v, ['ids', 'engine', 'model', 'fromRole', 'count', 'rankBy'], at);
     if (v.ids !== undefined && (!Array.isArray(v.ids) || !v.ids.length || v.ids.some((s: unknown) => typeof s !== 'string' || !/^[A-Z]+$/.test(s)))) err(`${at}: ids must be seat ids such as A, B, C`);
-    if (v.engine !== undefined && !['codex', 'claude'].includes(v.engine)) err(`${at}: unknown engine`);
+    if (v.engine !== undefined && !['codex', 'claude', 'qwen'].includes(v.engine)) err(`${at}: unknown engine`);
     if (v.model !== undefined && typeof v.model !== 'string') err(`${at}: model must be text`);
     if (v.fromRole !== undefined) role(v.fromRole, at);
     if (v.rankBy !== undefined) {

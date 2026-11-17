@@ -145,6 +145,17 @@ export class ClaudeTranslator extends Translator {
   }
 }
 
+/** Qwen headless uses Claude-like streamed assistant blocks with extra terminal events. */
+export class QwenTranslator extends ClaudeTranslator {
+  protected one(ev: Record<string, any>, changed: Set<Block>): void {
+    if (ev.type === 'result' && ev.structured_result !== undefined) {
+      const b = this.upsert('qwen:structured', { kind: 'text', text: JSON.stringify(ev.structured_result), phase: 'final', status: 'done' }, changed);
+      b.text = JSON.stringify(ev.structured_result);
+    }
+    super.one(ev, changed);
+  }
+}
+
 export class CodexTranslator extends Translator {
   protected one(ev: Record<string, any>, changed: Set<Block>): void {
     switch (ev.type) {

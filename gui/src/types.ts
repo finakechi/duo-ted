@@ -1,6 +1,11 @@
 import type { CoordinationTemplate, WorkflowState } from '../../src/templates/types.ts';
-export type Engine = 'claude' | 'codex';
+export type Engine = 'claude' | 'codex' | 'qwen';
 export type Protocol = 'debate' | 'review' | 'council' | 'ask' | 'pair' | 'custom';
+export interface AssignmentRequest {
+  mode: 'manual' | 'automatic' | 'hybrid';
+  preference: 'local-first' | 'best-fit' | 'cloud-first';
+  overrides?: number[];
+}
 
 export interface Block {
   id: string;
@@ -142,6 +147,7 @@ export interface SeatRecord {
   customRole?: boolean;
   codexThreadId?: string;
   claudeSessionId?: string;
+  qwenSessionId?: string;
 }
 
 export interface PairFinding {
@@ -204,6 +210,14 @@ export interface RunDetails {
   template?: CoordinationTemplate;
   draftTemplate?: CoordinationTemplate;
   coordination?: WorkflowState;
+  control?: {
+    state: 'running' | 'pause_requested' | 'paused';
+    pending: { target: string; text: string; at: string }[];
+    coordinatorNotes: string[];
+    delivered: { target: string; text: string; at: string }[];
+    pendingOverrides?: { target: string; spec: string; at: string }[];
+    appliedOverrides?: { target: string; from: string; to: string; at: string }[];
+  };
   dir: string;
 }
 
@@ -230,9 +244,11 @@ export interface Preset {
 export interface GuiDefaults {
   claude: { spec: string; access: string; };
   codex: { spec: string; access: string; useConfig: boolean; };
+  qwen: { spec: string; access: string; };
   theme: 'system' | 'light' | 'dark';
   notify: boolean;
 }
+export interface QwenProfile { name: string; kind: 'hosted' | 'local'; model: string; baseUrl: string; keyEnv?: string; }
 
 export interface Prefs {
   project?: string;
@@ -263,11 +279,12 @@ export interface AppState {
   presets: Record<string, Preset>;
   defaults: { preset: string; codexModel: string; claudeModel: string; };
   warnPercent: number;
-  access: { claude: Record<string, string>; codex: Record<string, string>; };
+  access: { claude: Record<string, string>; codex: Record<string, string>; qwen: Record<string, string>; };
   models: { codex: CodexModel[]; claude: { alias: string; note: string; }[]; };
+  qwenProfiles: Record<string, QwenProfile>;
   rates: Record<string, [number, number, number]>;
-  efforts: { codex: string[]; claude: string[]; };
-  versions: { codex: string; claude: string; };
+  efforts: { codex: string[]; claude: string[]; qwen: string[]; };
+  versions: { codex: string; claude: string; qwen?: string; };
   quota: QuotaSnapshot;
   chats: ChatSummary[];
   runs: RunSummary[];
@@ -278,6 +295,7 @@ export interface AppState {
 
 export interface StartRun {
   protocol: Protocol;
+  assignment?: AssignmentRequest;
   template?: CoordinationTemplate | string;
   seats: string[];
   chair?: string;

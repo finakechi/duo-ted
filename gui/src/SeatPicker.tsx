@@ -8,7 +8,7 @@ const CLAUDE_DEFAULT_MODEL = 'opus';
 
 function defaultsFor(engine: Engine): SpecParts {
   const s = app.value!;
-  return parseSpec(engine === 'claude' ? s.gui.claude.spec : s.gui.codex.spec);
+  return parseSpec(s.gui[engine].spec);
 }
 
 /** The published Standard credit rate; a model without one says so instead of borrowing another's. */
@@ -28,7 +28,7 @@ export function SeatPicker({ spec, onChange, engineLocked, seat, align = 'left',
     onChange(str);
   };
   const codexModel = s.models.codex.find((m) => m.slug === p.model);
-  const efforts = p.engine === 'codex' ? (codexModel?.efforts.length ? codexModel.efforts : s.efforts.codex) : s.efforts.claude;
+  const efforts = p.engine === 'codex' ? (codexModel?.efforts.length ? codexModel.efforts : s.efforts.codex) : s.efforts[p.engine];
   const chip = (open: boolean, toggle: () => void) => (
     <button type="button" class={`chip seat-chip ${p.engine} ${open ? 'open' : ''}`} onClick={() => { setRaw(spec); toggle(); }} title={`${spec}\nClick to change the model, effort and options`}>
       <EngineMark engine={p.engine} size={16} />
@@ -44,9 +44,9 @@ export function SeatPicker({ spec, onChange, engineLocked, seat, align = 'left',
         <div class="seat-panel" onMouseDown={(e) => e.stopPropagation()}>
           {!engineLocked && (
             <div class="seg full">
-              {(['claude', 'codex'] as Engine[]).map((e) => (
+              {(['claude', 'codex', 'qwen'] as Engine[]).map((e) => (
                 <button type="button" class={p.engine === e ? 'on' : ''} onClick={() => apply(e === p.engine ? p : defaultsFor(e))}>
-                  <EngineMark engine={e} size={16} /> {e === 'claude' ? 'Claude' : 'Codex'}
+                  <EngineMark engine={e} size={16} /> {e === 'claude' ? 'Claude' : e === 'codex' ? 'Codex' : 'Qwen'}
                 </button>
               ))}
             </div>
@@ -61,6 +61,17 @@ export function SeatPicker({ spec, onChange, engineLocked, seat, align = 'left',
                     <span class="model-rate" title="Codex plan credits at the published Standard rate">{rateLabel(m.slug)}</span>
                   </button>
                 ))
+              : p.engine === 'qwen' ? <>
+                  <button type="button" class={`model-row ${!getOpt(p, 'profile') ? 'on' : ''}`} onClick={() => apply(setOpt({ ...p, model: 'qwen3-coder-plus', effort: undefined }, 'profile', undefined))}>
+                    <span class="model-name">Configured Qwen Code model</span><span class="model-desc">Uses your existing Qwen authentication</span>
+                  </button>
+                  {Object.entries(s.qwenProfiles).map(([id, profile]) => (
+                    <button type="button" class={`model-row ${getOpt(p, 'profile') === id ? 'on' : ''}`} onClick={() => apply(setOpt({ ...p, model: profile.model, effort: undefined }, 'profile', id))}>
+                      <span class="model-name">{profile.name}{getOpt(p, 'profile') === id && <Icon name="check" size={13} />}</span>
+                      <span class="model-desc">{profile.kind} · {profile.model}</span>
+                    </button>
+                  ))}
+                </>
               : s.models.claude.map((m) => (
                   <button type="button" class={`model-row ${m.alias === (p.model || CLAUDE_DEFAULT_MODEL) ? 'on' : ''}`} onClick={() => apply({ ...p, model: m.alias })}>
                     <span class="model-name">{m.alias[0].toUpperCase() + m.alias.slice(1)}{m.alias === (p.model || CLAUDE_DEFAULT_MODEL) && <Icon name="check" size={13} />}</span>
@@ -68,12 +79,11 @@ export function SeatPicker({ spec, onChange, engineLocked, seat, align = 'left',
                   </button>
                 ))}
           </div>
-          <div class="panel-label">Effort</div>
-          <div class="seg wrap">
+          {efforts.length > 0 && <><div class="panel-label">Effort</div><div class="seg wrap">
             {efforts.map((e) => (
               <button type="button" class={p.effort === e ? 'on' : ''} onClick={() => apply({ ...p, effort: e })}>{e}</button>
             ))}
-          </div>
+          </div></>}
           {p.engine === 'codex' && (
             <>
               <div class="panel-label">Output</div>
@@ -127,6 +137,8 @@ const ACCESS_HELP: Record<string, string> = {
   full: 'No prompts at all. Use only in folders you can afford to lose.',
   'read-only': 'Reads files and runs read-only commands.',
   workspace: 'Edits and runs commands inside the project, sandboxed, without network.',
+  'qwen-read': 'Read-only Qwen session, enforced by Linux Bubblewrap.',
+  'qwen-write': 'Qwen can edit this workspace within a Linux Bubblewrap sandbox.',
 };
 
 export function AccessPicker({ engine, access, onChange, align = 'left', up }: { engine: Engine; access: string; onChange: (a: string) => void; align?: 'left' | 'right'; up?: boolean }) {

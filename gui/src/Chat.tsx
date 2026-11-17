@@ -224,7 +224,7 @@ function finalText(turn: ChatTurn): string {
 }
 
 function engineLabel(e: Engine): string {
-  return e === 'claude' ? 'Claude' : 'Codex';
+  return e === 'claude' ? 'Claude' : e === 'codex' ? 'Codex' : 'Qwen';
 }
 
 function TurnFooter({ chat, turn, partner, last }: { chat: ChatSession; turn: ChatTurn; partner?: ChatSession; last: boolean }) {
@@ -344,6 +344,7 @@ class TurnItem extends Component<TurnProps> {
 const STARTERS: Record<Engine, string[]> = {
   claude: ['Explain how this project is put together', 'Find the riskiest code here and say why', 'Write tests for the module I name next', 'Review my uncommitted changes'],
   codex: ['Find and fix a failing test', 'Profile the slowest path and speed it up', 'Add input validation to the API handlers', 'Summarize what changed in the last 10 commits'],
+  qwen: ['Explain this codebase', 'Find and fix a failing test', 'Review the current changes', 'Implement a small feature'],
 };
 
 function EmptyChat({ chat, onPick }: { chat: ChatSession; onPick: (t: string) => void }) {

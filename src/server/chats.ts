@@ -8,14 +8,16 @@ import { randomUUID } from 'node:crypto';
 import { appendFileSync, closeSync, existsSync, fchmodSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { BinSpec } from '../bins.ts';
-import type { Config } from '../config.ts';
+import { resolveQwenBin, type Config } from '../config.ts';
 import { withCodexBin } from '../engine.ts';
 import { DEPTH_VAR } from '../env.ts';
 import { classifyError, errorHint } from '../errors.ts';
 import { claudeRoute, claudeSink, codexRoute, dropCodexRoute } from '../hooks.ts';
-import { ClaudeTranslator, CodexTranslator, type Block } from '../live.ts';
+import { ClaudeTranslator, CodexTranslator, QwenTranslator, type Block } from '../live.ts';
+import { executeQwen } from '../qwen.ts';
+import { parseQwenStream } from '../tap.ts';
 import { DUO_HOME } from '../paths.ts';
-import { nodeRunner } from '../platform.ts';
+import { killTree, nodeRunner } from '../platform.ts';
 import { codexPrice } from '../pricing.ts';
 import { saveClaudeQuota, snapshot } from '../quota.ts';
 import { codexOverrides, parseSeat, type Seat } from '../seats.ts';
@@ -29,7 +31,12 @@ const CHATS_DIR = join(GUI_DIR, 'chats');
 const TAPS_DIR = join(GUI_DIR, 'taps');
 const MCP_DIR = join(GUI_DIR, 'mcp');
 
-export type Engine = 'claude' | 'codex';
+export type Engine = 'claude' | 'codex' | 'qwen';
+
+export const QWEN_ACCESS = {
+  'read-only': { label: 'Read-only' },
+  workspace: { label: 'Workspace write' },
+};
 
 /** Claude permission modes, as the GUI names them. "ask", "edits" and "auto" route prompts to the window. */
 export const CLAUDE_ACCESS: Record<string, { mode: string; prompts: boolean; label: string }> = {
@@ -80,6 +87,7 @@ export interface ChatSession {
   claudeSessionId?: string;
   claudeStarted?: boolean;
   codexThreadId?: string;
+  qwenSessionId?: string;
   codexTotals?: Usage;
   claudeCost?: number;
   turns: ChatTurn[];
@@ -89,7 +97,7 @@ export type ChatSummary = Omit<ChatSession, 'turns' | 'codexTotals'> & { turnCou
 
 interface LiveTurn {
   turn: ChatTurn;
-  translator: ClaudeTranslator | CodexTranslator;
+  translator: ClaudeTranslator | CodexTranslator | QwenTranslator;
   pending: Set<Block>;
   timer?: ReturnType<typeof setTimeout>;
 }
@@ -181,13 +189,13 @@ export class ChatManager {
   private validate(engine: Engine, spec: string, access: string): Seat {
     const seat = parseSeat(spec, 'A', this.cfg.defaults);
     if (seat.engine !== engine) throw new Error(`a ${engine} chat needs a ${engine} seat (got ${spec})`);
-    const table = engine === 'claude' ? CLAUDE_ACCESS : CODEX_ACCESS;
-    if (!table[access]) throw new Error(`unknown access "${access}" for ${engine} (${Object.keys(table).join(', ')})`);
+    const table = engine === 'claude' ? CLAUDE_ACCESS : engine === 'codex' ? CODEX_ACCESS : QWEN_ACCESS;
+    if (!Object.hasOwn(table, access)) throw new Error(`unknown access "${access}" for ${engine} (${Object.keys(table).join(', ')})`);
     return seat;
   }
 
   create(o: { engine: Engine; spec?: string; access?: string; cwd: string; useCodexConfig?: boolean; title?: string }): ChatSession {
-    const d = o.engine === 'claude' ? this.cfg.gui.claude : this.cfg.gui.codex;
+    const d = this.cfg.gui[o.engine];
     const spec = o.spec ?? d.spec;
     const access = o.access ?? d.access;
     this.validate(o.engine, spec, access);
@@ -417,6 +425,7 @@ export class ChatManager {
       this.perms.cancelChat(s.id);
       void this.stopLive(s.id);
     } });
+    if (s.engine === 'qwen') return this.runQwenTurn(s, turn, text, started);
     try {
       clawName = await this.ensureLive(s);
     } catch (e) {
@@ -474,6 +483,36 @@ export class ChatManager {
     // while partial text alone cannot turn a failure into a success.
     const completed = f.completed && turn.blocks.some((b) => b.kind === 'text' && b.text);
     this.endTurn(s, turn, started, { stopped, error: f.error ?? (completed ? undefined : error), usage: f.usage, costUsd: f.costUsd, claudeTurn: f.turn });
+  }
+
+  private async runQwenTurn(s: ChatSession, turn: ChatTurn, message: string, started: number): Promise<void> {
+    let stopped = false;
+    let proc: import('node:child_process').ChildProcessWithoutNullStreams | undefined;
+    const events: string[] = [];
+    const translator = new QwenTranslator();
+    this.current.set(s.id, { turn, translator, pending: new Set() });
+    this.running.set(s.id, { turn, stop: () => { stopped = true; killTree(proc?.pid); } });
+    let error: string | undefined;
+    let usage: Usage | undefined;
+    try {
+      const seat = this.validate(s.engine, s.spec, s.access);
+      const profile = seat.profile ? this.cfg.qwenProfiles[seat.profile] : undefined;
+      if (seat.profile && !profile) throw new Error(`unknown Qwen profile ${seat.profile}`);
+      if (profile && profile.model !== seat.model) throw new Error(`Qwen profile ${seat.profile} requires model ${profile.model}`);
+      const result = await executeQwen({ bin: resolveQwenBin(this.cfg), model: seat.model, cwd: s.cwd,
+        system: 'Follow the user instructions while preserving workspace permissions.', message,
+        timeoutSec: this.cfg.timeoutSec.qwen, resumeId: s.qwenSessionId, profile,
+        access: s.access === 'read-only' ? 'read' : 'write', configDir: CHATS_DIR, id: s.id,
+        onLine: (line) => { events.push(line); this.onLine(s.id, line); }, onProcess: (p) => { proc = p; if (stopped) killTree(p?.pid); } });
+      if (result.sessionId) s.qwenSessionId = result.sessionId;
+      const parsed = parseQwenStream(events.join('\n'));
+      error = parsed.error ?? result.error;
+      usage = parsed.usage;
+    } catch (e) { error = (e as Error).message; }
+    this.flush(s.id);
+    this.current.delete(s.id);
+    turn.blocks = translator.blocks;
+    this.endTurn(s, turn, started, { stopped, error, usage });
   }
 
   private endTurn(s: ChatSession, turn: ChatTurn, started: number, o: { stopped?: boolean; error?: string; usage?: Usage; costUsd?: number; claudeTurn?: ClaudeTurnCost }): void {

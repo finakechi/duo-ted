@@ -283,10 +283,12 @@ button.chip:hover { background: var(--hover); }
 .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex: none; }
 .dot-claude { background: var(--claude); }
 .dot-codex { background: var(--codex); }
+.dot-qwen { background: #a979e2; }
 
 .mark { display: inline-flex; align-items: center; justify-content: center; border-radius: 50%; flex: none; color: #fff; }
 .mark-claude { background: var(--claude); }
 .mark-codex { background: var(--codex); }
+.mark-qwen { background: #7d52ba; color: white; }
 .engine-name.claude { color: var(--claude); font-weight: 620; }
 .engine-name.codex { color: var(--codex); font-weight: 620; }
 

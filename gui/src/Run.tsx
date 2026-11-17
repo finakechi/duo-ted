@@ -11,7 +11,7 @@ import { templateOperationSettings } from '../../src/templates/operations.ts';
 import { SeatPicker } from './SeatPicker.tsx';
 import { parseSpec, shortSpec } from './spec.ts';
 import { app, cancelRun, confirmAction, continueRun, deleteRun, go, guard, loadRun, prefs, project, runLive, runLogs, runs, startRun, toast, updateClaude, workspaceAction } from './store.ts';
-import type { LiveTurn, PairCycle, Protocol, RunDetails, RunTurnMeta, StartRun } from './types.ts';
+import type { AssignmentRequest, LiveTurn, PairCycle, Protocol, RunDetails, RunTurnMeta, StartRun } from './types.ts';
 import { base, Cost, CREDIT_NOTE, Dropdown, dur, Elapsed, Empty, EngineMark, Icon, IntegerInput, Kbd, kfmt, MenuItem, MenuSeparator, Modal, money, Segmented, Spinner, Tabs, Toggle, untilText, USD_NOTE } from './ui.tsx';
 
 export const PROTOCOLS: Record<Protocol, { icon: string; label: string; help: string; mode: ModeId; }> = {
@@ -420,7 +420,7 @@ function ContinueModal({ d, onClose }: { d: RunDetails; onClose: () => void; }) 
       <button type="button" class="btn" onClick={onClose}>Cancel</button>
       <button type="button" class="btn primary" onClick={() => { void continueRun(d.meta.id, note, rounds); onClose(); }}><Icon name="play" size={13} /> Continue</button>
     </>}>
-      <p class="muted small">Resumes the same Codex threads and Claude sessions (their context and prompt cache carry over) and runs more {unit.toLowerCase()} as a new run{d.meta.protocol === 'pair' ? ' on the same workspace' : ''}.</p>
+      <p class="muted small">Starts a new run using recorded Codex, Claude or Qwen sessions when available, with retained workflow state, pending instructions and eligible future assignments. It runs more {unit.toLowerCase()}{d.meta.protocol === 'pair' ? ' on the same workspace' : ''}. A stopped process itself cannot resume in place; unfinished tool operations are not replayed automatically.</p>
       <label class="field">Note to the {d.meta.protocol === 'pair' ? 'writer' : 'participants'} (optional)<textarea rows={4} value={note} onInput={(e) => setNote((e.target as HTMLTextAreaElement).value)} placeholder={d.meta.protocol === 'pair' ? 'e.g. Keep the public API unchanged; add a test for the empty input case.' : 'e.g. You contradict each other on X; resolve it explicitly.'} /></label>
       <label class="field inline">{unit} <IntegerInput value={rounds} onChange={setRounds} /></label>
     </Modal>
@@ -454,6 +454,47 @@ export function RunView({ id }: { id: string; }) {
   const [tab, setTab] = useState<string>('live');
   const [openTurn, setOpenTurn] = useState<number | null>(null);
   const [cont, setCont] = useState(false);
+  const [instruction, setInstruction] = useState('');
+  const [instructionTarget, setInstructionTarget] = useState('coordinator');
+  const [overrideTarget, setOverrideTarget] = useState('');
+  const [overrideSpec, setOverrideSpec] = useState('qwen:qwen3-coder-plus');
+  const [controlBusy, setControlBusy] = useState(false);
+  useEffect(() => {
+    const first = d?.meta.seats.find((seat) => seat.role !== 'chair');
+    setOverrideTarget(first?.id ?? '');
+    setOverrideSpec(first?.spec ?? 'qwen:qwen3-coder-plus');
+  }, [id, d?.meta.id]);
+  const control = async (action: 'pause' | 'resume') => {
+    setControlBusy(true);
+    try {
+      const result = await api<{ requested?: boolean; resumed?: boolean }>(`/api/runs/${encodeURIComponent(id)}/${action}`, { method: 'POST' });
+      if (!(result.requested || result.resumed)) toast(`Run cannot ${action} at this time`);
+      await loadRun(id);
+    } catch (e) { toast((e as Error).message); }
+    finally { setControlBusy(false); }
+  };
+  const sendInstruction = async () => {
+    const text = instruction.trim();
+    if (!text) return;
+    setControlBusy(true);
+    try {
+      await api(`/api/runs/${encodeURIComponent(id)}/instruct`, { method: 'POST', body: { target: instructionTarget, text } });
+      setInstruction('');
+      await loadRun(id);
+      toast('Instruction queued for the next eligible turn', 'success');
+    } catch (e) { toast((e as Error).message); }
+    finally { setControlBusy(false); }
+  };
+  const sendOverride = async () => {
+    if (!overrideTarget) return;
+    setControlBusy(true);
+    try {
+      await api(`/api/runs/${encodeURIComponent(id)}/override`, { method: 'POST', body: { target: overrideTarget, spec: overrideSpec } });
+      await loadRun(id);
+      toast('Assignment queued for the selected agent’s next turn', 'success');
+    } catch (e) { toast((e as Error).message); }
+    finally { setControlBusy(false); }
+  };
   useEffect(() => {
     setTab('live');
     void loadRun(id);
@@ -488,6 +529,9 @@ export function RunView({ id }: { id: string; }) {
           <h1 title={m.title}>{m.title}</h1>
           <StatusChip status={running ? 'running' : m.status} outcome={m.outcome} />
           <div class="spacer" />
+          {running && (d.control?.state === 'paused' || d.control?.state === 'pause_requested'
+            ? <button type="button" class="btn small" disabled={controlBusy} onClick={() => void control('resume')}><Icon name="play" size={12} /> Resume</button>
+            : <button type="button" class="btn small" disabled={controlBusy} onClick={() => void control('pause')}><Icon name="pause" size={12} /> Pause next turn</button>)}
           {running && <button type="button" class="btn small stop" onClick={() => cancelRun(m.id)}><Icon name="stop" size={11} /> Stop</button>}
           {canContinue && <button type="button" class="btn small" onClick={() => setCont(true)}><Icon name="play" size={12} /> Continue</button>}
           <Dropdown align="right" trigger={(_o, toggle) => <button type="button" class="icon-btn" onClick={toggle} title="More"><Icon name="dots" /></button>}>
@@ -520,6 +564,33 @@ export function RunView({ id }: { id: string; }) {
           </div>
         )}
         {m.workspace && <WorkspaceBar d={d} running={running} />}
+        {running && <div class="pad" aria-label="Run intervention">
+          <div class="row wrap" style={{ gap: '8px' }}>
+            <span class="muted small" role="status">{d.control?.state === 'paused' ? 'Paused before next agent turn' : d.control?.state === 'pause_requested' ? 'Pause requested — waiting for next safe turn' : 'Instructions apply at a future agent turn'}</span>
+            <label for="run-instruction-agent" class="muted small">Recipient</label>
+            <select id="run-instruction-agent" value={instructionTarget} onChange={(e) => setInstructionTarget((e.target as HTMLSelectElement).value)}>
+              <option value="coordinator">Coordinator (future turns)</option>
+              {m.seats.map((seat) => <option key={seat.id} value={seat.id}>{seat.id}: {seat.model}</option>)}
+            </select>
+            <input aria-label="Additional instructions" value={instruction} onInput={(e) => setInstruction((e.target as HTMLInputElement).value)} placeholder="Instruction for the next eligible turn" maxLength={4000} />
+            <button type="button" class="btn small" disabled={controlBusy || !instruction.trim()} onClick={() => void sendInstruction()}>Queue instruction</button>
+          </div>
+          {!!d.control?.pending.length && <span class="muted small" role="status">{d.control.pending.length} instruction(s) queued</span>}
+          <div class="row wrap" style={{ gap: '8px', marginTop: '8px' }}>
+            <label for="run-override-agent" class="muted small">Future assignment</label>
+            <select id="run-override-agent" value={overrideTarget} onChange={(e) => {
+              const target = (e.target as HTMLSelectElement).value;
+              setOverrideTarget(target);
+              setOverrideSpec(m.seats.find((s) => s.id === target)?.spec ?? 'qwen:qwen3-coder-plus');
+            }}>
+              {[...new Map(m.seats.filter((s) => s.role !== 'chair').map((s) => [s.id, s])).values()].map((s) => <option key={s.id} value={s.id}>{s.id}: {s.model}</option>)}
+            </select>
+            <SeatPicker spec={overrideSpec} onChange={setOverrideSpec} />
+            <button type="button" class="btn small" disabled={controlBusy || !overrideTarget} onClick={() => void sendOverride()}>Queue assignment</button>
+            <span class="muted small">Takes effect before the next eligible turn; the previous agent’s completed replies are retained.</span>
+          </div>
+          {!!d.control?.pendingOverrides?.length && <span class="muted small" role="status">Pending: {d.control.pendingOverrides.map((o) => `${o.target} → ${o.spec}`).join(', ')}</span>}
+        </div>}
       </header>
       <Tabs active={tab} onChange={setTab} tabs={tabs} />
       <div class="run-body" onClick={onCopyClick}>
@@ -581,6 +652,10 @@ export function NewRun({ draft }: { draft?: Partial<StartRun>; }) {
   const remembered = prefs.value.lastSeats?.[protocol];
   const initialSeats = (p: Protocol) => draft?.seats ?? prefs.value.lastSeats?.[p]?.seats ?? (p === 'pair' ? [s.gui.codex.spec, s.gui.claude.spec] : preset?.seats ?? [s.gui.codex.spec, s.gui.claude.spec]);
   const [seats, setSeats] = useState<string[]>(initialSeats(protocol));
+  const [assignmentMode, setAssignmentMode] = useState<AssignmentRequest['mode']>('manual');
+  const [assignmentPreference, setAssignmentPreference] = useState<AssignmentRequest['preference']>('best-fit');
+  const [assignmentOverrides, setAssignmentOverrides] = useState<number[]>([]);
+  const [suggested, setSuggested] = useState<{ seats: string[]; reasons: string[]; error?: string }>();
   const [chair, setChair] = useState<string | undefined>(draft?.chair ?? remembered?.chair ?? preset?.chair);
   const [rounds, setRounds] = useState<number>(draft?.rounds ?? (protocol === 'pair' ? 4 : preset?.rounds ?? 3));
   const [minRounds, setMinRounds] = useState(1);
@@ -599,6 +674,19 @@ export function NewRun({ draft }: { draft?: Partial<StartRun>; }) {
   const isPair = protocol === 'pair' || library === 'pair';
   const pairSeats = [seats[0] ?? s.gui.codex.spec, seats[1] ?? s.gui.claude.spec];
   const isReview = protocol === 'review' || library === 'review';
+  useEffect(() => {
+    if (assignmentMode === 'manual') { setSuggested(undefined); return; }
+    setSuggested(undefined);
+    let cancelled = false;
+    const timer = setTimeout(() => void api<{ seats: string[]; reasons: string[] }>('/api/assignments/suggest', { method: 'POST', body: {
+      protocol: isPair ? 'pair' : protocol, seats,
+      assignment: { mode: assignmentMode, preference: assignmentPreference, overrides: assignmentOverrides },
+    } }).then((data) => { if (!cancelled) setSuggested(data); }).catch((error: Error) => { if (!cancelled) setSuggested({ seats: [], reasons: [], error: error.message }); }), 100);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [assignmentMode, assignmentPreference, assignmentOverrides.join(','), seats.join('|'), protocol, isPair]);
+  const renderedSeats = assignmentMode === 'manual' ? seats : suggested?.seats ?? [];
+  const override = (slot: number) => setAssignmentOverrides((current) => current.includes(slot) ? current.filter((n) => n !== slot) : [...current, slot]);
+  const editable = (slot: number) => assignmentMode === 'manual' || (assignmentMode === 'hybrid' && assignmentOverrides.includes(slot));
   useEffect(() => { if (library === 'pair') setRounds(4); else if (library === 'review') setRounds(2); else if (library === 'debate') setRounds(preset?.rounds ?? 3); }, [library]);
   const needsProject = isPair || isReview || (protocol === 'custom' && Object.values(templateDraft?.roles ?? {}).some((r) => r.access && r.access !== 'read'));
   useEffect(() => {
@@ -630,8 +718,10 @@ export function NewRun({ draft }: { draft?: Partial<StartRun>; }) {
     if (isReview && kind !== 'uncommitted' && !value.trim()) return toast('Fill in the branch, commit or plan file');
     if (isPair && isolation === 'worktree' && ws && !ws.head) return toast('A worktree needs a git repository with at least one commit; choose “In place”');
     if ((protocol === 'debate' || library === 'debate') && minRounds > rounds) return toast('Minimum rounds cannot exceed the maximum');
+    if (assignmentMode !== 'manual' && (suggested?.error || suggested?.seats.length !== seats.length)) return toast(suggested?.error ?? 'Wait for agent assignment');
     void startRun({
       protocol,
+      assignment: { mode: assignmentMode, preference: assignmentPreference, overrides: assignmentOverrides },
       ...(protocol === 'custom' ? { template } : {}),
       seats: isPair ? pairSeats : seats,
       chair: isPair || (protocol === 'custom' && !library) ? undefined : chair,
@@ -670,17 +760,28 @@ export function NewRun({ draft }: { draft?: Partial<StartRun>; }) {
               {Object.entries(s.presets).map(([k, pr]) => <option value={k}>{k} — {pr.seats.map(shortSpec).join(' vs ')}</option>)}
             </select>
           </div>
+          <div class="row wrap" style={{ gap: '10px', marginBottom: '10px' }}>
+            <label class="field">Assignment mode <select aria-label="Assignment mode" value={assignmentMode} onChange={(e) => setAssignmentMode((e.currentTarget as HTMLSelectElement).value as AssignmentRequest['mode'])}>
+              <option value="manual">Manual</option><option value="automatic">Automatic</option><option value="hybrid">Hybrid (overrides)</option>
+            </select></label>
+            {assignmentMode !== 'manual' && <label class="field">Preference <select aria-label="Assignment preference" value={assignmentPreference} onChange={(e) => setAssignmentPreference((e.currentTarget as HTMLSelectElement).value as AssignmentRequest['preference'])}>
+              <option value="local-first">Local First</option><option value="best-fit">Best Fit</option><option value="cloud-first">Cloud First</option>
+            </select></label>}
+          </div>
+          {assignmentMode !== 'manual' && <p class="muted small" role="status">{suggested?.error ?? (suggested?.reasons.join(' · ') || 'Checking eligible agents…')} — Qwen profiles need a successful tool-use test in Settings. Best Fit uses fixed eligibility rules, not quality scores.</p>}
           {isPair ? (
             <div class="pair-seats">
               <div class="seat-row">
                 <span class="seat-role">Writer</span>
-                <SeatPicker spec={pairSeats[0]} onChange={(v) => setSeats([v, pairSeats[1]])} />
+                {editable(0) ? <SeatPicker spec={pairSeats[0]} onChange={(v) => setSeats([v, pairSeats[1]])} /> : <span class="mono small">{renderedSeats[0] ?? 'Selecting…'}</span>}
+                {assignmentMode === 'hybrid' && <button class="btn small" type="button" aria-pressed={editable(0)} onClick={() => override(0)}>{editable(0) ? 'Use auto' : 'Override'}</button>}
                 <span class="muted small">implements the task and fixes findings</span>
               </div>
-              <button type="button" class="icon-btn swap" title="Swap writer and reviewer" onClick={() => setSeats([pairSeats[1], pairSeats[0]])}><Icon name="refresh" size={14} /></button>
+              {assignmentMode === 'manual' && <button type="button" class="icon-btn swap" title="Swap writer and reviewer" onClick={() => setSeats([pairSeats[1], pairSeats[0]])}><Icon name="refresh" size={14} /></button>}
               <div class="seat-row">
                 <span class="seat-role">Reviewer</span>
-                <SeatPicker spec={pairSeats[1]} seat onChange={(v) => setSeats([pairSeats[0], v])} />
+                {editable(1) ? <SeatPicker spec={pairSeats[1]} seat onChange={(v) => setSeats([pairSeats[0], v])} /> : <span class="mono small">{renderedSeats[1] ?? 'Selecting…'}</span>}
+                {assignmentMode === 'hybrid' && <button class="btn small" type="button" aria-pressed={editable(1)} onClick={() => override(1)}>{editable(1) ? 'Use auto' : 'Override'}</button>}
                 <span class="muted small">verifies the diff and files findings (read-only)</span>
               </div>
             </div>
@@ -689,14 +790,16 @@ export function NewRun({ draft }: { draft?: Partial<StartRun>; }) {
               {seats.map((spec, i) => (
                 <div class="seat-row">
                   <span class="seat-id">{seatId(i)}</span>
-                  <SeatPicker spec={spec} seat onChange={(v) => setSeats(seats.map((x, j) => (j === i ? v : x)))} />
-                  <span class="mono muted small seat-spec">{spec}</span>
+                  {editable(i) ? <SeatPicker spec={spec} seat onChange={(v) => setSeats(seats.map((x, j) => (j === i ? v : x)))} /> : <span class="mono small">{renderedSeats[i] ?? 'Selecting…'}</span>}
+                  {assignmentMode === 'hybrid' && <button class="btn small" type="button" aria-pressed={editable(i)} onClick={() => override(i)}>{editable(i) ? 'Use auto' : 'Override'}</button>}
+                  {editable(i) && <span class="mono muted small seat-spec">{spec}</span>}
                   <button type="button" class="icon-btn" disabled={seats.length <= min} title="Remove seat" onClick={() => setSeats(seats.filter((_, j) => j !== i))}><Icon name="trash" size={14} /></button>
                 </div>
               ))}
               <div class="row">
                 <button type="button" class="btn small" onClick={() => setSeats([...seats, s.gui.claude.spec])}><EngineMark engine="claude" size={14} /> Add Claude</button>
                 <button type="button" class="btn small" onClick={() => setSeats([...seats, s.gui.codex.spec])}><EngineMark engine="codex" size={14} /> Add Codex</button>
+                <button type="button" class="btn small" onClick={() => setSeats([...seats, s.gui.qwen.spec])}><EngineMark engine="qwen" size={14} /> Add Qwen</button>
               </div>
               {protocol !== 'custom' || library ? <div class="seat-row chair-row">
                 <Toggle checked={!!chair} onChange={(v) => setChair(v ? chair ?? s.gui.claude.spec : undefined)} label="A chair writes the final synthesis" />
@@ -760,7 +863,7 @@ export function NewRun({ draft }: { draft?: Partial<StartRun>; }) {
         {warnings.map((w) => <div class="callout warn"><Icon name="alert" size={15} /><span>{w}</span></div>)}
 
         <div class="form-actions">
-          <span class="muted small">{seats.map((x) => parseSpec(x).model || parseSpec(x).engine).join(isPair ? ' writes · ' : ' vs ')}{isPair ? ' reviews' : ''}</span>
+          <span class="muted small">{(renderedSeats.length ? renderedSeats : seats).map((x) => parseSpec(x).model || parseSpec(x).engine).join(isPair ? ' writes · ' : ' vs ')}{isPair ? ' reviews' : ''}</span>
           <div class="spacer" />
           <span class="muted small"><Kbd>{MOD}</Kbd>+<Kbd>Enter</Kbd></span>
           <button type="button" class="btn primary big" disabled={protocol === 'custom' && !template} onClick={submit}><Icon name="play" size={14} /> Start {mode.label.toLowerCase()}</button>

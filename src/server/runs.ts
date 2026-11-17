@@ -2,6 +2,8 @@
 import { existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import type { Config } from '../config.ts';
+import { assignModels, type AssignmentRequest } from '../assignment.ts';
+import { resolveClaudeBin, resolveCodexBin, resolveQwenBin } from '../config.ts';
 import { SCRATCH_DIR } from '../paths.ts';
 import { ask } from '../protocols/ask.ts';
 import { RunContext, type RunOptions } from '../protocols/common.ts';
@@ -38,6 +40,7 @@ export interface StartRun {
   title?: string;
   review?: ReviewTarget & { focus?: string; };
   pair?: Partial<PairSettings>;
+  assignment?: AssignmentRequest;
 }
 
 function summary(m: RunMeta, running: boolean) {
@@ -64,12 +67,30 @@ export class RunManager {
   private readonly seen = new Set<string>();
   private readonly bus: Bus;
   private readonly cfg: Config;
+  private readonly verifiedQwen = new Map<string, string>();
 
   constructor(bus: Bus, cfg: Config) {
     this.bus = bus;
     this.cfg = cfg;
     // Runs this app was running when it was killed still say "running" on disk.
     markInterrupted((id) => this.active.has(id));
+  }
+
+  verifyQwenProfile(id: string, profile: Config['qwenProfiles'][string]): void {
+    this.verifiedQwen.set(id, JSON.stringify(profile));
+  }
+
+  suggest(req: Pick<StartRun, 'seats' | 'assignment' | 'protocol'>): { seats: string[]; reasons: string[]; } {
+    if (!Array.isArray(req.seats) || req.seats.length < 1 || req.seats.length > 32) throw new Error('choose 1–32 model seats');
+    const assignment = req.assignment ?? { mode: 'manual', preference: 'best-fit' };
+    if (assignment.mode === 'manual') return assignModels({ requested: req.seats, assignment, defaults: { codex: this.cfg.gui.codex.spec, claude: this.cfg.gui.claude.spec, qwen: this.cfg.gui.qwen.spec }, profiles: {}, verified: new Set(), availability: { codex: true, claude: true, qwen: true }, pair: req.protocol === 'pair' });
+    const isAvailable = (resolveBin: () => unknown) => { try { resolveBin(); return true; } catch { return false; } };
+    const verified = new Set(Object.entries(this.cfg.qwenProfiles).filter(([id, p]) => this.verifiedQwen.get(id) === JSON.stringify(p)).map(([id]) => id));
+    return assignModels({ requested: req.seats, assignment,
+      defaults: { codex: this.cfg.gui.codex.spec, claude: this.cfg.gui.claude.spec, qwen: this.cfg.gui.qwen.spec },
+      profiles: this.cfg.qwenProfiles, verified,
+      availability: { codex: isAvailable(() => resolveCodexBin(this.cfg)), claude: isAvailable(() => resolveClaudeBin(this.cfg)), qwen: process.platform === 'linux' && existsSync('/usr/bin/bwrap') && isAvailable(() => resolveQwenBin(this.cfg)) },
+      pair: req.protocol === 'pair' });
   }
 
   private sink: RunOptions['sink'] = (e) => {
@@ -110,6 +131,7 @@ export class RunManager {
       council: json('council.json'),
       pair: json('pair.json'),
       coordination: json('coordination.json'),
+      control: json('control.json'),
       template: json('template.json'),
       draftTemplate: json('draft-template.json'),
       dir: store.dir,
@@ -148,6 +170,7 @@ export class RunManager {
     const template = req.protocol === 'custom' ? (typeof req.template === 'string' ? getTemplate(req.template) : validateTemplate(req.template)) : undefined;
     const mode = template?.library ?? req.protocol;
     if (!Array.isArray(req.seats) || req.seats.length > 32) throw new Error('choose up to 32 model seats');
+    const selected = this.suggest(req);
     const workspace = !req.noProject;
     if (!workspace && (mode === 'review' || mode === 'pair' || Object.values(template?.roles ?? {}).some((r) => r.access && r.access !== 'read'))) throw new Error(`${req.protocol} works on a project folder`);
     let cwd: string;
@@ -158,8 +181,8 @@ export class RunManager {
       cwd = join(SCRATCH_DIR, new Date().toISOString().replace(/[:.]/g, '-'));
       mkdirSync(cwd, { recursive: true });
     }
-    const ids = seatIds(req.seats.length);
-    const seats: Seat[] = req.seats.map((s, i) => parseSeat(s, ids[i], this.cfg.defaults));
+    const ids = seatIds(selected.seats.length);
+    const seats: Seat[] = selected.seats.map((s, i) => parseSeat(s, ids[i], this.cfg.defaults));
     const min = mode === 'review' || mode === 'ask' || mode === 'custom' ? template?.limits.minSeats ?? 1 : 2;
     if (seats.length < min) throw new Error(`${req.protocol} needs at least ${min} seat(s)`);
     if (mode === 'pair' && seats.length !== 2) throw new Error('pair takes exactly two seats: the writer and the reviewer');
@@ -184,7 +207,7 @@ export class RunManager {
       minRounds: req.minRounds ?? 1,
       anon: !!req.anon,
       quiet: true,
-      extra: { gui: true, ...(template ? { template } : {}), ...(req.review ? { target: req.review, focus: req.review.focus } : {}), ...(pairSettings ? { pair: pairSettings } : {}) },
+      extra: { gui: true, assignment: { ...(req.assignment ?? { mode: 'manual', preference: 'best-fit' }), reasons: selected.reasons }, ...(template ? { template } : {}), ...(req.review ? { target: req.review, focus: req.review.focus } : {}), ...(pairSettings ? { pair: pairSettings } : {}) },
       workspace,
       sink: this.sink,
     };
@@ -252,6 +275,32 @@ export class RunManager {
     if (!ctx) return false;
     ctx.cancel();
     return true;
+  }
+
+  pause(id: string): { requested: boolean } {
+    const ctx = this.active.get(id);
+    if (!ctx) throw new Error('run is not active');
+    return { requested: ctx.pause() };
+  }
+
+  resume(id: string): { resumed: boolean } {
+    const ctx = this.active.get(id);
+    if (!ctx) throw new Error('run is not active; restart using Continue if supported');
+    return { resumed: ctx.resume() };
+  }
+
+  instruct(id: string, target: string, text: string): { queued: boolean } {
+    const ctx = this.active.get(id);
+    if (!ctx) throw new Error('run is not active; restart using Continue if supported');
+    ctx.instruct(target, text);
+    return { queued: true };
+  }
+
+  override(id: string, target: string, spec: string): { queued: boolean } {
+    const ctx = this.active.get(id);
+    if (!ctx) throw new Error('run is not active; future assignments cannot be changed');
+    ctx.override(target, spec);
+    return { queued: true };
   }
 
   remove(id: string): void {

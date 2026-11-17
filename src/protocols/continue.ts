@@ -68,7 +68,7 @@ export async function continueRun(cfg: Config, ref: string, note: string, o: Con
   try {
     for (const seat of seats) {
       const rec = participants.find((r) => r.id === seat.id)!;
-      if (!rec.codexThreadId && !rec.claudeSessionId) throw new Error(`seat ${seat.id} has no recorded thread/session to resume`);
+      if (!rec.codexThreadId && !rec.claudeSessionId && !rec.qwenSessionId) throw new Error(`seat ${seat.id} has no recorded thread/session to resume`);
       sessions.push(await ctx.engines.openSeat(seat, 'participant', {
         schema: nativeSchema(ctx, 'participant', pm.protocol === 'debate' ? DEBATE_SCHEMA : undefined),
         system: systemRules(seat, { protocol: pm.protocol, cwd: pm.cwd, seats, anon, structured: pm.protocol === 'debate', workspace: pm.options.workspace !== false }),

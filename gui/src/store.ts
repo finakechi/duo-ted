@@ -274,13 +274,15 @@ export async function refreshQuota(): Promise<void> {
   if (q && app.value) app.value = { ...app.value, quota: q };
 }
 
-export async function saveSettings(patch: Record<string, unknown>): Promise<void> {
+export async function saveSettings(patch: Record<string, unknown>): Promise<boolean> {
   const s = await guard(api<AppState>('/api/config', { method: 'PUT', body: patch }));
   if (s) {
     app.value = s;
     applyTheme(s.gui.theme);
     toast('Settings saved', 'success');
+    return true;
   }
+  return false;
 }
 
 export async function loadDoctor(live = false): Promise<void> {

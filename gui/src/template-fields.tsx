@@ -60,7 +60,7 @@ export function SelectorEditor({ value, onChange, template, seats }: { value: Se
     {value.ids && <Checks label="Seats" value={value.ids} options={ids.map((id) => ({ value: id, label: `${id}${seats.find((_, i) => seatId(i) === id) ? ` · ${shortSpec(seats[ids.indexOf(id)])}` : ' · not added yet'}` }))} onChange={(v) => update({ ids: v })} />}
     <details class="template-details"><summary>Eligibility filters & ranking</summary><div class="template-stack">
       <div class="template-grid">
-        <Pick label="Provider" value={value.engine} empty="Any provider" options={['codex', 'claude']} onChange={(v) => update({ engine: (v || undefined) as Selector['engine'] })} />
+        <Pick label="Provider" value={value.engine} empty="Any provider" options={['codex', 'claude', 'qwen']} onChange={(v) => update({ engine: (v || undefined) as Selector['engine'] })} />
         <Pick label="Currently in role" value={value.fromRole} empty="Any role" options={Object.keys(template.roles)} onChange={(v) => update({ fromRole: v || undefined })} />
       </div>
       <Field label="Exact model name" hint="Leave blank to allow any model."><input value={value.model ?? ''} placeholder="e.g. gpt-6-sol" onInput={(e) => update({ model: e.currentTarget.value || undefined })} /></Field>

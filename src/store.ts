@@ -38,7 +38,7 @@ export interface ToolCall {
 export interface SeatRecord {
   id: string;
   spec: string;
-  engine: 'codex' | 'claude';
+  engine: 'codex' | 'claude' | 'qwen';
   model: string;
   effort?: string;
   name?: string;
@@ -47,6 +47,7 @@ export interface SeatRecord {
   clawSession: string;
   codexThreadId?: string;
   claudeSessionId?: string;
+  qwenSessionId?: string;
   /** Running totals the CLIs report cumulatively; kept so a continued run can report per-turn deltas. */
   codexUsageTotals?: Usage;
   claudeCostTotal?: number;
