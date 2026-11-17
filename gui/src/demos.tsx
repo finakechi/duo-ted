@@ -1,8 +1,10 @@
 /**
  * Animated "how it works" scenes, one per mode. A small step clock drives every element of a scene
  * together (CSS transitions do the motion), so a scene always resets cleanly. Scenes pause when
- * they are off screen and stay on their final frame when the user prefers reduced motion.
+ * they are off screen or the window is in the background, and stay on their final frame when the
+ * user prefers reduced motion.
  */
+import { signal } from '@preact/signals';
 import type { ComponentChildren } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { EngineMark, Icon } from './ui.tsx';
@@ -81,11 +83,24 @@ export const MODES: Record<ModeId, ModeInfo> = {
 
 export const MODE_ORDER: ModeId[] = ['chat', 'split', 'pair', 'debate', 'review', 'council', 'ask'];
 
+/**
+ * Whether someone is looking: the window is shown and focused. On Linux a window that is behind
+ * others, or on another monitor, still counts as visible, so focus is what tells.
+ */
+const windowActive = signal(true);
+if (typeof document !== 'undefined') {
+  const update = () => (windowActive.value = document.visibilityState === 'visible' && document.hasFocus());
+  update();
+  window.addEventListener('focus', update);
+  window.addEventListener('blur', update);
+  document.addEventListener('visibilitychange', update);
+}
+
 function reducedMotion(): boolean {
   return typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
 }
 
-/** Step clock: advances through `durations` (ms per step) and loops; pauses off screen. */
+/** Step clock: advances through `durations` (ms per step) and loops; pauses off screen and in the background. */
 function useSteps(durations: number[], ref: { current: HTMLElement | null }, playing = true): number {
   const last = durations.length - 1;
   const [step, setStep] = useState(() => (reducedMotion() ? last : 0));
@@ -97,11 +112,12 @@ function useSteps(durations: number[], ref: { current: HTMLElement | null }, pla
     io.observe(el);
     return () => io.disconnect();
   }, []);
+  const active = windowActive.value;
   useEffect(() => {
-    if (!playing || !visible || reducedMotion()) return;
+    if (!playing || !visible || !active || reducedMotion()) return;
     const t = setTimeout(() => setStep((s) => (s >= last ? 0 : s + 1)), durations[step]);
     return () => clearTimeout(t);
-  }, [step, playing, visible]);
+  }, [step, playing, visible, active]);
   return step;
 }
 
