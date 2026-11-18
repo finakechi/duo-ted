@@ -24,8 +24,8 @@ export function assignModels(o: AssignmentOptions): { seats: string[]; reasons: 
   const { mode, preference } = o.assignment;
   if (!['manual', 'automatic', 'hybrid'].includes(mode) || !['local-first', 'best-fit', 'cloud-first'].includes(preference)) throw new Error('invalid assignment mode or preference');
   if (mode === 'manual') return { seats: [...o.requested], reasons: ['Manual: all agent assignments are yours'] };
-  const local = Object.entries(o.profiles).filter(([id, p]) => p.kind === 'local' && o.verified.has(id)).sort(([a], [b]) => a.localeCompare(b));
-  const hosted = Object.entries(o.profiles).filter(([id, p]) => p.kind === 'hosted' && o.verified.has(id)).sort(([a], [b]) => a.localeCompare(b));
+  const local = Object.entries(o.profiles).filter(([id, p]) => p.enabled !== false && p.kind === 'local' && o.verified.has(id)).sort(([a], [b]) => a.localeCompare(b));
+  const hosted = Object.entries(o.profiles).filter(([id, p]) => p.enabled !== false && p.kind === 'hosted' && o.verified.has(id)).sort(([a], [b]) => a.localeCompare(b));
   const profileSpecs = (entries: [string, QwenProfile][]) => entries.map(([id, p]) => ({ spec: `qwen:${p.model}+profile=${id}`, engine: 'qwen', why: `${p.kind} Qwen profile ${id}: tool-use test passed` }));
   const cloud = [
     ...(o.availability.codex ? [{ spec: o.defaults.codex, engine: 'codex', why: 'Codex CLI available' }] : []),

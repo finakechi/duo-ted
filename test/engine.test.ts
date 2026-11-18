@@ -66,6 +66,51 @@ test('ask: both CLIs answer; the Codex prompt goes through stdin with the seat f
   assert.ok((codexTurn.codexCredits ?? 0) > 0, 'priced from the rate card');
 });
 
+test('DeepSeek Codex seat answers alongside Claude with isolated provider config and no plan credits', async () => {
+  rmSync(LOG, { force: true });
+  const configuration = structuredClone(cfg);
+  configuration.deepseek.enabled = true;
+  process.env.DEEPSEEK_API_KEY = 'sensitive-test-key-do-not-log';
+  try {
+    const seats = ['codex:deepseek-flash@high+provider=deepseek', 'claude:sonnet@low'].map((spec, i) => parseSeat(spec, String.fromCharCode(65 + i), D));
+    const ctx = RunContext.create(configuration, { protocol: 'ask', title: 'DeepSeek test', brief: 'Review a change', cwd: tmp, seats, rounds: 1, minRounds: 1, anon: false, quiet: true, extra: {} });
+    await ask(ctx);
+    assert.equal(ctx.store.meta.status, 'completed');
+    const deepseek = ctx.store.meta.turns.find((t) => t.seat === 'A')!;
+    assert.equal(deepseek.codexCredits, undefined);
+    assert.match(deepseek.unpriced || '', /DeepSeek/);
+    const codex = calls().find((c) => c.cli === 'codex')!;
+    assert.match(codex.args.join(' '), /model_provider="duo_deepseek"/);
+    assert.match(codex.args.join(' '), /wire_api="responses"/);
+    assert.ok(codex.args.includes('--ignore-rules'));
+    assert.doesNotMatch(readFileSync(LOG, 'utf8'), /sensitive-test-key-do-not-log/);
+    assert.doesNotMatch(readFileSync(join(ctx.store.dir, 'run.json'), 'utf8'), /sensitive-test-key-do-not-log/);
+    assert.equal(ctx.store.meta.seats.find((s) => s.id === 'A')?.engine, 'codex');
+    assert.ok(ctx.store.meta.turns.some((t) => t.seat === 'B' && !t.error));
+  } finally { delete process.env.DEEPSEEK_API_KEY; }
+});
+
+test('DeepSeek writer and Claude reviewer preserve Pair git isolation', async () => {
+  const repo = join(tmp, 'deepseek-pair');
+  execFileSync('git', ['init', '-q', repo]);
+  writeFileSync(join(repo, 'README.md'), '# before\n');
+  execFileSync('git', ['-C', repo, 'add', '-A']);
+  execFileSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'init']);
+  const configuration = structuredClone(cfg);
+  configuration.deepseek.enabled = true;
+  process.env.DEEPSEEK_API_KEY = 'fake-key';
+  try {
+    const seats = ['codex:deepseek-flash@high+provider=deepseek', 'claude:sonnet@low'].map((spec, i) => parseSeat(spec, String.fromCharCode(65 + i), D));
+    const ctx = RunContext.create(configuration, { protocol: 'pair', title: 'DeepSeek Pair test', brief: 'Create a test change', cwd: repo, seats, rounds: 1, minRounds: 1, anon: false, quiet: true, extra: {} });
+    await pair(ctx, { isolation: 'worktree', writerAccess: 'sandboxed' });
+    const workspace = ctx.store.meta.workspace!;
+    assert.ok(existsSync(join(workspace.cwd, 'duo-fake.txt')));
+    assert.ok(!existsSync(join(repo, 'duo-fake.txt')));
+    assert.ok(ctx.store.meta.turns.some((t) => t.seat === 'B'));
+    assert.equal(finishWorkspace(workspace, 'discard', 'test').ok, true);
+  } finally { delete process.env.DEEPSEEK_API_KEY; }
+});
+
 test('ask: a Qwen seat participates and emits recorded tool events and a resumable session', { skip: process.platform !== 'linux' || !existsSync('/usr/bin/bwrap') }, async () => {
   const ctx = ctxFor('ask', ['qwen:qwen3-coder-plus', 'codex:gpt-6-sol@low']);
   await ask(ctx);
@@ -137,6 +182,7 @@ test('overrides reject unknown seats and unconfigured Qwen profiles', async () =
   const ctx = ctxFor('ask', ['claude:sonnet@low']);
   assert.throws(() => ctx.override('Z', 'qwen:qwen3-coder-plus'), /unknown or non-overridable/);
   assert.throws(() => ctx.override('A', 'qwen:qwen3-coder-plus+profile=missing'), /unknown Qwen profile/);
+  assert.throws(() => ctx.override('A', 'codex:deepseek-flash+provider=deepseek'), /DeepSeek is disabled/);
   ctx.cancel();
   await ctx.fail(new Error('cancelled'), []);
 });

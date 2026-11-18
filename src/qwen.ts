@@ -43,7 +43,9 @@ function sandboxPolicy(o: QwenTurn): string {
 
 function profileEnvironment(profile?: QwenProfile): Record<string, string> {
   if (!profile) return {};
-  const key = profile.keyEnv ? process.env[profile.keyEnv] : process.env.OPENAI_API_KEY;
+  // Never forward a user's unrelated OpenAI credential to a local server by accident.
+  const key = profile.keyEnv ? process.env[profile.keyEnv] : profile.kind === 'hosted' ? process.env.OPENAI_API_KEY : undefined;
+  if (profile.keyEnv && !key) throw new Error(`Qwen profile ${profile.name}: set ${profile.keyEnv} in the environment`);
   if (!key && profile.kind !== 'local') throw new Error(`Qwen profile ${profile.name}: set ${profile.keyEnv ?? 'OPENAI_API_KEY'} in the environment`);
   return {
     OPENAI_BASE_URL: profile.baseUrl,
@@ -132,7 +134,7 @@ export async function executeQwen(o: QwenTurn): Promise<QwenResult> {
 export async function probeQwenProfile(profile: QwenProfile, bin?: BinSpec): Promise<{
   reachable: boolean; modelListed?: boolean; toolUse: 'verified' | 'failed' | 'unverified'; detail: string;
 }> {
-  const key = profile.keyEnv ? process.env[profile.keyEnv] : process.env.OPENAI_API_KEY;
+  const key = profile.keyEnv ? process.env[profile.keyEnv] : profile.kind === 'hosted' ? process.env.OPENAI_API_KEY : undefined;
   if (!key && profile.kind === 'hosted') return { reachable: false, toolUse: 'unverified', detail: `Set ${profile.keyEnv ?? 'OPENAI_API_KEY'} first` };
   let modelListed: boolean | undefined;
   try {

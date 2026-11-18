@@ -60,7 +60,9 @@ export function SelectorEditor({ value, onChange, template, seats }: { value: Se
     {value.ids && <Checks label="Seats" value={value.ids} options={ids.map((id) => ({ value: id, label: `${id}${seats.find((_, i) => seatId(i) === id) ? ` · ${shortSpec(seats[ids.indexOf(id)])}` : ' · not added yet'}` }))} onChange={(v) => update({ ids: v })} />}
     <details class="template-details"><summary>Eligibility filters & ranking</summary><div class="template-stack">
       <div class="template-grid">
-        <Pick label="Provider" value={value.engine} empty="Any provider" options={['codex', 'claude', 'qwen']} onChange={(v) => update({ engine: (v || undefined) as Selector['engine'] })} />
+        <Pick label="Coding engine" value={value.engine} empty="Any engine" options={['codex', 'claude', 'qwen']} onChange={(v) => update({ engine: (v || undefined) as Selector['engine'] })} />
+        <Pick label="Model provider" value={value.provider} empty="Any provider" options={['openai', 'anthropic', 'qwen', 'deepseek', 'local', 'hosted']} onChange={(v) => update({ provider: (v || undefined) as Selector['provider'] })} />
+        <Pick label="Execution" value={value.locality} empty="Local or cloud" options={['local', 'cloud']} onChange={(v) => update({ locality: (v || undefined) as Selector['locality'] })} />
         <Pick label="Currently in role" value={value.fromRole} empty="Any role" options={Object.keys(template.roles)} onChange={(v) => update({ fromRole: v || undefined })} />
       </div>
       <Field label="Exact model name" hint="Leave blank to allow any model."><input value={value.model ?? ''} placeholder="e.g. gpt-6-sol" onInput={(e) => update({ model: e.currentTarget.value || undefined })} /></Field>
@@ -75,7 +77,7 @@ export function SelectorEditor({ value, onChange, template, seats }: { value: Se
 }
 
 export function statePaths(t: CoordinationTemplate, perModel = false): string[] {
-  const result = ['vars.error', ...(t.library ? ['vars.done'] : []), ...(t.library === 'debate' ? ['vars.reviewComplete', 'vars.reviewAddressed', 'vars.ledger.claims', 'vars.ledger.resolution.agreed', 'vars.ledger.resolution.disputed', 'vars.ledger.resolution.unaddressed'] : []), ...(perModel ? ['model.id', 'model.engine', 'model.model', 'model.reply'] : [])];
+  const result = ['vars.error', ...(t.library ? ['vars.done'] : []), ...(t.library === 'debate' ? ['vars.reviewComplete', 'vars.reviewAddressed', 'vars.ledger.claims', 'vars.ledger.resolution.agreed', 'vars.ledger.resolution.disputed', 'vars.ledger.resolution.unaddressed'] : []), ...(perModel ? ['model.id', 'model.engine', 'model.provider', 'model.locality', 'model.model', 'model.reply'] : [])];
   for (const [id, step] of Object.entries(t.steps)) {
     result.push(`visits.${id}`);
     if (step.type !== 'turn' && (step.type !== 'operation' || step.use.endsWith('.finish'))) continue;
@@ -126,7 +128,7 @@ function pathLabel(path: string): string {
   if (parts[0] === 'memory') return `${title(parts[1])} · Stored memory`;
   if (path === 'vars.done') return 'Built-in stage · Finished';
   if (path === 'vars.error') return 'Run · Last error';
-  if (parts[0] === 'model') return `Current model · ${path === 'model.id' ? 'Seat' : path === 'model.engine' ? 'Provider' : path === 'model.model' ? 'Model name' : path === 'model.reply' ? 'Latest response' : title(parts.slice(2).join('.'))}`;
+  if (parts[0] === 'model') return `Current model · ${path === 'model.id' ? 'Seat' : path === 'model.engine' ? 'Coding engine' : path === 'model.provider' ? 'Model provider' : path === 'model.locality' ? 'Local or cloud' : path === 'model.model' ? 'Model name' : path === 'model.reply' ? 'Latest response' : title(parts.slice(2).join('.'))}`;
   return parts[0] === 'data' ? `Item · ${title(parts.slice(1).join('.'))}` : title(path);
 }
 function PathField({ label, value, onChange, paths }: { label: string; value: string; onChange: (v: string) => void; paths: string[]; }) {

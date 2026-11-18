@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Optional DeepSeek Flash/Pro support through a per-seat Codex Responses API route (no changes to global Codex settings), with model discovery, an explicit enable switch, no automatic paid web search, and unpriced third-party usage rather than fabricated plan credits.
+- Optional local OpenAI-compatible model profiles in Settings, with endpoint/model entry, model discovery, profile toggles, declared capability warnings and existing Qwen Code tool-use verification. Old configured Qwen local profiles are preserved.
+- Coding engine and model provider are distinguished in model pickers and coordination-template selectors; provider/locality filters can be authored in the visual template builder and executed by the shared workflow runtime.
+- Disabled optional providers require no installation or connectivity and appear as informational setup states. Expanded fake-provider and pinned-Codex configuration tests; live provider behavior still requires user credentials and a compatible local host.
+
 - The app engine no longer waits on the Codex model catalog, CLI version checks or git: a cached catalog is shown at once and refreshed in the background (the window updates when it arrives), and the Changes panel, workspace checks and pair diffs run git without blocking chats and runs, with timeouts and size limits. Concurrent refreshes share one subprocess.
 - Stopping a CLI call (timeout, cancel or shutdown) ends everything it started, and a call settles even when a leftover process holds its output. Quota refreshes and live sign-in checks stop with the engine; a Claude Code update is left to finish.
 - Permission-bridge files left behind by a crash, with their expired token, are removed when Duo starts.

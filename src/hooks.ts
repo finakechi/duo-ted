@@ -29,6 +29,8 @@ export interface CodexRoute {
   ignoreRules: boolean;
   onLine?: LineSink;
   onSpawn?: (p: ChildProcess) => void;
+  /** Remove vendor credentials from a third-party provider child, without altering parent env. */
+  unsetEnv?: string[];
 }
 
 const codexRoutes = new Map<string, CodexRoute>();
@@ -141,10 +143,12 @@ function install(): void {
       const { args: rewritten, stdin } = rewriteCodexArgs(args, codex);
       const stdio = Array.isArray(options.stdio) ? [...options.stdio] : ['pipe', 'pipe', 'pipe'];
       if (stdin !== undefined) stdio[0] = 'pipe';
+      const env = { ...(options.env ?? process.env), ...codex.bin.env };
+      for (const name of codex.unsetEnv ?? []) delete env[name];
       const p = realSpawn(codex.bin.command, [...codex.bin.args, ...rewritten], {
         ...options,
         stdio: stdio as SpawnOptions['stdio'],
-        env: { ...(options.env ?? process.env), ...codex.bin.env },
+        env,
         windowsHide: true,
       });
       if (stdin !== undefined && p.stdin) {

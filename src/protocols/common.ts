@@ -9,6 +9,7 @@ import { PROJECT_ROOT } from '../paths.ts';
 import { formatDelta, formatWindows, snapshot } from '../quota.ts';
 import { fmtTurnLine } from '../render.ts';
 import { formatSeat, parseSeat, seatLabel, type Seat } from '../seats.ts';
+import { validateProviderSeat } from '../providers.ts';
 import { RunStore, type QuotaSnapshot, type RunMeta, type TurnRecord } from '../store.ts';
 
 export type RunEvent =
@@ -112,6 +113,7 @@ export class RunContext {
   }
 
   static create(cfg: Config, opts: RunOptions, continuedFrom?: RunStore): RunContext {
+    for (const seat of [...opts.seats, ...(opts.chair ? [opts.chair] : [])]) validateProviderSeat(cfg, seat);
     const hasQwen = [...opts.seats, ...(opts.chair ? [opts.chair] : [])].some((seat) => seat.engine === 'qwen');
     const optionalQwen = (() => { try { return resolveQwenBin(cfg); } catch (e) { if (hasQwen) throw e; return undefined; } })();
     const bins = { codex: resolveCodexBin(cfg), claude: resolveClaudeBin(cfg), ...(optionalQwen ? { qwen: optionalQwen } : {}) };
@@ -213,6 +215,7 @@ export class RunContext {
       resolveQwenBin(this.cfg);
       if (next.profile && (!this.cfg.qwenProfiles[next.profile] || this.cfg.qwenProfiles[next.profile].model !== next.model)) throw new Error('unknown Qwen profile or mismatched model');
     }
+    validateProviderSeat(this.cfg, next);
     if (next.engine === 'claude') resolveClaudeBin(this.cfg);
     if (next.engine === 'codex') resolveCodexBin(this.cfg);
     // A newer override supersedes an earlier *pending* one; completed decisions remain.

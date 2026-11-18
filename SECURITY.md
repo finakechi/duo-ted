@@ -13,6 +13,7 @@ Duo can make AI agents edit files and run commands on your computer, so its loca
 - A pair-mode writer works in a separate git worktree by default and is sandboxed unless you choose full access. Nothing reaches your folder until you apply it.
 - `duo-safe`, the entry point the Codex allow-rule permits, refuses raw Codex config, WebFetch, pair mode, setup and the GUI.
 - Seats run with `DUO_DEPTH` set, and Duo refuses to start under it, so a model cannot start Duo again.
+- DeepSeek sessions use an isolated Codex provider override and read the key from a named environment variable. They do not modify `~/.codex/config.toml`, inherit unrelated OpenAI keys, or enable paid DeepSeek search. Local Qwen endpoints never receive the user's unrelated `OPENAI_API_KEY` by default; configured key variables remain in the child process environment rather than in run exports.
 
 Chats run with the permissions you choose for them. *Full access* (Claude `bypassPermissions`, Codex `danger-full-access`) means exactly that.
 

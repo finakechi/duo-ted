@@ -38,9 +38,11 @@ export function templateErrors(value: unknown): string[] {
   const target = (v: unknown, at: string) => { if (typeof v !== 'string' || !Object.hasOwn(steps, v)) err(`${at}: unknown step ${typeof v === 'string' ? v : '(invalid reference)'}`); };
   const select = (v: unknown, at: string) => {
     if (!object(v)) return err(`${at}: selector must be an object`);
-    allowed(v, ['ids', 'engine', 'model', 'fromRole', 'count', 'rankBy'], at);
+    allowed(v, ['ids', 'engine', 'provider', 'locality', 'model', 'fromRole', 'count', 'rankBy'], at);
     if (v.ids !== undefined && (!Array.isArray(v.ids) || !v.ids.length || v.ids.some((s: unknown) => typeof s !== 'string' || !/^[A-Z]+$/.test(s)))) err(`${at}: ids must be seat ids such as A, B, C`);
     if (v.engine !== undefined && !['codex', 'claude', 'qwen'].includes(v.engine)) err(`${at}: unknown engine`);
+    if (v.provider !== undefined && !['openai', 'anthropic', 'qwen', 'deepseek', 'local', 'hosted'].includes(v.provider)) err(`${at}: unknown model provider`);
+    if (v.locality !== undefined && !['local', 'cloud'].includes(v.locality)) err(`${at}: locality must be local or cloud`);
     if (v.model !== undefined && typeof v.model !== 'string') err(`${at}: model must be text`);
     if (v.fromRole !== undefined) role(v.fromRole, at);
     if (v.rankBy !== undefined) {

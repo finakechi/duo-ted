@@ -15,7 +15,8 @@ import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'no
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { extname, join } from 'node:path';
 import { binVersionAsync, runBinAsync } from '../bins.ts';
-import { CLAUDE_MODELS, codexCatalogAsync, loadConfig, resolveClaudeBin, resolveCodexBin, resolveQwenBin, saveConfig, validateQwenProfiles, type CodexModel } from '../config.ts';
+import { CLAUDE_MODELS, codexCatalogAsync, loadConfig, resolveClaudeBin, resolveCodexBin, resolveQwenBin, saveConfig, validateDeepSeekSettings, validateQwenProfiles, type CodexModel } from '../config.ts';
+import { DEEPSEEK_BASE_URL, discoverDeepSeek, discoverModels } from '../providers.ts';
 import { liveChecks, runDoctor } from '../doctor.ts';
 import { sanitizeEnvironment } from '../env.ts';
 import { CONFIG_PATH, DUO_HOME, PROJECT_ROOT, SCRATCH_DIR } from '../paths.ts';
@@ -185,6 +186,8 @@ async function state() {
     },
     models: { codex: visible(catalog), claude: CLAUDE_MODELS },
     qwenProfiles: c.qwenProfiles,
+    deepseek: c.deepseek,
+    localModelsEnabled: c.localModelsEnabled,
     rates: knownCodexRates(),
     efforts: { codex: CODEX_EFFORTS, claude: CLAUDE_EFFORTS, qwen: [] },
     versions: { codex: codexVersion, claude: claudeVersion, qwen: qwenVersion },
@@ -303,8 +306,11 @@ const routes: [string, RegExp, Handler][] = [
     if (b.qwenProfiles !== undefined) {
       try { validateQwenProfiles(b.qwenProfiles); } catch (e) { throw new HttpError(400, (e as Error).message); }
     }
+    if (b.deepseek !== undefined) {
+      try { validateDeepSeekSettings(b.deepseek); } catch (e) { throw new HttpError(400, (e as Error).message); }
+    }
     const patch: Record<string, unknown> = {};
-    for (const k of ['gui', 'presets', 'defaults', 'warnPercent', 'qwenProfiles'] as const) if (b[k] !== undefined) patch[k] = b[k];
+    for (const k of ['gui', 'presets', 'defaults', 'warnPercent', 'qwenProfiles', 'deepseek', 'localModelsEnabled'] as const) if (b[k] !== undefined) patch[k] = b[k];
     const next = saveConfig(patch as any);
     Object.assign(cfg, next);
     return state();
@@ -318,6 +324,18 @@ const routes: [string, RegExp, Handler][] = [
     const result = await probeQwenProfile(profile, cli);
     if (result.toolUse === 'verified') runs.verifyQwenProfile(String(b.profile), profile);
     return result;
+  }],
+  ['POST', /^\/api\/deepseek\/models$/, async () => {
+    try { return { models: await discoverDeepSeek(loadConfig().deepseek), baseUrl: DEEPSEEK_BASE_URL }; }
+    catch (e) { throw new HttpError(400, (e as Error).message); }
+  }],
+  ['POST', /^\/api\/local\/models$/, async (_m, req) => {
+    const c = loadConfig();
+    if (!c.localModelsEnabled) throw new HttpError(400, 'Local Models are disabled');
+    const profile = c.qwenProfiles[String((await body(req)).profile ?? '')];
+    if (!profile || profile.kind !== 'local' || profile.enabled === false) throw new HttpError(400, 'Select an enabled local profile');
+    try { return { models: await discoverModels(profile.baseUrl, profile.keyEnv) }; }
+    catch (e) { throw new HttpError(400, (e as Error).message); }
   }],
   ['POST', /^\/api\/open$/, async (_m, req) => {
     const p = String((await body(req)).path ?? '');

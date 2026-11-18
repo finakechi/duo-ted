@@ -76,6 +76,21 @@ test('Qwen endpoint configuration uses env names and never logs credential value
   } finally { delete process.env.FAKE_LOG; delete process.env.QWEN_TEST_KEY; }
 });
 
+test('A local Qwen endpoint never inherits an unrelated OpenAI API key', { skip: !available }, async () => {
+  const log = join(dir, 'local-secret-check.jsonl');
+  process.env.FAKE_LOG = log;
+  process.env.OPENAI_API_KEY = 'unrelated-openai-secret';
+  try {
+    const result = await executeQwen({ bin, model: 'local-coder', cwd: dir, system: 'Local test', access: 'read',
+      configDir: dir, id: 'local-secret', message: 'Hello', timeoutSec: 4, onLine: () => undefined,
+      profile: { name: 'Ollama', kind: 'local', model: 'local-coder', baseUrl: 'http://127.0.0.1:11434/v1' } });
+    assert.equal(result.error, undefined);
+    const call = JSON.parse(readFileSync(log, 'utf8').trim().split('\n').at(-1)!);
+    assert.equal(call.usesPlaceholderKey, true);
+    assert.doesNotMatch(readFileSync(log, 'utf8'), /unrelated-openai-secret/);
+  } finally { delete process.env.FAKE_LOG; delete process.env.OPENAI_API_KEY; }
+});
+
 test('profile test separates HTTP connectivity/model listing from proven agent tool use', async () => {
   const server = createServer((req, res) => {
     if (req.url === '/v1/models') { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({ data: [{ id: 'local-coder' }] })); }
