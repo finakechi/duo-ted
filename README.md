@@ -1,6 +1,6 @@
 # Duo
 
-**Claude Code, Codex and experimental Qwen Code in one desktop app.** Chat with an agent, run them side by side, or let them work on the same problem together: one writes the code while another reviews it, they debate until every claim is agreed, or they cross-check each other's code reviews. Agent prompts and tool calls are recorded; token/price reporting depends on provider support.
+**Claude Code, Codex, optional DeepSeek, and experimental Qwen Code with local models in one desktop app.** Chat with an agent, run them side by side, or let them work on the same problem together: one writes the code while another reviews it, they debate until every claim is agreed, or they cross-check each other's code reviews. Agent prompts and tool calls are recorded; token/price reporting depends on provider support.
 
 Duo drives the official CLIs you already use, signed in with your own plans: [Claude Code](https://docs.claude.com/claude-code) (Claude subscription) and the [Codex CLI](https://github.com/openai/codex) (ChatGPT subscription). Nothing goes through a third-party server.
 
@@ -72,6 +72,36 @@ In **New run**, choose Qwen under a seat's model picker. In Pair, put Qwen in th
 During an active run, **Pause next turn** waits until the next agent-turn boundary, **Queue instruction** targets an agent or future coordinator turns, **Queue assignment** replaces a selected agent/model before its next eligible turn while retaining its access restrictions, and **Resume** releases the boundary. A cross-provider assignment starts a fresh agent session but supplies bounded prior completed replies and keeps workflow decisions. An active tool call is not interrupted by Pause; **Stop** cancels it. Completed turns, run files and the instruction/assignment ledger are retained. After a process crash or app restart, the prior active execution is **not resumable in place**: inspect the saved run/worktree and use **Continue** for supported protocols to start a new run with saved session identifiers, pending instructions and pending overrides. Do not assume an interrupted in-flight tool action is safe to replay automatically. Some modes without Continue support require a new run.
 
 Qwen's adapter uses non-interactive structured streaming, Qwen session IDs for subsequent turns, CLI model selection, and a separately configured Bubblewrap tool sandbox. Qwen writers receive workspace-write access with network closed; reviewers receive read-only access and excluded write/shell tools. Qwen's own permission modes are not a substitute for that host-enforced sandbox. Live-provider behavior (including Qwen version-specific flags, endpoint authentication, tool calls and resume) must be checked on your machine: repository tests use fake CLI processes and do not verify a real hosted/local inference model.
+
+### DeepSeek (optional)
+
+DeepSeek is a **model provider**; Duo uses the installed **Codex coding engine** to run its repository tools, git workflow and sandbox. No global Codex configuration is replaced. DeepSeek is **off by default** and does not contact the API while disabled.
+
+1. Obtain a DeepSeek API key and set `DEEPSEEK_API_KEY` in the environment **before launching Duo**. For example, on Linux/macOS: `export DEEPSEEK_API_KEY='your-key'` in the shell that starts Duo. Do not put the value into Duo's JSON settings or a seat spec.
+2. Open **Settings → DeepSeek**, enable the integration, and save. The default identifiers match the current published Flash and Pro offerings: `deepseek-flash` and `deepseek-v4-pro`. Use **Test connection and discover models** to fetch the API's current list, or enter a documented identifier manually.
+3. Select **DeepSeek · deepseek-flash** in a Codex seat's model picker, or use `codex:deepseek-flash@high+provider=deepseek` from the CLI. The label indicates Codex is the harness and DeepSeek is the API host.
+4. For a mixed-model Pair, assign that seat as writer and `claude:sonnet@medium` as reviewer (or reverse their positions), choose a git worktree and a check command, then inspect the result before applying.
+
+DeepSeek API calls may incur charges. Duo does **not** turn on DeepSeek's paid web search or URL tools. Its Codex route uses the Responses API, preserves the provider setting when resuming turns, and passes only an environment-variable **name** in CLI arguments. Usage tokens appear when Codex reports them; DeepSeek API charges show as *unpriced* until a verified rate card is supported. The Codex CLI's own sandbox must function on the computer. See [DeepSeek's Codex integration](https://api-docs.deepseek.com/quick_start/agent_integrations/codex/) and [Responses API compatibility](https://api-docs.deepseek.com/guides/responses_api/) for model-specific limits. In particular, the API is stateless: an agent harness must send prior context, and some OpenAI features are unsupported. A successful model-list request does not verify actual code-editing behavior.
+
+### Local Models (optional)
+
+1. Start an existing OpenAI-compatible local inference server, such as Ollama (`http://127.0.0.1:11434/v1`), LM Studio (commonly `http://127.0.0.1:1234/v1`) or vLLM (commonly `http://127.0.0.1:8000/v1`). Duo will not install or launch a server or download model weights.
+2. Open **Settings → Local Models**, enable it, create a named profile, enter the endpoint and exact model ID, then save. The default endpoint is only an example; no server is assumed to be running. Use an environment-variable name if your server requires a key. Disable any saved profile individually without deleting it.
+3. Reopen Settings and choose **Discover models**. If the server does not implement `GET /models`, enter the ID manually. Choose **Test coding tools** to verify a real file-reading tool invocation before allowing automatic assignment.
+4. Select the enabled profile from the Qwen Code model picker (labelled **Local model · via Qwen Code**). For Pair, use a local Qwen writer and a Claude or Codex reviewer. Read-only reviewers and writers require Linux Bubblewrap; on unsupported hosts Duo refuses to run Qwen rather than weakening isolation.
+
+The profile's **Declared model capabilities** section is user-supplied metadata, not an automatically verified rating. Unknown or incompatible tool support is shown explicitly; a model declared to lack tool calling is refused as a coding agent. Local and DeepSeek integrations can both be disabled without changing Claude or Codex settings. Earlier Qwen local profiles remain available after an upgrade if they were already configured, unless you turn off Local Models.
+
+Common problems:
+
+- **DeepSeek disabled / API key missing:** enable it in Settings, set `DEEPSEEK_API_KEY` in the Duo process environment, and restart Duo. Invalid keys produce an authentication error only when you test or run DeepSeek.
+- **Endpoint unavailable / model not listed:** start the local server, check the endpoint address and `/v1` suffix, and confirm the exact model ID. A manual ID still needs a real compatible endpoint.
+- **Tool verification failed:** network connectivity is not sufficient; check that your model and server implement agent tool calls. Automatic assignment excludes unverified local profiles.
+- **Qwen Code / Bubblewrap missing:** local coding roles are not available. Claude/Codex still work normally. On macOS and Windows, local Qwen coding remains unsupported until a verified equivalent sandbox is implemented.
+- **Codex read-only sandbox errors:** the host OS may block Codex's sandbox. Do not turn off review isolation to work around it; run a supported host environment.
+
+DeepSeek sends the task context to DeepSeek's cloud API; loopback local profiles send it to the configured local server. If you intentionally configure a non-loopback endpoint, traffic leaves your machine. Credentials are read from environment variables, never stored in exported runs, and never embedded in Codex command arguments. See [SECURITY.md](SECURITY.md).
 
 Notes:
 

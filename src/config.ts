@@ -29,6 +29,28 @@ export interface QwenProfile {
   model: string;
   baseUrl: string;
   keyEnv?: string;
+  /** A disabled profile stays saved but is not eligible for new runs. */
+  enabled?: boolean;
+  /** User-declared capabilities; connectivity alone never establishes these. */
+  capabilities?: { tools?: boolean; structuredOutput?: boolean; reasoning?: boolean; contextTokens?: number; multimodal?: boolean };
+}
+
+export interface DeepSeekSettings {
+  enabled: boolean;
+  /** Name of an environment variable, never the API key itself. */
+  keyEnv: string;
+  /** Current published models plus user/discovery-supplied identifiers. */
+  models: string[];
+}
+
+export function validateDeepSeekSettings(value: unknown): DeepSeekSettings {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('DeepSeek settings must be an object');
+  const v = value as Record<string, unknown>;
+  if (Object.keys(v).some((k) => !['enabled', 'keyEnv', 'models'].includes(k))) throw new Error('DeepSeek settings contain an unknown or secret-bearing field');
+  if (typeof v.enabled !== 'boolean') throw new Error('DeepSeek enabled must be true or false');
+  if (typeof v.keyEnv !== 'string' || !/^[A-Z_][A-Z0-9_]*$/.test(v.keyEnv)) throw new Error('DeepSeek keyEnv must name an environment variable');
+  if (!Array.isArray(v.models) || !v.models.length || v.models.length > 30 || v.models.some((m) => typeof m !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}$/.test(m))) throw new Error('DeepSeek models must be valid model identifiers');
+  return { enabled: v.enabled, keyEnv: v.keyEnv, models: [...new Set(v.models as string[])] };
 }
 
 /** Validate every persisted field; endpoint profiles must never become a place to store API keys. */
@@ -38,16 +60,22 @@ export function validateQwenProfiles(value: unknown): Record<string, QwenProfile
   for (const [id, item] of Object.entries(value)) {
     if (!/^[A-Za-z][\w-]{0,63}$/.test(id) || !item || typeof item !== 'object' || Array.isArray(item)) throw new Error(`invalid Qwen profile ID: ${id}`);
     const p = item as Record<string, unknown>;
-    if (Object.keys(p).some((key) => !['name', 'kind', 'model', 'baseUrl', 'keyEnv'].includes(key))) throw new Error(`Qwen profile ${id}: unknown or secret-bearing field`);
+    if (Object.keys(p).some((key) => !['name', 'kind', 'model', 'baseUrl', 'keyEnv', 'enabled', 'capabilities'].includes(key))) throw new Error(`Qwen profile ${id}: unknown or secret-bearing field`);
     if (p.kind !== 'hosted' && p.kind !== 'local') throw new Error(`Qwen profile ${id}: kind must be hosted or local`);
     if (typeof p.model !== 'string' || !p.model.trim() || /[\s@+=]/.test(p.model)) throw new Error(`Qwen profile ${id}: invalid model`);
     if (typeof p.baseUrl !== 'string') throw new Error(`Qwen profile ${id}: baseUrl required`);
     if (p.keyEnv !== undefined && (typeof p.keyEnv !== 'string' || !/^[A-Z_][A-Z0-9_]*$/.test(p.keyEnv))) throw new Error(`Qwen profile ${id}: keyEnv must name an environment variable`);
     if (p.name !== undefined && (typeof p.name !== 'string' || p.name.length > 80)) throw new Error(`Qwen profile ${id}: invalid name`);
+    if (p.enabled !== undefined && typeof p.enabled !== 'boolean') throw new Error(`Qwen profile ${id}: enabled must be true or false`);
+    if (p.capabilities !== undefined) {
+      if (!p.capabilities || typeof p.capabilities !== 'object' || Array.isArray(p.capabilities)) throw new Error(`Qwen profile ${id}: invalid capabilities`);
+      const c = p.capabilities as Record<string, unknown>;
+      if (Object.entries(c).some(([k, v]) => k === 'contextTokens' ? !Number.isInteger(v) || Number(v) < 1 : !['tools', 'structuredOutput', 'reasoning', 'multimodal'].includes(k) || typeof v !== 'boolean')) throw new Error(`Qwen profile ${id}: invalid capabilities`);
+    }
     let url: URL;
     try { url = new URL(p.baseUrl); } catch { throw new Error(`Qwen profile ${id}: invalid endpoint URL`); }
     if (url.username || url.password || url.search || url.hash || !['http:', 'https:'].includes(url.protocol) || (p.kind === 'hosted' && url.protocol !== 'https:')) throw new Error(`Qwen profile ${id}: invalid or insecure endpoint URL`);
-    result[id] = { name: String(p.name || id), kind: p.kind, model: p.model, baseUrl: url.toString().replace(/\/$/, ''), ...(p.keyEnv ? { keyEnv: p.keyEnv } : {}) };
+    result[id] = { name: String(p.name || id), kind: p.kind, model: p.model, baseUrl: url.toString().replace(/\/$/, ''), ...(p.keyEnv ? { keyEnv: p.keyEnv } : {}), ...(p.enabled !== undefined ? { enabled: p.enabled } : {}), ...(p.capabilities ? { capabilities: p.capabilities as QwenProfile['capabilities'] } : {}) };
   }
   return result;
 }
@@ -60,6 +88,8 @@ export interface Config {
   claudeBin?: string;
   qwenBin?: string;
   qwenProfiles: Record<string, QwenProfile>;
+  deepseek: DeepSeekSettings;
+  localModelsEnabled: boolean;
   /** Flag a quota window at or above this percentage. */
   warnPercent: number;
   /** Per-turn timeout by engine, seconds (a seat's +timeout= wins). */
@@ -78,6 +108,8 @@ export const DEFAULT_CONFIG: Config = {
   },
   defaults: { preset: 'std', codexModel: 'gpt-6-sol', claudeModel: 'opus', qwenModel: 'qwen3-coder-plus', claudeEffort: 'high' },
   qwenProfiles: {},
+  deepseek: { enabled: false, keyEnv: 'DEEPSEEK_API_KEY', models: ['deepseek-flash', 'deepseek-v4-pro'] },
+  localModelsEnabled: false,
   presets: {
     quick: { seats: ['codex:gpt-6-luna@high', 'claude:haiku'], rounds: 2, description: 'cheap sanity checks' },
     std: { seats: ['codex:gpt-6-sol@medium', 'claude:sonnet@medium'], rounds: 3, description: 'everyday reviews and debates' },
@@ -100,6 +132,8 @@ export function saveConfig(patch: Partial<Config>): Config {
   if (existsSync(CONFIG_PATH)) current = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'));
   const next = { ...current, ...patch };
   if (patch.qwenProfiles !== undefined) next.qwenProfiles = validateQwenProfiles(patch.qwenProfiles);
+  if (patch.deepseek !== undefined) next.deepseek = validateDeepSeekSettings(patch.deepseek);
+  if (patch.localModelsEnabled !== undefined && typeof patch.localModelsEnabled !== 'boolean') throw new Error('Local Models enabled must be true or false');
   mkdirSync(dirname(CONFIG_PATH), { recursive: true });
   writeFileSync(CONFIG_PATH, JSON.stringify(next, null, 2) + '\n');
   return loadConfig();
@@ -123,6 +157,13 @@ export function loadConfig(): Config {
   }
   if (user.defaults) Object.assign(cfg.defaults, user.defaults);
   if (user.presets) Object.assign(cfg.presets, user.presets);
+  if (user.deepseek !== undefined) {
+    try { cfg.deepseek = validateDeepSeekSettings(user.deepseek); }
+    catch { /* A malformed optional provider must never stop Duo from starting. */ }
+  }
+  // A legacy user's explicitly configured Qwen local profiles remain enabled after the upgrade.
+  if (typeof user.localModelsEnabled === 'boolean') cfg.localModelsEnabled = user.localModelsEnabled;
+  else cfg.localModelsEnabled = Object.values(user.qwenProfiles ?? {}).some((p) => p?.kind === 'local');
   if (user.qwenProfiles && typeof user.qwenProfiles === 'object' && !Array.isArray(user.qwenProfiles)) {
     for (const [id, profile] of Object.entries(user.qwenProfiles)) {
       if (!/^[A-Za-z][\w-]{0,63}$/.test(id) || !profile || typeof profile !== 'object') continue;
@@ -132,7 +173,7 @@ export function loadConfig(): Config {
         const url = new URL(p.baseUrl);
         if (url.username || url.password || url.search || url.hash || !['http:', 'https:'].includes(url.protocol) || (p.kind === 'hosted' && url.protocol !== 'https:')) continue;
         if (p.keyEnv && !/^[A-Z_][A-Z0-9_]*$/.test(p.keyEnv)) continue;
-        cfg.qwenProfiles[id] = { name: String(p.name || id).slice(0, 80), kind: p.kind, model: p.model, baseUrl: url.toString().replace(/\/$/, ''), ...(p.keyEnv ? { keyEnv: p.keyEnv } : {}) };
+        cfg.qwenProfiles[id] = validateQwenProfiles({ [id]: p })[id];
       } catch { /* invalid endpoint */ }
     }
   }

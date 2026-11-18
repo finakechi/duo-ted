@@ -15,6 +15,7 @@ import { classifyError, errorHint } from '../errors.ts';
 import { claudeRoute, claudeSink, codexRoute, dropCodexRoute } from '../hooks.ts';
 import { ClaudeTranslator, CodexTranslator, QwenTranslator, type Block } from '../live.ts';
 import { executeQwen } from '../qwen.ts';
+import { deepseekForSeat, validateProviderSeat } from '../providers.ts';
 import { parseQwenStream } from '../tap.ts';
 import { DUO_HOME } from '../paths.ts';
 import { killTree, nodeRunner } from '../platform.ts';
@@ -189,6 +190,7 @@ export class ChatManager {
   private validate(engine: Engine, spec: string, access: string): Seat {
     const seat = parseSeat(spec, 'A', this.cfg.defaults);
     if (seat.engine !== engine) throw new Error(`a ${engine} chat needs a ${engine} seat (got ${spec})`);
+    validateProviderSeat(this.cfg, seat, false);
     const table = engine === 'claude' ? CLAUDE_ACCESS : engine === 'codex' ? CODEX_ACCESS : QWEN_ACCESS;
     if (!Object.hasOwn(table, access)) throw new Error(`unknown access "${access}" for ${engine} (${Object.keys(table).join(', ')})`);
     return seat;
@@ -221,6 +223,7 @@ export class ChatManager {
   update(id: string, patch: Partial<Pick<ChatSession, 'title' | 'spec' | 'access' | 'useCodexConfig' | 'cwd' | 'pinned'>>): ChatSession {
     const s = this.get(id);
     if (patch.spec !== undefined || patch.access !== undefined) this.validate(s.engine, patch.spec ?? s.spec, patch.access ?? s.access);
+    if (patch.spec && parseSeat(patch.spec, 'A', this.cfg.defaults).provider !== parseSeat(s.spec, 'A', this.cfg.defaults).provider) s.codexThreadId = undefined;
     if (patch.cwd !== undefined && !existsSync(patch.cwd)) throw new Error(`folder does not exist: ${patch.cwd}`);
     Object.assign(s, Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined)));
     if (patch.title === undefined && patch.pinned === undefined) s.updatedAt = new Date().toISOString();
@@ -325,10 +328,12 @@ export class ChatManager {
     let route: string | undefined;
     try {
       if (seat.engine === 'codex') {
+        const provider = deepseekForSeat(this.cfg, seat, CHATS_DIR);
         route = codexRoute(`chat-${s.id}-${Date.now().toString(36)}`, {
           bin: this.bins.codex,
-          overrides: [...codexOverrides(seat), `shell_environment_policy.set={${DEPTH_VAR}="1"}`],
+          overrides: [...codexOverrides(seat), ...(provider?.overrides ?? []), `shell_environment_policy.set={${DEPTH_VAR}="1"}`],
           ignoreRules: false,
+          unsetEnv: provider?.unsetEnv,
           onLine: (line) => this.onLine(s.id, line),
         });
         await withCodexBin(route, () => this.manager.startSession({
@@ -338,7 +343,7 @@ export class ChatManager {
           model: seat.model,
           effort: seat.effort as any,
           sandboxMode: CODEX_ACCESS[s.access].sandbox,
-          ignoreUserConfig: !s.useCodexConfig,
+          ignoreUserConfig: !!provider || !s.useCodexConfig,
           skipPersistence: true,
           permissionMode: 'dontAsk',
           ...(s.codexThreadId ? { resumeSessionId: s.codexThreadId } : {}),
@@ -527,9 +532,12 @@ export class ChatManager {
           ? { input: o.usage.input - prev.input, cached: Math.max(0, o.usage.cached - prev.cached), output: Math.max(0, o.usage.output - prev.output), reasoning: Math.max(0, o.usage.reasoning - prev.reasoning) }
           : o.usage;
         const seat = parseSeat(turn.spec, 'A', this.cfg.defaults);
-        const price = codexPrice(seat.model, turn.usage, seat.tier);
-        turn.credits = price.credits;
-        if (price.unpriced && turn.usage.input + turn.usage.output > 0) turn.unpriced = price.unpriced;
+        if (seat.provider === 'deepseek') turn.unpriced = 'DeepSeek API usage (no verified price estimate)';
+        else {
+          const price = codexPrice(seat.model, turn.usage, seat.tier);
+          turn.credits = price.credits;
+          if (price.unpriced && turn.usage.input + turn.usage.output > 0) turn.unpriced = price.unpriced;
+        }
       } else {
         turn.usage = o.usage;
       }

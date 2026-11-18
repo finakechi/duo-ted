@@ -19,6 +19,7 @@ import { validateTemplate } from '../templates/validate.ts';
 import type { CoordinationTemplate } from '../templates/types.ts';
 import { exportHtml } from '../render.ts';
 import { parseSeat, seatIds, type Seat } from '../seats.ts';
+import { validateProviderSeat } from '../providers.ts';
 import { deleteRun, listRuns, markInterrupted, RunStore, type RunMeta } from '../store.ts';
 import { finishWorkspace, workspaceDiff, workspaceOptionsAsync } from '../worktree.ts';
 import type { Bus } from './bus.ts';
@@ -85,7 +86,7 @@ export class RunManager {
     const assignment = req.assignment ?? { mode: 'manual', preference: 'best-fit' };
     if (assignment.mode === 'manual') return assignModels({ requested: req.seats, assignment, defaults: { codex: this.cfg.gui.codex.spec, claude: this.cfg.gui.claude.spec, qwen: this.cfg.gui.qwen.spec }, profiles: {}, verified: new Set(), availability: { codex: true, claude: true, qwen: true }, pair: req.protocol === 'pair' });
     const isAvailable = (resolveBin: () => unknown) => { try { resolveBin(); return true; } catch { return false; } };
-    const verified = new Set(Object.entries(this.cfg.qwenProfiles).filter(([id, p]) => this.verifiedQwen.get(id) === JSON.stringify(p)).map(([id]) => id));
+    const verified = new Set(Object.entries(this.cfg.qwenProfiles).filter(([id, p]) => p.enabled !== false && (p.kind !== 'local' || this.cfg.localModelsEnabled) && this.verifiedQwen.get(id) === JSON.stringify(p)).map(([id]) => id));
     return assignModels({ requested: req.seats, assignment,
       defaults: { codex: this.cfg.gui.codex.spec, claude: this.cfg.gui.claude.spec, qwen: this.cfg.gui.qwen.spec },
       profiles: this.cfg.qwenProfiles, verified,
@@ -183,10 +184,12 @@ export class RunManager {
     }
     const ids = seatIds(selected.seats.length);
     const seats: Seat[] = selected.seats.map((s, i) => parseSeat(s, ids[i], this.cfg.defaults));
+    for (const seat of seats) validateProviderSeat(this.cfg, seat);
     const min = mode === 'review' || mode === 'ask' || mode === 'custom' ? template?.limits.minSeats ?? 1 : 2;
     if (seats.length < min) throw new Error(`${req.protocol} needs at least ${min} seat(s)`);
     if (mode === 'pair' && seats.length !== 2) throw new Error('pair takes exactly two seats: the writer and the reviewer');
     const chair = req.chair && mode !== 'pair' ? parseSeat(req.chair, 'Z', this.cfg.defaults) : undefined;
+    if (chair) validateProviderSeat(this.cfg, chair);
     const brief = (req.brief ?? '').trim() || (mode === 'review' ? `Review ${req.review?.kind ?? 'uncommitted'}` : '');
     if (!brief) throw new Error(mode === 'pair' ? 'describe the task first' : 'the brief is empty');
     let pairSettings: PairSettings | undefined;

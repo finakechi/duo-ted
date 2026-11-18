@@ -85,6 +85,11 @@ export async function runDoctor(cfg: Config, o: { quick?: boolean } = {}): Promi
     add({ id: label, label, level: 'info', detail: existsSync(p) ? p : `not installed (\`duo setup\` adds ${p})` });
   }
   add({ id: 'config', label: 'config', level: 'info', detail: existsSync(CONFIG_PATH) ? CONFIG_PATH : `${CONFIG_PATH} (defaults)` });
+  add({ id: 'deepseek', label: 'DeepSeek', level: !cfg.deepseek.enabled ? 'info' : process.env[cfg.deepseek.keyEnv] ? 'ok' : 'warn',
+    detail: !cfg.deepseek.enabled ? 'disabled (optional)' : process.env[cfg.deepseek.keyEnv] ? 'enabled · API key variable set (connection not tested)' : `enabled · ${cfg.deepseek.keyEnv} is not set`,
+    fix: cfg.deepseek.enabled && !process.env[cfg.deepseek.keyEnv] ? `Set ${cfg.deepseek.keyEnv} before starting Duo.` : undefined });
+  add({ id: 'local-models', label: 'Local Models', level: 'info',
+    detail: cfg.localModelsEnabled ? `enabled · ${Object.values(cfg.qwenProfiles).filter((p) => p.kind === 'local' && p.enabled !== false).length} active profiles (connection not tested)` : 'disabled (optional)' });
   add({ id: 'data', label: 'data', level: 'info', detail: DUO_HOME });
   return out;
 }

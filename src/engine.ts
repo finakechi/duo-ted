@@ -25,6 +25,7 @@ import { killTree } from './platform.ts';
 import { codexPrice } from './pricing.ts';
 import { saveClaudeQuota } from './quota.ts';
 import { executeQwen } from './qwen.ts';
+import { deepseekForSeat, validateProviderSeat } from './providers.ts';
 import { codexOverrides, formatSeat, type Seat } from './seats.ts';
 import type { RunStore, SeatRecord, TurnRecord, Usage } from './store.ts';
 import { extractJson, parseClaudeStream, parseCodexStream, parseQwenStream, type ParsedTurn } from './tap.ts';
@@ -130,6 +131,8 @@ export class Engines {
       resume?: Pick<SeatRecord, 'codexThreadId' | 'claudeSessionId' | 'qwenSessionId' | 'codexUsageTotals' | 'claudeCostTotal'>;
     },
   ): Promise<SeatSession> {
+    const configuredProfile = validateProviderSeat(this.cfg, seat);
+    if (opts.schema && configuredProfile?.capabilities?.structuredOutput === false) throw new Error(`profile ${seat.profile} cannot produce the structured responses required by this role`);
     const access = opts.access ?? { kind: 'read' };
     const suffix = opts.sessionKey ?? (role === 'chair' ? 'chair' : role === 'reviewer' ? `${seat.id}-rev` : seat.id);
     const clawName = `duo-${this.runTag}-${suffix}`;
@@ -139,6 +142,7 @@ export class Engines {
       spec: formatSeat(seat),
       engine: seat.engine,
       model: seat.model,
+      ...(seat.provider ? { provider: seat.provider } : seat.profile && configuredProfile ? { provider: configuredProfile.kind === 'local' ? 'local' : 'hosted' } : {}),
       effort: seat.effort,
       name: seat.name,
       role,
@@ -181,13 +185,15 @@ export class Engines {
     };
 
     if (seat.engine === 'codex') {
+      const provider = deepseekForSeat(this.cfg, seat, this.run.dir);
       const overrides = [
         ...codexOverrides(seat),
+        ...(provider?.overrides ?? []),
         `shell_environment_policy.set={${DEPTH_VAR}="1"}`,
         ...(opts.hideSkills ? ['skills.include_instructions=false'] : []),
         ...(access.kind === 'write' && access.codexSandbox === 'workspace-write' && access.network ? ['sandbox_workspace_write.network_access=true'] : []),
       ];
-      const route = codexRoute(`${this.runTag}-${suffix}`, { bin: this.bins.codex, overrides, ignoreRules: true, onLine });
+      const route = codexRoute(`${this.runTag}-${suffix}`, { bin: this.bins.codex, overrides, ignoreRules: true, onLine, unsetEnv: provider?.unsetEnv });
       ss.codexRouteName = route;
       const start = async () => {
         await withCodexBin(route, () => this.manager.startSession({
@@ -205,9 +211,7 @@ export class Engines {
       };
     } else if (seat.engine === 'qwen') {
       if (!this.bins.qwen) throw new Error('Qwen Code CLI is not configured');
-      const profile = seat.profile ? this.cfg.qwenProfiles[seat.profile] : undefined;
-      if (seat.profile && !profile) throw new Error(`unknown Qwen profile ${seat.profile}`);
-      if (profile && profile.model !== seat.model) throw new Error(`Qwen profile ${seat.profile} uses model ${profile.model}, not ${seat.model}`);
+      const profile = configuredProfile;
       ss.qwen = { cwd: opts.cwd, system: opts.system, schema: opts.schema, access: access.kind === 'read' ? 'read' : 'write', profile };
       ss.restart = async () => undefined; // each Qwen turn is a new CLI process with --resume
     } else {
@@ -377,10 +381,12 @@ export class Engines {
         usd = undefined;
         unpriced = parsed.turn.unpriced;
       }
-    } else {
+    } else if (ss.seat.engine === 'codex' && !ss.seat.provider) {
       const price = codexPrice(ss.seat.model, usage, ss.seat.tier);
       credits = price.credits;
       if (price.unpriced && usage.input + usage.output > 0) unpriced = price.unpriced;
+    } else {
+      unpriced = ss.seat.provider === 'deepseek' ? 'DeepSeek API usage (no verified price estimate)' : 'External model usage (price unknown)';
     }
     // A reply the CLI completed is a success even if claw saw a recoverable error on the way.
     const transportError = res.error && !(parsed.completed && reply) ? res.error : undefined;

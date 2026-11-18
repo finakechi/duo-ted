@@ -40,6 +40,8 @@ export interface SeatRecord {
   spec: string;
   engine: 'codex' | 'claude' | 'qwen';
   model: string;
+  /** Actual inference provider, not the coding harness (Codex/Qwen). */
+  provider?: 'deepseek' | 'local' | 'hosted';
   effort?: string;
   name?: string;
   role: string;

@@ -13,7 +13,7 @@ const session = valueOf(args, '--resume') || '00000000-0000-4000-8000-0000000000
 const schema = valueOf(args, '--json-schema');
 record({ cli: 'qwen', args, prompt, cwd: process.cwd(), session, endpoint: process.env.OPENAI_BASE_URL || undefined,
   // Never print or record API keys; tests only inspect whether the key exists.
-  hasKey: Boolean(process.env.OPENAI_API_KEY), systemPolicy: process.env.QWEN_CODE_SYSTEM_SETTINGS_PATH || undefined });
+  hasKey: Boolean(process.env.OPENAI_API_KEY), usesPlaceholderKey: process.env.OPENAI_API_KEY === 'ollama', systemPolicy: process.env.QWEN_CODE_SYSTEM_SETTINGS_PATH || undefined });
 if (mode === 'exit') { process.stderr.write('invalid authentication or unknown model\n'); process.exit(2); }
 if (mode === 'wait') { await new Promise((resolve) => setTimeout(resolve, 20_000)); }
 if (mode === 'malformed') { console.log('{broken json'); process.exit(0); }

@@ -38,5 +38,5 @@ export function setOpt(p: SpecParts, key: string, value: string | undefined): Sp
 
 export function shortSpec(spec: string): string {
   const p = parseSpec(spec);
-  return `${p.model || p.engine}${p.effort ? ' · ' + p.effort : ''}`;
+  return `${getOpt(p, 'provider') === 'deepseek' ? 'DeepSeek · ' : getOpt(p, 'profile') ? `${getOpt(p, 'profile')} · ` : ''}${p.model || p.engine}${p.effort ? ' · ' + p.effort : ''}`;
 }

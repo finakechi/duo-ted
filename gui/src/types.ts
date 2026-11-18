@@ -248,7 +248,8 @@ export interface GuiDefaults {
   theme: 'system' | 'light' | 'dark';
   notify: boolean;
 }
-export interface QwenProfile { name: string; kind: 'hosted' | 'local'; model: string; baseUrl: string; keyEnv?: string; }
+export interface QwenProfile { name: string; kind: 'hosted' | 'local'; model: string; baseUrl: string; keyEnv?: string; enabled?: boolean; capabilities?: { tools?: boolean; structuredOutput?: boolean; reasoning?: boolean; contextTokens?: number; multimodal?: boolean }; }
+export interface DeepSeekSettings { enabled: boolean; keyEnv: string; models: string[]; }
 
 export interface Prefs {
   project?: string;
@@ -282,6 +283,8 @@ export interface AppState {
   access: { claude: Record<string, string>; codex: Record<string, string>; qwen: Record<string, string>; };
   models: { codex: CodexModel[]; claude: { alias: string; note: string; }[]; };
   qwenProfiles: Record<string, QwenProfile>;
+  deepseek: DeepSeekSettings;
+  localModelsEnabled: boolean;
   rates: Record<string, [number, number, number]>;
   efforts: { codex: string[]; claude: string[]; qwen: string[]; };
   versions: { codex: string; claude: string; qwen?: string; };

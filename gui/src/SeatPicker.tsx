@@ -28,7 +28,8 @@ export function SeatPicker({ spec, onChange, engineLocked, seat, align = 'left',
     onChange(str);
   };
   const codexModel = s.models.codex.find((m) => m.slug === p.model);
-  const efforts = p.engine === 'codex' ? (codexModel?.efforts.length ? codexModel.efforts : s.efforts.codex) : s.efforts[p.engine];
+  const deepseek = p.engine === 'codex' && getOpt(p, 'provider') === 'deepseek';
+  const efforts = deepseek ? ['low', 'high', 'max'] : p.engine === 'codex' ? (codexModel?.efforts.length ? codexModel.efforts : s.efforts.codex) : s.efforts[p.engine];
   const chip = (open: boolean, toggle: () => void) => (
     <button type="button" class={`chip seat-chip ${p.engine} ${open ? 'open' : ''}`} onClick={() => { setRaw(spec); toggle(); }} title={`${spec}\nClick to change the model, effort and options`}>
       <EngineMark engine={p.engine} size={16} />
@@ -54,21 +55,29 @@ export function SeatPicker({ spec, onChange, engineLocked, seat, align = 'left',
           <div class="panel-label">Model</div>
           <div class="model-list">
             {p.engine === 'codex'
-              ? s.models.codex.map((m) => (
-                  <button type="button" class={`model-row ${m.slug === p.model ? 'on' : ''}`} onClick={() => apply({ ...p, model: m.slug, effort: m.efforts.includes(p.effort ?? '') ? p.effort : m.defaultEffort })}>
+              ? <>
+                {s.models.codex.map((m) => (
+                  <button type="button" class={`model-row ${!deepseek && m.slug === p.model ? 'on' : ''}`} onClick={() => apply(setOpt({ ...p, model: m.slug, effort: m.efforts.includes(p.effort ?? '') ? p.effort : m.defaultEffort }, 'provider', undefined))}>
                     <span class="model-name">{m.display}{m.slug === p.model && <Icon name="check" size={13} />}</span>
                     <span class="model-desc">{m.description}</span>
                     <span class="model-rate" title="Codex plan credits at the published Standard rate">{rateLabel(m.slug)}</span>
                   </button>
-                ))
+                ))}
+                {s.deepseek.enabled && s.deepseek.models.map((model) => (
+                  <button type="button" class={`model-row ${deepseek && p.model === model ? 'on' : ''}`} onClick={() => apply(setOpt({ ...p, model, effort: 'high', opts: p.opts.filter(([k]) => !['web', 'tier'].includes(k)) }, 'provider', 'deepseek'))}>
+                    <span class="model-name">DeepSeek · {model}{deepseek && p.model === model && <Icon name="check" size={13} />}</span>
+                    <span class="model-desc">Cloud API · Codex coding engine · API usage billed by DeepSeek</span>
+                  </button>
+                ))}
+              </>
               : p.engine === 'qwen' ? <>
                   <button type="button" class={`model-row ${!getOpt(p, 'profile') ? 'on' : ''}`} onClick={() => apply(setOpt({ ...p, model: 'qwen3-coder-plus', effort: undefined }, 'profile', undefined))}>
                     <span class="model-name">Configured Qwen Code model</span><span class="model-desc">Uses your existing Qwen authentication</span>
                   </button>
-                  {Object.entries(s.qwenProfiles).map(([id, profile]) => (
+                  {Object.entries(s.qwenProfiles).filter(([, profile]) => profile.enabled !== false && (profile.kind !== 'local' || s.localModelsEnabled)).map(([id, profile]) => (
                     <button type="button" class={`model-row ${getOpt(p, 'profile') === id ? 'on' : ''}`} onClick={() => apply(setOpt({ ...p, model: profile.model, effort: undefined }, 'profile', id))}>
                       <span class="model-name">{profile.name}{getOpt(p, 'profile') === id && <Icon name="check" size={13} />}</span>
-                      <span class="model-desc">{profile.kind} · {profile.model}</span>
+                      <span class="model-desc">{profile.kind === 'local' ? 'Local model' : 'Hosted provider'} · via Qwen Code · {profile.model}</span>
                     </button>
                   ))}
                 </>
@@ -84,7 +93,7 @@ export function SeatPicker({ spec, onChange, engineLocked, seat, align = 'left',
               <button type="button" class={p.effort === e ? 'on' : ''} onClick={() => apply({ ...p, effort: e })}>{e}</button>
             ))}
           </div></>}
-          {p.engine === 'codex' && (
+          {p.engine === 'codex' && !deepseek && (
             <>
               <div class="panel-label">Output</div>
               <div class="opt-grid">

@@ -57,6 +57,10 @@ export interface Seat {
   addDirs: string[];
   /** Optional Duo-managed Qwen endpoint profile; never contains a credential. */
   profile?: string;
+  /** Model host, distinct from the coding engine. */
+  provider?: 'deepseek';
+  /** Resolved only in a run, never supplied by an untrusted seat spec. */
+  backend?: { provider: 'deepseek' | 'openai' | 'anthropic' | 'qwen' | 'local' | 'hosted'; locality: 'local' | 'cloud' };
 }
 
 export interface SeatDefaults {
@@ -163,6 +167,13 @@ function applyOption(seat: Seat, key: string, value: string, spec: string, safe:
       seat.profile = name;
       return;
     }
+    case 'provider': {
+      codexOnly(key);
+      if (safe) throw new SeatError('custom providers are disabled in duo-safe');
+      if (value !== 'deepseek') throw new SeatError(`unknown Codex provider ${value}`);
+      seat.provider = 'deepseek';
+      return;
+    }
     default:
       throw new SeatError(`unknown option "${key}" in "${spec}"`);
   }
@@ -181,6 +192,7 @@ export function formatSeat(seat: Seat): string {
   if (seat.name) s += `+name=${seat.name}`;
   if (seat.timeoutSec) s += `+timeout=${seat.timeoutSec}`;
   if (seat.profile) s += `+profile=${seat.profile}`;
+  if (seat.provider) s += `+provider=${seat.provider}`;
   return s;
 }
 
@@ -192,7 +204,7 @@ export function seatLabel(seat: Seat): string {
 
 /** Human name used when talking to peers ("Codex (gpt-6-sol)"). */
 export function seatPeerName(seat: Seat): string {
-  const vendor = seat.engine === 'codex' ? 'Codex' : seat.engine === 'claude' ? 'Claude' : 'Qwen';
+  const vendor = seat.provider === 'deepseek' ? 'DeepSeek via Codex' : seat.engine === 'codex' ? 'Codex' : seat.engine === 'claude' ? 'Claude' : 'Qwen';
   return seat.name ? `${seat.name} — ${vendor} ${seat.model}` : `${vendor} ${seat.model}`;
 }
 

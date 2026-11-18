@@ -9,7 +9,7 @@ import type { CoordinationTemplate, Message, Operations, Selector, WorkflowState
 import { matches, readPath, schemaError, validateTemplate } from './validate.ts';
 
 export function selected(select: Selector, seats: Seat[], roles: Record<string, string[]>, state?: WorkflowState): Seat[] {
-  const pool = seats.filter((s) => (!select.ids || select.ids.includes(s.id)) && (!select.engine || select.engine === s.engine) && (!select.model || select.model === s.model) && (!select.fromRole || roles[select.fromRole]?.includes(s.id)));
+  const pool = seats.filter((s) => (!select.ids || select.ids.includes(s.id)) && (!select.engine || select.engine === s.engine) && (!select.provider || select.provider === (s.backend?.provider ?? (s.provider === 'deepseek' ? 'deepseek' : s.engine === 'codex' ? 'openai' : s.engine === 'claude' ? 'anthropic' : 'qwen'))) && (!select.locality || select.locality === (s.backend?.locality ?? 'cloud')) && (!select.model || select.model === s.model) && (!select.fromRole || roles[select.fromRole]?.includes(s.id)));
   if (select.rankBy && state) {
     const rank = select.rankBy;
     const score = (s: Seat) => readPath(state.outputs[rank.step]?.find((m) => m.seat === s.id), rank.path);
@@ -201,7 +201,7 @@ export async function executeWorkflow(ctx: RunContext, definition: CoordinationT
         if (tr.once !== false && transitioned.has(i)) continue;
         const candidates = selected({ ...tr.select, count: undefined, fromRole: tr.from }, ctx.opts.seats, st.roles, st).filter((seat) => {
           const last = [...st.history].reverse().find((m) => m.seat === seat.id && !m.error);
-          return matches(tr.when, { ...st, model: { id: seat.id, engine: seat.engine, model: seat.model, data: last?.data, reply: last?.reply } });
+          return matches(tr.when, { ...st, model: { id: seat.id, engine: seat.engine, model: seat.model, provider: seat.backend?.provider, locality: seat.backend?.locality, data: last?.data, reply: last?.reply } });
         }).slice(0, tr.select?.count ?? 32);
         if (candidates.length) { assign(st, tr.to, candidates, true); transitioned.add(i); ctx.log(`role change: ${candidates.map((s) => s.id).join(', ')} → ${tr.to}`); }
       }
