@@ -16,7 +16,7 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { binVersionAsync, type BinSpec } from './bins.ts';
 import { endpointLocation, profileIssues, resolveCodexBin, resolveQwenBin, type Config, type EndpointLocation, type QwenProfile } from './config.ts';
@@ -205,8 +205,8 @@ export class ReadinessStore {
       return {
         view, fp, run: {
           connection: async () => connectionCheck(this.deepseekBaseUrl, model, s.keyEnv),
-          review: (signal) => codexRoleProbe(cfg, bin, seat, 'read', signal),
-          write: (signal) => codexRoleProbe(cfg, bin, seat, 'write', signal),
+          review: (signal) => codexRoleProbe(cfg, bin, seat, 'read', signal, this.deepseekBaseUrl),
+          write: (signal) => codexRoleProbe(cfg, bin, seat, 'write', signal, this.deepseekBaseUrl),
         },
       };
     }
@@ -263,21 +263,49 @@ function git(cwd: string, args: string[]): void {
   spawnSync('git', ['-C', cwd, '-c', 'user.name=Duo readiness', '-c', 'user.email=readiness@duo.invalid', '-c', 'commit.gpgsign=false', ...args], { stdio: 'ignore', timeout: 10_000 });
 }
 
-/** A throwaway repository with a proof file, plus a sibling folder the role must not reach. */
-function sandboxFolder(): { root: string; repo: string; outside: string; config: string; marker: string } {
+/**
+ * The folder that must stay untouched by the agent under test.
+ *
+ * It deliberately does NOT live next to the disposable workspace under the system temp dir: the
+ * Linux sandboxes Duo relies on (Codex's bubblewrap sandbox and Qwen's executionSandbox) keep the
+ * temp dir writable so the agent can use temporary files, so a "sibling of the workspace in /tmp"
+ * is inside the sandbox's writable area, not outside it. A write there proves nothing about the
+ * boundary and fails an honest test as a false positive (observed with Codex 0.166.0: a scripted
+ * escape to a temp-dir sibling landed, while the same write under the home directory was blocked).
+ * The sentinel therefore lives under HOME, which the sandbox mounts read-only in
+ * workspace-write/read-only modes. If no trustworthy location exists, the probe fails closed.
+ */
+function boundaryOutsideDir(): string {
+  let home = '';
+  try { home = homedir(); } catch { /* HOME unset on POSIX */ }
+  if (!home || home === tmpdir() || home.startsWith(`${tmpdir()}/`)) {
+    throw new Error('cannot create a trustworthy boundary sentinel: HOME is missing or points into the temp dir, so no place outside the sandbox writable area exists');
+  }
+  return mkdtempSync(join(home, '.duo-readiness-out-'));
+}
+
+/** A throwaway repository with a proof file, plus a sentinel folder the role must not reach. */
+function sandboxFolder(): { root: string; repo: string; outside: string; config: string; marker: string; dispose: () => void } {
   const root = mkdtempSync(join(tmpdir(), 'duo-readiness-'));
-  const repo = join(root, 'repo');
-  const outside = join(root, 'outside');
-  const config = join(root, 'config');
-  for (const d of [repo, outside, config]) mkdirSync(d, { recursive: true, mode: 0o700 });
-  const marker = `DUO_READ_PROOF_${randomBytes(6).toString('hex')}`;
-  writeFileSync(join(repo, 'README.md'), '# Duo readiness test\n\nA disposable repository created by Duo to test an agent\'s tools. It is deleted after the test.\n');
-  writeFileSync(join(repo, 'proof.txt'), marker + '\n');
-  writeFileSync(join(outside, 'sentinel.txt'), 'outside the workspace\n');
-  git(repo, ['init', '-q']);
-  git(repo, ['add', '-A']);
-  git(repo, ['commit', '-q', '-m', 'readiness fixture']);
-  return { root, repo, outside, config, marker };
+  let outside = '';
+  try {
+    outside = boundaryOutsideDir();
+    const repo = join(root, 'repo');
+    const config = join(root, 'config');
+    for (const d of [repo, config, outside]) mkdirSync(d, { recursive: true, mode: 0o700 });
+    const marker = `DUO_READ_PROOF_${randomBytes(6).toString('hex')}`;
+    writeFileSync(join(repo, 'README.md'), '# Duo readiness test\n\nA disposable repository created by Duo to test an agent\'s tools. It is deleted after the test.\n');
+    writeFileSync(join(repo, 'proof.txt'), marker + '\n');
+    writeFileSync(join(outside, 'sentinel.txt'), 'outside the workspace\n');
+    git(repo, ['init', '-q']);
+    git(repo, ['add', '-A']);
+    git(repo, ['commit', '-q', '-m', 'readiness fixture']);
+    return { root, repo, outside, config, marker, dispose: () => { rmSync(root, { recursive: true, force: true }); rmSync(outside, { recursive: true, force: true }); } };
+  } catch (e) {
+    rmSync(root, { recursive: true, force: true });
+    if (outside) rmSync(outside, { recursive: true, force: true });
+    throw e;
+  }
 }
 
 /** Content hash of every file under dir except .git internals. */
@@ -369,15 +397,15 @@ async function qwenRoleProbe(bin: BinSpec, profile: QwenProfile, access: RoleNee
   } catch (e) {
     return { ok: false, detail: classifyFailure((e as Error).message, undefined, 0) };
   } finally {
-    rmSync(f.root, { recursive: true, force: true });
+    f.dispose();
   }
 }
 
 /** One reviewer or writer probe of a DeepSeek model through Codex, with an isolated CODEX_HOME. */
-async function codexRoleProbe(cfg: Config, bin: BinSpec, seat: Seat, access: RoleNeed, signal: AbortSignal): Promise<Omit<CheckOutcome, 'at'>> {
+async function codexRoleProbe(cfg: Config, bin: BinSpec, seat: Seat, access: RoleNeed, signal: AbortSignal, baseUrl: string): Promise<Omit<CheckOutcome, 'at'>> {
   const f = sandboxFolder();
   try {
-    const provider = deepseekForSeat(cfg, seat, f.config)!;
+    const provider = deepseekForSeat(cfg, seat, f.config, baseUrl)!;
     const codexHome = join(f.config, 'codex-home');
     mkdirSync(codexHome, { recursive: true, mode: 0o700 });
     const before = snapshot(f.repo);
@@ -412,7 +440,7 @@ async function codexRoleProbe(cfg: Config, bin: BinSpec, seat: Seat, access: Rol
   } catch (e) {
     return { ok: false, detail: classifyFailure((e as Error).message, undefined, 0) };
   } finally {
-    rmSync(f.root, { recursive: true, force: true });
+    f.dispose();
   }
 }
 

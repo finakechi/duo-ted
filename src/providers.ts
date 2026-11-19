@@ -30,7 +30,7 @@ function codexModel(slug: string) {
   };
 }
 
-export function deepseekForSeat(cfg: Config, seat: Seat, catalogDir: string): { overrides: string[]; unsetEnv: string[] } | undefined {
+export function deepseekForSeat(cfg: Config, seat: Seat, catalogDir: string, baseUrl = DEEPSEEK_BASE_URL): { overrides: string[]; unsetEnv: string[] } | undefined {
   if (!seat.provider) return undefined;
   if (seat.provider !== 'deepseek' || seat.engine !== 'codex') throw new Error(`unsupported model provider ${seat.provider} for ${seat.engine}`);
   const s = cfg.deepseek;
@@ -45,7 +45,7 @@ export function deepseekForSeat(cfg: Config, seat: Seat, catalogDir: string): { 
     overrides: [
       'model_provider="duo_deepseek"',
       'model_providers.duo_deepseek.name="DeepSeek"',
-      `model_providers.duo_deepseek.base_url=${q(DEEPSEEK_BASE_URL)}`,
+      `model_providers.duo_deepseek.base_url=${q(baseUrl)}`,
       'model_providers.duo_deepseek.wire_api="responses"',
       `model_providers.duo_deepseek.env_key=${q(s.keyEnv)}`,
       `model_catalog_json=${q(catalog)}`,

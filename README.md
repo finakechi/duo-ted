@@ -82,6 +82,8 @@ A reachable endpoint, a model list, or a model's name says nothing about whether
 
 Each test is bounded (connection 10 s, sandbox check 30 s, model task 120 s), can be cancelled, and removes its folder afterwards. Failures say why: unreachable endpoint, rejected key, no tool calls (the model or server lacks tool calling), malformed stream, timeout, missing sandbox, or a boundary violation. **Cloud models** (DeepSeek, hosted endpoints) ask you to confirm before the reviewer/writer tests, because they send a few short prompts that the provider may bill.
 
+The outside-write sentinel does not sit next to the disposable workspace: the Linux sandboxes Duo relies on (Codex's bubblewrap sandbox, Qwen's executionSandbox) keep the system temp dir writable, so a "sibling in /tmp" is inside the sandbox, not outside it. The sentinel lives under your home directory, which the sandbox mounts read-only; a successful escape write there is a real boundary violation and fails the test. If no such location exists (e.g. HOME points into the temp dir), the test fails closed instead of pretending a boundary.
+
 Results are kept **in memory only** and are tied to the profile, endpoint, model, credential variable, harness version, sandbox and Duo's tool policy. After a restart, or any change to those, the model shows *Needs a new test*. Status labels: *Disabled*, *Unsupported*, *Not tested*, *Unreachable*, *Connected · roles not verified*, *Role test failed*, *Verified: reviewer*, *Verified: writer*, *Verified: reviewer and writer*.
 
 #### Using optional models in runs
