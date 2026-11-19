@@ -15,15 +15,16 @@ import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'no
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { extname, join } from 'node:path';
 import { binVersionAsync, runBinAsync } from '../bins.ts';
-import { CLAUDE_MODELS, codexCatalogAsync, loadConfig, resolveClaudeBin, resolveCodexBin, resolveQwenBin, saveConfig, validateDeepSeekSettings, validateQwenProfiles, type CodexModel } from '../config.ts';
+import { CLAUDE_MODELS, codexCatalogAsync, endpointLocation, loadConfig, profileIssues, resolveClaudeBin, resolveCodexBin, resolveQwenBin, saveConfig, validateDeepSeekSettings, validateProfilesForSave, type CodexModel } from '../config.ts';
 import { DEEPSEEK_BASE_URL, discoverDeepSeek, discoverModels } from '../providers.ts';
+import { ReadinessStore, type CheckKind } from '../readiness.ts';
+import { CloudHandoffError } from '../protocols/common.ts';
 import { liveChecks, runDoctor } from '../doctor.ts';
 import { sanitizeEnvironment } from '../env.ts';
 import { CONFIG_PATH, DUO_HOME, PROJECT_ROOT, SCRATCH_DIR } from '../paths.ts';
 import { IS_MAC, IS_WIN, openFolder } from '../platform.ts';
 import { knownCodexRates } from '../pricing.ts';
 import { refreshQuota } from '../quota-refresh.ts';
-import { probeQwenProfile } from '../qwen.ts';
 import { snapshot } from '../quota.ts';
 import { CLAUDE_EFFORTS, CODEX_EFFORTS } from '../seats.ts';
 import { workspaceOptionsAsync } from '../worktree.ts';
@@ -53,6 +54,8 @@ const MCP_SCRIPT = process.env.DUO_PERMISSION_MCP || join(import.meta.dirname, '
 
 const bus = new Bus();
 const perms = new PermissionBroker(bus);
+/** Role readiness results: in memory only, so nothing proven before a restart is trusted after it. */
+const readiness = new ReadinessStore();
 let chats: ChatManager;
 let runs: RunManager;
 
@@ -186,6 +189,9 @@ async function state() {
     },
     models: { codex: visible(catalog), claude: CLAUDE_MODELS },
     qwenProfiles: c.qwenProfiles,
+    /** Policy problems and real endpoint location per profile (from the address, never the label). */
+    profilePolicy: Object.fromEntries(Object.entries(c.qwenProfiles).map(([id, p]) => [id, { location: endpointLocation(p.baseUrl), issues: profileIssues(id, p) }])),
+    readiness: await readiness.describeAll(c),
     deepseek: c.deepseek,
     localModelsEnabled: c.localModelsEnabled,
     rates: knownCodexRates(),
@@ -268,6 +274,21 @@ const routes: [string, RegExp, Handler][] = [
   ['DELETE', /^\/api\/templates\/([\w-]+)\/memory\/([\w-]+)$/, (m) => { clearMemory(getTemplate(m[1]), m[2]); return { ok: true }; }],
   ['GET', /^\/api\/runs$/, () => runs.list()],
   ['POST', /^\/api\/assignments\/suggest$/, async (_m, req) => runs.suggest(await body(req))],
+  ['GET', /^\/api\/readiness$/, () => readiness.describeAll(loadConfig())],
+  ['POST', /^\/api\/readiness\/check$/, async (_m, req) => {
+    const b = await body(req);
+    const kind = String(b.kind ?? '');
+    if (!['connection', 'review', 'write'].includes(kind)) throw new HttpError(400, 'kind must be connection, review or write');
+    const target = String(b.target ?? '');
+    bus.emit({ t: 'readiness', target, view: await readiness.describe(loadConfig(), target) });
+    const pending = readiness.check(loadConfig(), target, kind as CheckKind, { confirmCost: b.confirmCost === true });
+    // Report "checking" right away; the result follows on the event stream and in the reply.
+    setTimeout(() => void readiness.describe(loadConfig(), target).then((view) => view.status === 'checking' && bus.emit({ t: 'readiness', target, view })), 50);
+    const view = await pending;
+    bus.emit({ t: 'readiness', target, view });
+    return view;
+  }],
+  ['POST', /^\/api\/readiness\/cancel$/, async (_m, req) => ({ cancelled: readiness.cancel(String((await body(req)).target ?? '')) })],
   ['POST', /^\/api\/runs$/, async (_m, req) => runs.start(await body(req))],
   ['GET', /^\/api\/runs\/([\w.-]+)$/, (m) => runs.get(m[1])],
   ['DELETE', /^\/api\/runs\/([\w.-]+)$/, (m) => { runs.remove(m[1]); return { ok: true }; }],
@@ -282,7 +303,8 @@ const routes: [string, RegExp, Handler][] = [
   }],
   ['POST', /^\/api\/runs\/([\w.-]+)\/override$/, async (m, req) => {
     const b = await body(req);
-    return runs.override(m[1], String(b.target ?? ''), String(b.spec ?? ''));
+    try { return await runs.override(m[1], String(b.target ?? ''), String(b.spec ?? ''), { confirmCloudHandoff: b.confirmCloudHandoff === true }); }
+    catch (e) { if (e instanceof CloudHandoffError) throw new HttpError(409, e.message); throw e; }
   }],
   ['POST', /^\/api\/runs\/([\w.-]+)\/workspace$/, async (m, req) => {
     const a = String((await body(req)).action ?? '');
@@ -304,7 +326,7 @@ const routes: [string, RegExp, Handler][] = [
   ['PUT', /^\/api\/config$/, async (_m, req) => {
     const b = await body(req);
     if (b.qwenProfiles !== undefined) {
-      try { validateQwenProfiles(b.qwenProfiles); } catch (e) { throw new HttpError(400, (e as Error).message); }
+      try { validateProfilesForSave(b.qwenProfiles, loadConfig().qwenProfiles as unknown as Record<string, unknown>); } catch (e) { throw new HttpError(400, (e as Error).message); }
     }
     if (b.deepseek !== undefined) {
       try { validateDeepSeekSettings(b.deepseek); } catch (e) { throw new HttpError(400, (e as Error).message); }
@@ -315,16 +337,6 @@ const routes: [string, RegExp, Handler][] = [
     Object.assign(cfg, next);
     return state();
   }],
-  ['POST', /^\/api\/qwen\/test$/, async (_m, req) => {
-    const b = await body(req);
-    const profile = loadConfig().qwenProfiles[String(b.profile ?? '')];
-    if (!profile) throw new HttpError(400, 'unknown Qwen profile');
-    let cli;
-    try { cli = resolveQwenBin(loadConfig()); } catch { /* reachability is still testable */ }
-    const result = await probeQwenProfile(profile, cli);
-    if (result.toolUse === 'verified') runs.verifyQwenProfile(String(b.profile), profile);
-    return result;
-  }],
   ['POST', /^\/api\/deepseek\/models$/, async () => {
     try { return { models: await discoverDeepSeek(loadConfig().deepseek), baseUrl: DEEPSEEK_BASE_URL }; }
     catch (e) { throw new HttpError(400, (e as Error).message); }
@@ -334,6 +346,8 @@ const routes: [string, RegExp, Handler][] = [
     if (!c.localModelsEnabled) throw new HttpError(400, 'Local Models are disabled');
     const profile = c.qwenProfiles[String((await body(req)).profile ?? '')];
     if (!profile || profile.kind !== 'local' || profile.enabled === false) throw new HttpError(400, 'Select an enabled local profile');
+    const issue = profileIssues(profile.name, profile)[0];
+    if (issue) throw new HttpError(400, issue);
     try { return { models: await discoverModels(profile.baseUrl, profile.keyEnv) }; }
     catch (e) { throw new HttpError(400, (e as Error).message); }
   }],
@@ -376,7 +390,7 @@ function ready(): void {
   const port = typeof addr === 'object' && addr ? addr.port : 0;
   const url = `http://127.0.0.1:${port}`;
   chats = new ChatManager(bus, cfg, bins, perms, { url, token }, MCP_SCRIPT);
-  runs = new RunManager(bus, cfg);
+  runs = new RunManager(bus, cfg, readiness);
   process.stdout.write(JSON.stringify({ ready: true, url, token, platform: IS_WIN ? 'win32' : IS_MAC ? 'darwin' : process.platform }) + '\n');
   // Ask both CLIs their versions in the background now, so a run started later (which records them
   // synchronously) finds them remembered instead of starting each CLI on the engine's thread.

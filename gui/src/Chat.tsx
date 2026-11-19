@@ -280,6 +280,7 @@ function TurnView({ chat, turn, partner, last }: { chat: ChatSession; turn: Chat
   const updateHint = turn.error && /claude update|or newer is required/i.test(turn.error);
   return (
     <div class="turn">
+      {turn.newContext && <div class="context-break" role="note"><span>{turn.newContext}</span></div>}
       <div class="user-row"><div class="user-bubble">{turn.user}</div></div>
       <div class="assistant">
         <div class="assistant-head">

@@ -46,62 +46,76 @@ For a versioned release, download the source bundle and `SHA256SUMS` from [GitHu
 
 Then open **Duo** from your launcher, or run `duo gui`.
 
-### Qwen Code (experimental, Linux)
+### Optional models: DeepSeek and local/hosted endpoints (Linux)
 
-Install [Qwen Code](https://github.com/QwenLM/qwen-code) separately and sign in using its supported authentication, or select a Duo-managed OpenAI-compatible endpoint profile. Qwen must be on `PATH`, or set `DUO_QWEN_BIN` to its executable/script (an optional `qwenBin` in Duo's JSON config also works). Qwen integration currently **requires Linux with `/usr/bin/bwrap` (Bubblewrap)** and fails closed if that sandbox is unavailable; macOS/Windows Qwen sessions are not yet supported. Claude and Codex behavior on those platforms is unchanged.
+Claude Code and Codex work exactly as before with both optional integrations **off**, which is the default. Turning one on never changes Claude or Codex settings, and a disabled integration or profile makes no connections and shows no startup warnings.
 
-Under **Settings → General → Qwen endpoint profiles**, save a profile such as:
+Duo keeps four things apart, and shows each of them in Settings and in the model picker:
 
-```json
-{
-  "local": {
-    "name": "My Ollama server",
-    "kind": "local",
-    "model": "qwen3-coder",
-    "baseUrl": "http://127.0.0.1:11434/v1"
-  }
-}
-```
+| | DeepSeek | Local or hosted endpoint profile |
+|---|---|---|
+| **Coding engine** (runs the agent loop and tools) | Codex | Qwen Code |
+| **Model provider** | DeepSeek API | your inference server (Ollama, LM Studio, vLLM…) or a hosted OpenAI-compatible endpoint |
+| **Model** | e.g. `deepseek-flash` | the profile's exact model ID |
+| **Where it runs** | Cloud | judged from the endpoint **address**: *On this device* (loopback), *Local network* (private/LAN address, explicit opt-in), or *Cloud* |
 
-This configuration does not install a model. Start the inference server and make sure its model is already available and supports agent tool calling. Hosted endpoints require HTTPS; set `"kind": "hosted"`, your provider's `/v1` base URL, and optionally `"keyEnv": "MY_QWEN_API_KEY"`. Export that environment variable **before starting Duo**; do not paste its value into Duo's config. For a local server requiring a token, `keyEnv` can refer to that token's variable as well. To use Qwen Code's own current login/provider configuration, pick the plain Qwen model without a Duo endpoint profile.
+#### Setup
 
-Save and reopen Settings, then click **Test saved profile**. The result distinguishes HTTP reachability/model listing from a real file-reading agent tool invocation. Automatic assignment includes a Qwen profile only after this tool-use test passes in the current Duo server session; test again after restarting Duo or changing the profile.
+- **DeepSeek:** set `DEEPSEEK_API_KEY` (or another variable you name) in the environment **before starting Duo**, then **Settings → DeepSeek → Enable**, choose model IDs and save. The key itself is never saved, put in command arguments, logged or exported.
+- **Local models:** start your own OpenAI-compatible server (Duo never installs a server or downloads weights). **Settings → Local Models → Enable**, add a profile with the endpoint (e.g. `http://127.0.0.1:11434/v1`) and exact model ID, and save. **Discover models** lists what the server offers.
+  - An address on your LAN (e.g. `http://192.168.1.20:11434/v1`) needs **Allow local-network endpoint**. A "local" profile pointing at a remote/public address is refused; configure that as a hosted profile.
+  - A key sent to anything other than this device must use HTTPS: an authenticated plain-HTTP LAN or remote endpoint is refused. Loopback HTTP is fine.
+- **Hosted endpoints:** **Settings → General → Hosted Qwen endpoint profiles**. HTTPS only, and the profile **must name its own API-key variable**: Duo never falls back to `OPENAI_API_KEY` or any other provider's key.
+- **Qwen Code harness:** endpoint profiles run through [Qwen Code](https://github.com/QwenLM/qwen-code), on `PATH` or via `DUO_QWEN_BIN` / `qwenBin`. Duo has verified the tool set and flags of **Qwen Code 0.28.x** and refuses other releases (fail closed), because an unknown release may ship tools Duo cannot restrict. Qwen also requires **Linux with `/usr/bin/bwrap` (Bubblewrap)**; there is no unsandboxed fallback. **Settings → Setup check** reports both.
 
-In **New run**, choose Qwen under a seat's model picker. In Pair, put Qwen in the Writer or Reviewer position, choose a Git worktree and a verification command, and review the changes before applying. You can also choose Manual, Automatic, or Hybrid assignment. Automatic uses available agent CLIs and tool-verified Qwen profiles; Hybrid lets you pin individual seat assignments while Duo fills the rest. Local First prefers verified local Qwen profiles, Cloud First favors Codex/Claude then verified hosted Qwen, and Best Fit uses a fixed eligible-provider order (Codex, Claude, verified Qwen), **not** fabricated quality or price scores. Pair review uses a separate engine when automatically assigned.
+Older saved profiles that break these rules stay saved and are shown as *Unsupported* with the reason; fix them in Settings. Saving other settings is not blocked by an unchanged older profile.
 
-During an active run, **Pause next turn** waits until the next agent-turn boundary, **Queue instruction** targets an agent or future coordinator turns, **Queue assignment** replaces a selected agent/model before its next eligible turn while retaining its access restrictions, and **Resume** releases the boundary. A cross-provider assignment starts a fresh agent session but supplies bounded prior completed replies and keeps workflow decisions. An active tool call is not interrupted by Pause; **Stop** cancels it. Completed turns, run files and the instruction/assignment ledger are retained. After a process crash or app restart, the prior active execution is **not resumable in place**: inspect the saved run/worktree and use **Continue** for supported protocols to start a new run with saved session identifiers, pending instructions and pending overrides. Do not assume an interrupted in-flight tool action is safe to replay automatically. Some modes without Continue support require a new run.
+#### Role readiness: proving a model can do the job
 
-Qwen's adapter uses non-interactive structured streaming, Qwen session IDs for subsequent turns, CLI model selection, and a separately configured Bubblewrap tool sandbox. Qwen writers receive workspace-write access with network closed; reviewers receive read-only access and excluded write/shell tools. Qwen's own permission modes are not a substitute for that host-enforced sandbox. Live-provider behavior (including Qwen version-specific flags, endpoint authentication, tool calls and resume) must be checked on your machine: repository tests use fake CLI processes and do not verify a real hosted/local inference model.
+A reachable endpoint, a model list, or a model's name says nothing about whether the model can act as a coding agent. Each saved optional model therefore has three explicit, user-triggered tests in Settings:
 
-### DeepSeek (optional)
+| Test | What it proves |
+|---|---|
+| **Test connection** | The endpoint answers, accepts the credential, and lists the model. No text is generated. |
+| **Test reviewer** | In a disposable git repository (never your project), the agent read a file **with a tool** and returned its contents. The reviewer boundary was checked: Qwen's own `qwen sandbox --verify` passed under the read-only, network-closed policy, the launch carried the reviewer tool deny list, and requested writes (inside and outside the workspace) left everything unchanged. |
+| **Test writer** | In a separate disposable workspace the agent created a file with the requested content using a write tool, and a write outside the workspace did not land. |
 
-DeepSeek is a **model provider**; Duo uses the installed **Codex coding engine** to run its repository tools, git workflow and sandbox. No global Codex configuration is replaced. DeepSeek is **off by default** and does not contact the API while disabled.
+Each test is bounded (connection 10 s, sandbox check 30 s, model task 120 s), can be cancelled, and removes its folder afterwards. Failures say why: unreachable endpoint, rejected key, no tool calls (the model or server lacks tool calling), malformed stream, timeout, missing sandbox, or a boundary violation. **Cloud models** (DeepSeek, hosted endpoints) ask you to confirm before the reviewer/writer tests, because they send a few short prompts that the provider may bill.
 
-1. Obtain a DeepSeek API key and set `DEEPSEEK_API_KEY` in the environment **before launching Duo**. For example, on Linux/macOS: `export DEEPSEEK_API_KEY='your-key'` in the shell that starts Duo. Do not put the value into Duo's JSON settings or a seat spec.
-2. Open **Settings → DeepSeek**, enable the integration, and save. The default identifiers match the current published Flash and Pro offerings: `deepseek-flash` and `deepseek-v4-pro`. Use **Test connection and discover models** to fetch the API's current list, or enter a documented identifier manually.
-3. Select **DeepSeek · deepseek-flash** in a Codex seat's model picker, or use `codex:deepseek-flash@high+provider=deepseek` from the CLI. The label indicates Codex is the harness and DeepSeek is the API host.
-4. For a mixed-model Pair, assign that seat as writer and `claude:sonnet@medium` as reviewer (or reverse their positions), choose a git worktree and a check command, then inspect the result before applying.
+Results are kept **in memory only** and are tied to the profile, endpoint, model, credential variable, harness version, sandbox and Duo's tool policy. After a restart, or any change to those, the model shows *Needs a new test*. Status labels: *Disabled*, *Unsupported*, *Not tested*, *Unreachable*, *Connected · roles not verified*, *Role test failed*, *Verified: reviewer*, *Verified: writer*, *Verified: reviewer and writer*.
 
-DeepSeek API calls may incur charges. Duo does **not** turn on DeepSeek's paid web search or URL tools. Its Codex route uses the Responses API, preserves the provider setting when resuming turns, and passes only an environment-variable **name** in CLI arguments. Usage tokens appear when Codex reports them; DeepSeek API charges show as *unpriced* until a verified rate card is supported. The Codex CLI's own sandbox must function on the computer. See [DeepSeek's Codex integration](https://api-docs.deepseek.com/quick_start/agent_integrations/codex/) and [Responses API compatibility](https://api-docs.deepseek.com/guides/responses_api/) for model-specific limits. In particular, the API is stateless: an agent harness must send prior context, and some OpenAI features are unsupported. A successful model-list request does not verify actual code-editing behavior.
+#### Using optional models in runs
 
-### Local Models (optional)
+- **Every workflow enforces the same rule** (Pair, Review, Ask, Debate, Council, continuations, queued reassignments and custom templates): an optional model may hold a **writer** role only after passing the writer test, and any other role (reviewer, participant, chair) only after passing the reviewer test. Codex and Claude Code need no test. The run setup shows the exact reason before you start, and the executor checks again when it opens each agent.
+- **Manual** assignment uses your choices exactly and explains any ineligible one. **Automatic** considers only optional models with a verified role, plus available Codex/Claude CLIs; **Hybrid** keeps your pinned seats. If no eligible agent exists for a slot, the run does not start: Duo never substitutes a model silently. Local First / Cloud First / Best Fit are fixed orderings, not quality scores.
+- A **Qwen writer** always runs inside Bubblewrap with workspace-write access. *Sandboxed + network* opens command networking for it; *Full access* is refused for Qwen. Host-side web tools (`web_fetch`, `web_search`) are never available to Qwen seats, and reviewers get only read/search tools. If Qwen's folder trust is enabled and the workspace is untrusted, Qwen silently downgrades write access; Duo detects this and stops the turn with instructions instead of reporting a writer that cannot write.
+- Pair worktrees, the independent reviewer, revision cycles, verification commands, the completion check and **human approval before applying** are unchanged. Stop cancels running work, and a turn cancelled during a queued reassignment never starts afterwards.
 
-1. Start an existing OpenAI-compatible local inference server, such as Ollama (`http://127.0.0.1:11434/v1`), LM Studio (commonly `http://127.0.0.1:1234/v1`) or vLLM (commonly `http://127.0.0.1:8000/v1`). Duo will not install or launch a server or download model weights.
-2. Open **Settings → Local Models**, enable it, create a named profile, enter the endpoint and exact model ID, then save. The default endpoint is only an example; no server is assumed to be running. Use an environment-variable name if your server requires a key. Disable any saved profile individually without deleting it.
-3. Reopen Settings and choose **Discover models**. If the server does not implement `GET /models`, enter the ID manually. Choose **Test coding tools** to verify a real file-reading tool invocation before allowing automatic assignment.
-4. Select the enabled profile from the Qwen Code model picker (labelled **Local model · via Qwen Code**). For Pair, use a local Qwen writer and a Claude or Codex reviewer. Read-only reviewers and writers require Linux Bubblewrap; on unsupported hosts Duo refuses to run Qwen rather than weakening isolation.
+#### Privacy boundaries
 
-The profile's **Declared model capabilities** section is user-supplied metadata, not an automatically verified rating. Unknown or incompatible tool support is shown explicitly; a model declared to lack tool calling is refused as a coding agent. Local and DeepSeek integrations can both be disabled without changing Claude or Codex settings. Earlier Qwen local profiles remain available after an upgrade if they were already configured, unless you turn off Local Models.
+- Task context goes to whichever provider each seat uses: DeepSeek's cloud, your hosted endpoint, or your own server. A Pair reviewer sees the writer's diff by design.
+- **Switching providers never carries a stored conversation along.** In chat, moving to another provider or endpoint (or editing the profile's endpoint) starts a new conversation and says so; earlier messages from a local model are not sent. In a run, reassigning a seat that ran on this device or your LAN to a cloud model asks you to confirm, because Duo forwards up to three of that seat's earlier replies; unconfirmed, the cloud model starts without them. A recorded session is resumed only on the backend that created it.
+- For endpoint profiles, the Qwen process (and anything the model runs) receives only that profile's own key; other credential variables in Duo's environment are removed, and the key is redacted from streams, traces and errors.
+- Duo points Qwen at its own operator policy file through `QWEN_CODE_SYSTEM_SETTINGS_PATH`; this replaces any `/etc/qwen-code/settings.json` policy for Duo's Qwen seats.
 
-Common problems:
+#### Example: mixed-provider Pair
 
-- **DeepSeek disabled / API key missing:** enable it in Settings, set `DEEPSEEK_API_KEY` in the Duo process environment, and restart Duo. Invalid keys produce an authentication error only when you test or run DeepSeek.
-- **Endpoint unavailable / model not listed:** start the local server, check the endpoint address and `/v1` suffix, and confirm the exact model ID. A manual ID still needs a real compatible endpoint.
-- **Tool verification failed:** network connectivity is not sufficient; check that your model and server implement agent tool calls. Automatic assignment excludes unverified local profiles.
-- **Qwen Code / Bubblewrap missing:** local coding roles are not available. Claude/Codex still work normally. On macOS and Windows, local Qwen coding remains unsupported until a verified equivalent sandbox is implemented.
-- **Codex read-only sandbox errors:** the host OS may block Codex's sandbox. Do not turn off review isolation to work around it; run a supported host environment.
+1. Make sure the writer has passed **Test writer** (e.g. DeepSeek `deepseek-flash`, or a local profile) in Settings.
+2. **New run → Pair**. Writer: pick **DeepSeek · deepseek-flash** (Codex model picker) or your local profile (Qwen model picker). Reviewer: `claude:sonnet@medium` or a Codex model.
+3. Choose **Git worktree**, writer access **Sandboxed**, and a check command such as `npm test`.
+4. Start, watch the cycles, then review the diff and **Apply**, **Keep** or **Discard**. CLI equivalent: `duo pair -s codex:deepseek-flash@high+provider=deepseek -s claude:sonnet@medium --check "npm test" -C ~/code/app "Fix the failing parser test"` (the CLI does not run readiness tests; it relies on you to choose eligible models).
 
-DeepSeek sends the task context to DeepSeek's cloud API; loopback local profiles send it to the configured local server. If you intentionally configure a non-loopback endpoint, traffic leaves your machine. Credentials are read from environment variables, never stored in exported runs, and never embedded in Codex command arguments. See [SECURITY.md](SECURITY.md).
+#### Troubleshooting
+
+- **Unsupported: set `KEY` in the environment:** export the variable in the shell that starts Duo, then restart Duo.
+- **Unreachable / model not listed:** start the server; check the address, the `/v1` suffix and the exact model ID.
+- **"made no tool calls":** the model or the server's chat template does not support tool calling. Pick a tool-capable model or server configuration; connectivity alone is not enough.
+- **Sandbox not established / Bubblewrap missing:** install Bubblewrap and make sure unprivileged user namespaces are allowed. Claude and Codex keep working.
+- **Qwen Code X is not verified by Duo:** install Qwen Code 0.28.x.
+- **Needs a new test:** a setting, the harness or Duo restarted since the last test; run it again.
+- **Codex read-only sandbox errors (DeepSeek):** the host may block Codex's sandbox. Do not disable review isolation to work around it.
+
+**Limitations.** The repository's tests use fake Qwen/Codex CLIs and fake endpoints: they verify Duo's routing, isolation, gating and evidence handling, not any real model's ability. Whether a given model passes the role tests depends on the model, server and harness on your machine. macOS and Windows are not supported for optional models in this release. Usage from DeepSeek and endpoint profiles is shown as *unpriced*.
 
 Notes:
 

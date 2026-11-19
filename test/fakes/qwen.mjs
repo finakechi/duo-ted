@@ -4,8 +4,18 @@ import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { instance, record, valueOf } from './common.mjs';
 
-const args = process.argv.slice(2);
-if (args[0] === '--version') { console.log('0.999.0 (fake Qwen Code)'); process.exit(0); }
+import { existsSync, readFileSync } from 'node:fs';
+
+// --fake-version=X (a BinSpec argument) stands in for another installed release.
+const all = process.argv.slice(2);
+const version = (all.find((a) => a.startsWith('--fake-version=')) ?? '--fake-version=0.28.0').split('=')[1];
+const args = all.filter((a) => !a.startsWith('--fake-version='));
+if (args[0] === '--version') { console.log(version); process.exit(0); }
+if (args[0] === 'sandbox') {
+  record({ cli: 'qwen', action: 'sandbox', args, systemPolicy: process.env.QWEN_CODE_SYSTEM_SETTINGS_PATH, qwenHome: process.env.QWEN_HOME });
+  if (process.env.FAKE_QWEN_SANDBOX === 'fail') { console.error('bwrap: setting up uid map: Permission denied'); process.exit(1); }
+  console.log('Tool boundary: bwrap (full)'); process.exit(0);
+}
 let prompt = '';
 for await (const line of createInterface({ input: process.stdin })) prompt += line + '\n';
 const mode = process.env.FAKE_QWEN_MODE || '';
@@ -13,7 +23,49 @@ const session = valueOf(args, '--resume') || '00000000-0000-4000-8000-0000000000
 const schema = valueOf(args, '--json-schema');
 record({ cli: 'qwen', args, prompt, cwd: process.cwd(), session, endpoint: process.env.OPENAI_BASE_URL || undefined,
   // Never print or record API keys; tests only inspect whether the key exists.
-  hasKey: Boolean(process.env.OPENAI_API_KEY), usesPlaceholderKey: process.env.OPENAI_API_KEY === 'ollama', systemPolicy: process.env.QWEN_CODE_SYSTEM_SETTINGS_PATH || undefined });
+  hasKey: Boolean(process.env.OPENAI_API_KEY), usesPlaceholderKey: process.env.OPENAI_API_KEY === 'ollama', systemPolicy: process.env.QWEN_CODE_SYSTEM_SETTINGS_PATH || undefined,
+  // Names only: which other credentials leaked into the child environment.
+  credentialNames: Object.keys(process.env).filter((k) => /(API_?KEY|TOKEN|SECRET)$/.test(k) && k !== 'OPENAI_API_KEY'), qwenHome: process.env.QWEN_HOME });
+if (mode === 'trust-downgrade' && valueOf(args, '--approval-mode') === 'yolo') {
+  process.stderr.write('Approval mode overridden to "default" because the current folder is not trusted.\n');
+  await new Promise((resolve) => setTimeout(resolve, 20_000));
+}
+if (mode === 'echo-key') {
+  // A sandboxed command that prints the key it was given; Duo must redact it from the stream.
+  const out = (o) => process.stdout.write(JSON.stringify(o) + '\n');
+  out({ type: 'tool_use', id: 'k', name: 'run_shell_command', input: { command: 'env' } });
+  out({ type: 'tool_result', tool_use_id: 'k', content: `OPENAI_API_KEY=${process.env.OPENAI_API_KEY}`, is_error: false });
+  out({ type: 'result', subtype: 'success', is_error: false, session_id: session, result: `key is ${process.env.OPENAI_API_KEY}` });
+  process.exit(0);
+}
+// Readiness probes: answer like a tool-capable agent (or a broken one) in the disposable repository.
+if (prompt.includes('automated Duo capability test')) {
+  const out = (o) => process.stdout.write(JSON.stringify(o) + '\n');
+  const probe = process.env.FAKE_QWEN_PROBE || 'honest';
+  const plan = valueOf(args, '--approval-mode') === 'plan';
+  out({ type: 'system', subtype: 'session_start', session_id: session });
+  if (probe === 'notools') {
+    out({ type: 'result', subtype: 'success', is_error: false, session_id: session, result: 'I cannot access files.' });
+    process.exit(0);
+  }
+  if (probe === 'escape' && plan) writeFileSync(join(process.cwd(), 'review-write-attempt.txt'), 'test\n');
+  if (prompt.includes('read the file proof.txt')) {
+    const content = existsSync('proof.txt') ? readFileSync('proof.txt', 'utf8').trim() : '';
+    out({ type: 'tool_use', id: 'r1', name: 'read_file', input: { path: 'proof.txt' } });
+    out({ type: 'tool_result', tool_use_id: 'r1', content, is_error: false });
+    out({ type: 'result', subtype: 'success', is_error: false, session_id: session, result: content });
+    process.exit(0);
+  }
+  const marker = /DUO_WRITE_PROOF_\w+/.exec(prompt)?.[0];
+  if (!plan && marker) {
+    writeFileSync(join(process.cwd(), 'duo-writer-proof.txt'), marker + '\n');
+    out({ type: 'tool_use', id: 'w1', name: 'write_file', input: { file_path: 'duo-writer-proof.txt' } });
+    out({ type: 'tool_result', tool_use_id: 'w1', content: 'ok', is_error: false });
+    if (probe === 'escape-write') { const outside = /try to create (\S+) containing/.exec(prompt)?.[1]; if (outside) writeFileSync(outside, 'test\n'); }
+  }
+  out({ type: 'result', subtype: 'success', is_error: false, session_id: session, result: 'done' });
+  process.exit(0);
+}
 if (mode === 'exit') { process.stderr.write('invalid authentication or unknown model\n'); process.exit(2); }
 if (mode === 'wait') { await new Promise((resolve) => setTimeout(resolve, 20_000)); }
 if (mode === 'malformed') { console.log('{broken json'); process.exit(0); }

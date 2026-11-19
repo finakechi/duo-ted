@@ -15,7 +15,7 @@ import { classifyError, errorHint } from '../errors.ts';
 import { claudeRoute, claudeSink, codexRoute, dropCodexRoute } from '../hooks.ts';
 import { ClaudeTranslator, CodexTranslator, QwenTranslator, type Block } from '../live.ts';
 import { executeQwen } from '../qwen.ts';
-import { deepseekForSeat, validateProviderSeat } from '../providers.ts';
+import { backendKey, deepseekForSeat, seatLocation, validateProviderSeat } from '../providers.ts';
 import { parseQwenStream } from '../tap.ts';
 import { DUO_HOME } from '../paths.ts';
 import { killTree, nodeRunner } from '../platform.ts';
@@ -72,6 +72,8 @@ export interface ChatTurn {
   unpriced?: string;
   error?: string;
   hint?: string;
+  /** Set when this turn began a new provider conversation: earlier turns were not sent to it. */
+  newContext?: string;
 }
 
 export interface ChatSession {
@@ -89,6 +91,8 @@ export interface ChatSession {
   claudeStarted?: boolean;
   codexThreadId?: string;
   qwenSessionId?: string;
+  /** Backend that holds codexThreadId / qwenSessionId (see providers.backendKey). */
+  backendKey?: string;
   codexTotals?: Usage;
   claudeCost?: number;
   turns: ChatTurn[];
@@ -220,16 +224,37 @@ export class ChatManager {
     return s;
   }
 
-  update(id: string, patch: Partial<Pick<ChatSession, 'title' | 'spec' | 'access' | 'useCodexConfig' | 'cwd' | 'pinned'>>): ChatSession {
+  update(id: string, patch: Partial<Pick<ChatSession, 'title' | 'spec' | 'access' | 'useCodexConfig' | 'cwd' | 'pinned'>>): ChatSession & { notice?: string } {
     const s = this.get(id);
     if (patch.spec !== undefined || patch.access !== undefined) this.validate(s.engine, patch.spec ?? s.spec, patch.access ?? s.access);
-    if (patch.spec && parseSeat(patch.spec, 'A', this.cfg.defaults).provider !== parseSeat(s.spec, 'A', this.cfg.defaults).provider) s.codexThreadId = undefined;
+    let notice: string | undefined;
+    if (patch.spec && patch.spec !== s.spec) notice = this.switchBackend(s, parseSeat(patch.spec, 'A', this.cfg.defaults));
     if (patch.cwd !== undefined && !existsSync(patch.cwd)) throw new Error(`folder does not exist: ${patch.cwd}`);
     Object.assign(s, Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined)));
     if (patch.title === undefined && patch.pinned === undefined) s.updatedAt = new Date().toISOString();
     this.save(s);
     if (!this.drafts.has(s.id)) this.bus.emit({ t: 'chat', chat: this.summary(s) });
-    return s;
+    return notice ? { ...s, notice } : s;
+  }
+
+  /**
+   * A stored conversation stays with the provider that holds it. Moving a chat to another provider
+   * or endpoint drops the stored session so the next turn starts a new conversation there; the
+   * earlier turns, including local tool output, are not transmitted. Returns the user-facing notice.
+   */
+  private switchBackend(s: ChatSession, next: Seat): string | undefined {
+    const held = !!(s.codexThreadId || s.qwenSessionId);
+    const key = backendKey(this.cfg, next);
+    const previous = s.backendKey ?? (held ? backendKey(this.cfg, parseSeat(s.spec, 'A', this.cfg.defaults)) : undefined);
+    if (!held || previous === key) return undefined;
+    s.codexThreadId = undefined;
+    s.qwenSessionId = undefined;
+    s.backendKey = undefined;
+    const from = seatLocation(this.cfg, parseSeat(s.spec, 'A', this.cfg.defaults));
+    const to = seatLocation(this.cfg, next);
+    return from !== 'cloud' && to === 'cloud'
+      ? 'The next message starts a new conversation with a cloud model. Earlier messages from the local model stay on this device and are not sent.'
+      : 'The next message starts a new conversation with this provider; earlier messages in this chat are not sent to it.';
   }
 
   async remove(id: string): Promise<void> {
@@ -423,6 +448,16 @@ export class ChatManager {
 
   private async runTurn(s: ChatSession, turn: ChatTurn, text: string): Promise<void> {
     const started = Date.now();
+    if (s.engine === 'codex') {
+      const key = backendKey(this.cfg, parseSeat(s.spec, 'A', this.cfg.defaults));
+      if (s.codexThreadId && s.backendKey && s.backendKey !== key) {
+        s.codexThreadId = undefined;
+        turn.newContext = 'New conversation: the model provider changed, so earlier messages were not sent to it.';
+      } else if (!s.codexThreadId && s.turns.length > 1) {
+        turn.newContext = 'New conversation: earlier messages in this chat were not sent to this model.';
+      }
+      s.backendKey = key;
+    }
     let stopped = false;
     let clawName = '';
     this.running.set(s.id, { turn, stop: () => {
@@ -504,12 +539,22 @@ export class ChatManager {
       const profile = seat.profile ? this.cfg.qwenProfiles[seat.profile] : undefined;
       if (seat.profile && !profile) throw new Error(`unknown Qwen profile ${seat.profile}`);
       if (profile && profile.model !== seat.model) throw new Error(`Qwen profile ${seat.profile} requires model ${profile.model}`);
+      // The profile's endpoint may have changed in Settings since the session was stored.
+      const key = backendKey(this.cfg, seat);
+      if (s.qwenSessionId && s.backendKey !== key) {
+        s.qwenSessionId = undefined;
+        turn.newContext = 'New conversation: the model endpoint changed, so earlier messages were not sent to it.';
+      } else if (!s.qwenSessionId && s.turns.length > 1 && !turn.newContext) {
+        turn.newContext = 'New conversation: earlier messages in this chat were not sent to this model.';
+      }
+      s.backendKey = key;
+      if (stopped) throw new Error('stopped');
       const result = await executeQwen({ bin: resolveQwenBin(this.cfg), model: seat.model, cwd: s.cwd,
         system: 'Follow the user instructions while preserving workspace permissions.', message,
         timeoutSec: this.cfg.timeoutSec.qwen, resumeId: s.qwenSessionId, profile,
         access: s.access === 'read-only' ? 'read' : 'write', configDir: CHATS_DIR, id: s.id,
         onLine: (line) => { events.push(line); this.onLine(s.id, line); }, onProcess: (p) => { proc = p; if (stopped) killTree(p?.pid); } });
-      if (result.sessionId) s.qwenSessionId = result.sessionId;
+      if (result.sessionId && !stopped) s.qwenSessionId = result.sessionId;
       const parsed = parseQwenStream(events.join('\n'));
       error = parsed.error ?? result.error;
       usage = parsed.usage;

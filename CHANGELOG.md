@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Optional models are now usable for coding roles on Linux with evidence. Each saved DeepSeek model or Qwen endpoint profile has explicit **Test connection**, **Test reviewer** and **Test writer** checks that run in disposable repositories with strict timeouts, cancellation and cleanup, ask before paid cloud calls, and keep connection, read and write evidence separate. Results live in memory and are invalidated by restarts or any relevant change. Settings and model pickers show engine, provider, model and where the model runs, with the verified roles.
+- Every workflow (Pair, Review, Ask, Debate, Council, continuations, reassignments and custom templates) lets an optional model hold a writer role only after its writer test and any other role only after its reviewer test. Run setup explains an ineligible choice before starting; automatic and hybrid assignment use verified roles and fail explicitly instead of substituting a model.
+- Security: hosted Qwen profiles no longer fall back to `OPENAI_API_KEY` (in runs and in tests); a profile's Qwen process receives only its own key, other credentials are removed from its environment, and the key is redacted from streams and errors.
+- Security: endpoint location comes from the address (device, explicitly allowed LAN, or cloud); remote "local" profiles and authenticated plain-HTTP off-device endpoints are refused. Older saved profiles stay visible as unsupported with the reason.
+- Security: Qwen seats require a verified Qwen Code release (0.28.x) and exclude every tool their role does not need, including host-side `web_fetch`/`web_search`; writer network settings take effect, full access is refused, and Qwen's folder-trust downgrade of a writer is detected.
+- Cancellation: a Stop while a queued reassignment is opening its agent can no longer start the turn, and an agent opened during the stop is closed.
+- Switching provider or endpoint never carries a stored conversation along: chats start a new conversation and say so; a local-to-cloud reassignment in a run asks before forwarding earlier replies; a recorded session resumes only on the backend that created it.
+
 - Optional DeepSeek Flash/Pro support through a per-seat Codex Responses API route (no changes to global Codex settings), with model discovery, an explicit enable switch, no automatic paid web search, and unpriced third-party usage rather than fabricated plan credits.
 - Optional local OpenAI-compatible model profiles in Settings, with endpoint/model entry, model discovery, profile toggles, declared capability warnings and existing Qwen Code tool-use verification. Old configured Qwen local profiles are preserved.
 - Coding engine and model provider are distinguished in model pickers and coordination-template selectors; provider/locality filters can be authored in the visual template builder and executed by the shared workflow runtime.

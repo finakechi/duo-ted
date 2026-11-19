@@ -2,14 +2,14 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { binVersion, resolveClaudeBin, resolveCodexBin, resolveQwenBin, type Config } from '../config.ts';
-import { Engines, type LiveUpdate, type SeatSession, type SendOpts } from '../engine.ts';
+import { CANCELLED, Engines, type EngineHooks, type LiveUpdate, type SeatSession, type SendOpts } from '../engine.ts';
 import { classifyError, errorHint } from '../errors.ts';
 import type { Block } from '../live.ts';
 import { PROJECT_ROOT } from '../paths.ts';
 import { formatDelta, formatWindows, snapshot } from '../quota.ts';
 import { fmtTurnLine } from '../render.ts';
 import { formatSeat, parseSeat, seatLabel, type Seat } from '../seats.ts';
-import { validateProviderSeat } from '../providers.ts';
+import { seatLocation, validateProviderSeat } from '../providers.ts';
 import { RunStore, type QuotaSnapshot, type RunMeta, type TurnRecord } from '../store.ts';
 
 export type RunEvent =
@@ -37,6 +37,13 @@ export interface RunOptions {
   workspace?: boolean;
   /** Live progress for the GUI; receives every event with the run id. */
   sink?: (e: RunEvent & { run: string; }) => void;
+  /** Role readiness for optional models (the desktop app's verified tests); see Engines. */
+  eligibility?: EngineHooks['eligibility'];
+}
+
+/** Thrown by RunContext.override when a local model's history would go to a cloud model unconfirmed. */
+export class CloudHandoffError extends Error {
+  readonly code = 'cloud_handoff_confirmation';
 }
 
 /** Thrown inside a protocol when the run was cancelled or cannot usefully continue. */
@@ -99,8 +106,8 @@ export class RunContext {
   private controlState: 'running' | 'pause_requested' | 'paused' = 'running';
   private resumeWaiters: (() => void)[] = [];
   private pendingInstructions: { target: string; text: string; at: string }[] = [];
-  private pendingOverrides: { target: string; spec: string; at: string }[] = [];
-  private appliedOverrides: { target: string; from: string; to: string; at: string }[] = [];
+  private pendingOverrides: { target: string; spec: string; at: string; cloudHandoff?: boolean }[] = [];
+  private appliedOverrides: { target: string; from: string; to: string; at: string; cloudHandoff?: boolean; rejected?: string }[] = [];
   private coordinatorNotes: string[] = [];
   private deliveredInstructions: { target: string; text: string; at: string }[] = [];
 
@@ -110,6 +117,7 @@ export class RunContext {
     this.store = store;
     this.quotaBefore = quota;
     this.engines = makeEngines(store, cfg, bins, this);
+    for (const seat of opts.seats) if (seatLocation(cfg, seat) !== 'cloud') this.everLocal.add(seat.id);
   }
 
   static create(cfg: Config, opts: RunOptions, continuedFrom?: RunStore): RunContext {
@@ -205,8 +213,10 @@ export class RunContext {
   }
 
   /** Queue a replacement for this seat's next turn. Role permissions, worktree and
-   * reviewer isolation come from the existing session, never the requested spec. */
-  override(target: string, spec: string): void {
+   * reviewer isolation come from the existing session, never the requested spec.
+   * Moving from a model on this device or LAN to a cloud model forwards this agent's earlier
+   * replies to the cloud provider, so that needs `confirmCloudHandoff`. */
+  override(target: string, spec: string, o: { confirmCloudHandoff?: boolean } = {}): void {
     if (this.finished || this.aborted) throw new Error('run is not active');
     const seat = this.opts.seats.find((s) => s.id === target);
     if (!seat) throw new Error(`unknown or non-overridable agent ${target}`);
@@ -218,16 +228,31 @@ export class RunContext {
     validateProviderSeat(this.cfg, next);
     if (next.engine === 'claude') resolveClaudeBin(this.cfg);
     if (next.engine === 'codex') resolveCodexBin(this.cfg);
+    const handoff = this.isCloudHandoff(seat, next);
+    if (handoff && !o.confirmCloudHandoff) {
+      throw new CloudHandoffError(`${target} runs on ${seatLocation(this.cfg, seat) === 'lan' ? 'your local network' : 'this device'}; switching it to ${formatSeat(next)} (cloud) sends its earlier replies (up to 3, from the local model) to that cloud provider. Confirm the cloud handoff to continue.`);
+    }
     // A newer override supersedes an earlier *pending* one; completed decisions remain.
-    this.pendingOverrides = this.pendingOverrides.filter((o) => o.target !== target);
-    this.pendingOverrides.push({ target, spec: formatSeat(next), at: new Date().toISOString() });
+    this.pendingOverrides = this.pendingOverrides.filter((p) => p.target !== target);
+    this.pendingOverrides.push({ target, spec: formatSeat(next), at: new Date().toISOString(), ...(handoff ? { cloudHandoff: true } : {}) });
     this.persistControl();
     this.emit({ kind: 'control', state: this.controlState });
+  }
+
+  /** Seats whose replies in this run (or the runs it continues) include output of a non-cloud model. */
+  private readonly everLocal = new Set<string>();
+
+  private isCloudHandoff(from: Seat, to: Seat): boolean {
+    return (seatLocation(this.cfg, from) !== 'cloud' || this.everLocal.has(from.id)) && seatLocation(this.cfg, to) === 'cloud';
   }
 
   /** On an explicitly requested continuation, carry forward undelivered user
    * choices. Never resume an in-flight process or a paused state automatically. */
   private recoverControl(previous: RunStore): void {
+    for (let r: RunStore | undefined = previous, depth = 0; r && depth < 8; depth++) {
+      for (const rec of r.meta.seats) if (rec.location && rec.location !== 'cloud') this.everLocal.add(rec.id);
+      try { r = r.meta.continuedFrom ? RunStore.open(r.meta.continuedFrom) : undefined; } catch { r = undefined; }
+    }
     let state: Record<string, unknown>;
     try { state = JSON.parse(previous.readFile('control.json') ?? '{}'); } catch { return; }
     const entries = (value: unknown) => Array.isArray(value) ? value.slice(-100).filter((x) => x && typeof x === 'object') as Record<string, unknown>[] : [];
@@ -238,7 +263,7 @@ export class RunContext {
     this.deliveredInstructions = entries(state.delivered).filter((e) => typeof e.target === 'string' && typeof e.text === 'string')
       .map((e) => ({ target: String(e.target), text: String(e.text), at: String(e.at ?? '') }));
     this.pendingOverrides = entries(state.pendingOverrides).filter((e) => eligible(e.target) && typeof e.spec === 'string' && e.spec.length <= 1000)
-      .map((e) => ({ target: String(e.target), spec: String(e.spec), at: String(e.at ?? '') }));
+      .map((e) => ({ target: String(e.target), spec: String(e.spec), at: String(e.at ?? ''), ...(e.cloudHandoff === true ? { cloudHandoff: true } : {}) }));
     this.appliedOverrides = entries(state.appliedOverrides).filter((e) => typeof e.target === 'string' && typeof e.from === 'string' && typeof e.to === 'string')
       .map((e) => ({ target: String(e.target), from: String(e.from), to: String(e.to), at: String(e.at ?? '') }));
     this.persistControl();
@@ -255,14 +280,32 @@ export class RunContext {
     if (!pending) return '';
     const from = formatSeat(ss.seat);
     const next = parseSeat(pending.spec, ss.seat.id, this.cfg.defaults);
-    await this.engines.reassign(ss, next);
+    const handoff = this.isCloudHandoff(ss.seat, next);
+    this.pendingOverrides = this.pendingOverrides.filter((o) => o !== pending);
+    try {
+      await this.engines.reassign(ss, next);
+    } catch (e) {
+      // Cancelled meanwhile: stop here. Otherwise keep the current agent and say why, rather than
+      // failing the run or substituting another model.
+      if (this.aborted || (e as Error).message === CANCELLED) { this.persistControl(); this.checkpoint(); throw e; }
+      const reason = (e as Error).message;
+      this.appliedOverrides.push({ target: next.id, from, to: pending.spec, at: pending.at, rejected: reason });
+      this.persistControl();
+      this.log(`${next.id}: assignment change to ${pending.spec} was not applied (${reason}); ${from} continues`);
+      return '';
+    }
     const original = this.opts.seats.find((seat) => seat.id === next.id);
     if (original) Object.assign(original, next);
-    this.pendingOverrides = this.pendingOverrides.filter((o) => o !== pending);
-    this.appliedOverrides.push({ target: next.id, from, to: pending.spec, at: pending.at });
+    this.appliedOverrides.push({ target: next.id, from, to: pending.spec, at: pending.at, ...(pending.cloudHandoff ? { cloudHandoff: true } : {}) });
     this.persistControl();
     this.recordSeats([ss]);
     this.log(`${next.id}: assignment changed ${from} → ${pending.spec} for future turns`);
+    // Local history goes to a cloud model only when the user confirmed that handoff.
+    if (seatLocation(this.cfg, next) !== 'cloud') this.everLocal.add(next.id);
+    if (handoff && !pending.cloudHandoff) {
+      this.log(`${next.id}: starting without its earlier local replies (cloud handoff was not confirmed)`);
+      return '';
+    }
     // The new provider has no old provider session. Supply a bounded summary of
     // this seat's completed replies, in addition to the workflow's own state.
     const earlier: { store: RunStore; turn: RunMeta['turns'][number] }[] = this.store.meta.turns.filter((t) => t.seat === next.id).map((turn) => ({ store: this.store, turn }));
@@ -364,6 +407,8 @@ export class RunContext {
     await this.boundary();
     this.checkpoint();
     const history = await this.applyOverride(ss);
+    // Opening the replacement is asynchronous: a Stop during it must not start this turn.
+    this.checkpoint();
     message = history + this.withInstructions(ss.seat.id, message);
     this.countSend();
     const t = await this.engines.send(ss, message, o);
@@ -458,6 +503,7 @@ export class RunContext {
 
 function makeEngines(store: RunStore, cfg: Config, bins: ConstructorParameters<typeof Engines>[2], ctx: RunContext): Engines {
   return new Engines(store, cfg, bins, {
+    eligibility: ctx.opts.eligibility,
     onTurnStart: (seat, n, round, kind) => ctx.emit({ kind: 'turn_start', seat, n, round, turnKind: kind }),
     onLive: (u: LiveUpdate) => ctx.emit({ kind: 'live', seat: u.seat, n: u.n, round: u.round, turnKind: u.kind, blocks: u.blocks }),
   });

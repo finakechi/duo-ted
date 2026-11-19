@@ -6,7 +6,8 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { binVersionAsync, runBinAsync, type BinSpec } from './bins.ts';
-import { codexCatalogAsync, resolveClaudeBin, resolveCodexBin, type Config } from './config.ts';
+import { codexCatalogAsync, profileIssues, resolveClaudeBin, resolveCodexBin, resolveQwenBin, type Config } from './config.ts';
+import { bwrapAvailable, qwenVersionStatus } from './qwen.ts';
 import { gitAsync } from './worktree.ts';
 import { errorHint } from './errors.ts';
 import { CONFIG_PATH, DUO_HOME, PROJECT_ROOT } from './paths.ts';
@@ -90,6 +91,20 @@ export async function runDoctor(cfg: Config, o: { quick?: boolean } = {}): Promi
     fix: cfg.deepseek.enabled && !process.env[cfg.deepseek.keyEnv] ? `Set ${cfg.deepseek.keyEnv} before starting Duo.` : undefined });
   add({ id: 'local-models', label: 'Local Models', level: 'info',
     detail: cfg.localModelsEnabled ? `enabled · ${Object.values(cfg.qwenProfiles).filter((p) => p.kind === 'local' && p.enabled !== false).length} active profiles (connection not tested)` : 'disabled (optional)' });
+  // Only when the user has active Qwen endpoint profiles: legacy Claude/Codex setups see no new lines.
+  const active = Object.entries(cfg.qwenProfiles).filter(([, p]) => p.enabled !== false && (p.kind === 'hosted' || cfg.localModelsEnabled));
+  if (active.length) {
+    let qwen: { version: string; ok: boolean; reason?: string } | undefined;
+    try { qwen = await qwenVersionStatus(resolveQwenBin(cfg)); } catch { /* not installed */ }
+    const sandbox = bwrapAvailable();
+    add({ id: 'qwen-harness', label: 'Qwen Code harness', level: qwen?.ok && sandbox ? 'ok' : 'warn',
+      detail: !qwen ? 'not installed: Qwen endpoint profiles cannot run as agents' : !qwen.ok ? qwen.reason! : !sandbox ? `${qwen.version} · /usr/bin/bwrap missing, Qwen seats are refused` : `${qwen.version} (verified release) · Bubblewrap available · roles still need the readiness tests in Settings`,
+      fix: !qwen ? 'Install Qwen Code 0.28.x, or set qwenBin in the Duo config.' : !qwen.ok ? 'Install a Qwen Code release Duo has verified (0.28.x).' : !sandbox ? 'Install Bubblewrap (bwrap) from your distribution.' : undefined });
+    for (const [id, p] of active) {
+      const issue = profileIssues(id, p)[0];
+      if (issue) add({ id: `profile-${id}`, label: `Profile ${id}`, level: 'warn', detail: issue, fix: 'Edit the profile in Settings.' });
+    }
+  }
   add({ id: 'data', label: 'data', level: 'info', detail: DUO_HOME });
   return out;
 }

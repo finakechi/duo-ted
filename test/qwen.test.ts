@@ -2,12 +2,11 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createServer } from 'node:http';
 import { after, test } from 'node:test';
 import { parseQwenStream } from '../src/tap.ts';
-import { executeQwen, probeQwenProfile } from '../src/qwen.ts';
+import { executeQwen, qwenExcludedTools, qwenSupport, scrubCredentials, QWEN_TOOLS } from '../src/qwen.ts';
 import { parseSeat, formatSeat } from '../src/seats.ts';
-import { validateQwenProfiles } from '../src/config.ts';
+import { endpointLocation, profileIssues, validateProfilesForSave, validateQwenProfiles } from '../src/config.ts';
 
 const dir = mkdtempSync(join(tmpdir(), 'duo-qwen-'));
 const file = join(import.meta.dirname, 'fakes', 'qwen.mjs');
@@ -91,22 +90,102 @@ test('A local Qwen endpoint never inherits an unrelated OpenAI API key', { skip:
   } finally { delete process.env.FAKE_LOG; delete process.env.OPENAI_API_KEY; }
 });
 
-test('profile test separates HTTP connectivity/model listing from proven agent tool use', async () => {
-  const server = createServer((req, res) => {
-    if (req.url === '/v1/models') { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({ data: [{ id: 'local-coder' }] })); }
-    else { res.statusCode = 404; res.end(); }
-  });
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+const calls = (log: string) => readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+
+test('DT-01: a hosted profile never falls back to OPENAI_API_KEY', { skip: !available }, async () => {
+  process.env.OPENAI_API_KEY = 'unrelated-openai-key-must-not-be-used';
   try {
-    const address = server.address();
-    if (!address || typeof address === 'string') throw new Error('missing test HTTP port');
-    const profile = { kind: 'local' as const, name: 'Local', model: 'local-coder', baseUrl: `http://127.0.0.1:${address.port}/v1` };
-    const reachable = await probeQwenProfile(profile);
-    assert.deepEqual({ reached: reachable.reachable, listed: reachable.modelListed, tools: reachable.toolUse }, { reached: true, listed: true, tools: 'unverified' });
-    if (available) {
-      const verified = await probeQwenProfile(profile, bin);
-      assert.equal(verified.reachable, true);
-      assert.equal(verified.toolUse, 'failed', 'fake CLI emits a read call but not the secret proof file content');
-    }
-  } finally { server.close(); }
+    const hosted = { name: 'Hosted', kind: 'hosted' as const, model: 'qwen3-coder-plus', baseUrl: 'https://example.invalid/v1' };
+    await assert.rejects(executeQwen({ bin, model: hosted.model, cwd: dir, system: 'x', access: 'read', configDir: dir, id: 'nofallback', message: 'hi', timeoutSec: 4, onLine: () => undefined, profile: hosted }), /must name the environment variable/);
+    await assert.rejects(executeQwen({ bin, model: hosted.model, cwd: dir, system: 'x', access: 'read', configDir: dir, id: 'nofallback', message: 'hi', timeoutSec: 4, onLine: () => undefined, profile: { ...hosted, keyEnv: 'DUO_TEST_UNSET_KEY' } }), /set DUO_TEST_UNSET_KEY/);
+  } finally { delete process.env.OPENAI_API_KEY; }
+  assert.match(profileIssues('h', { name: 'h', kind: 'hosted', model: 'm', baseUrl: 'https://example.invalid/v1' })[0], /never falls back to OPENAI_API_KEY/);
+  assert.throws(() => validateQwenProfiles({ h: { kind: 'hosted', model: 'm', baseUrl: 'https://example.invalid/v1' } }), /must name the environment variable/);
+});
+
+test('DT-01: profile runs pass only their own key and scrub every other credential and its echo', { skip: !available }, async () => {
+  const log = join(dir, 'scrub.jsonl');
+  process.env.FAKE_LOG = log;
+  process.env.QWEN_TEST_KEY = 'hosted-secret-value-1234';
+  process.env.DEEPSEEK_API_KEY = 'deepseek-secret-should-not-reach-qwen';
+  process.env.ANTHROPIC_API_KEY = 'anthropic-secret-should-not-reach-qwen';
+  process.env.FAKE_QWEN_MODE = 'echo-key';
+  const lines: string[] = [];
+  try {
+    const result = await executeQwen({ bin, model: 'qwen3-coder-plus', cwd: dir, system: 'x', access: 'write', configDir: dir, id: 'scrub', message: 'hi', timeoutSec: 4,
+      onLine: (l) => lines.push(l), profile: { name: 'Hosted', kind: 'hosted', model: 'qwen3-coder-plus', baseUrl: 'https://example.invalid/v1', keyEnv: 'QWEN_TEST_KEY' } });
+    const call = calls(log).at(-1);
+    assert.deepEqual(call.credentialNames, [], 'no other credential variable reaches the Qwen child');
+    assert.equal(call.hasKey, true);
+    assert.doesNotMatch(lines.join('\n'), /hosted-secret-value-1234/);
+    assert.match(lines.join('\n'), /\[redacted\]/);
+    assert.doesNotMatch(JSON.stringify(result), /hosted-secret-value-1234/);
+  } finally {
+    for (const k of ['FAKE_LOG', 'QWEN_TEST_KEY', 'DEEPSEEK_API_KEY', 'ANTHROPIC_API_KEY', 'FAKE_QWEN_MODE']) delete process.env[k];
+  }
+  assert.deepEqual(Object.keys(scrubCredentials({ PATH: '/bin', HOME: '/h', GITHUB_TOKEN: 'x', OPENAI_BASE_URL: 'u', MY_SERVICE_API_KEY: 'k', QWEN_HOME: '/q' })).sort(), ['HOME', 'PATH', 'QWEN_HOME']);
+});
+
+test('DT-04: endpoint location comes from the address, and unsafe local/LAN/plain-HTTP setups are refused', () => {
+  assert.equal(endpointLocation('http://127.0.0.1:11434/v1'), 'device');
+  assert.equal(endpointLocation('http://localhost:8080/v1'), 'device');
+  assert.equal(endpointLocation('http://[::1]:8080/v1'), 'device');
+  assert.equal(endpointLocation('http://192.168.1.20:11434/v1'), 'lan');
+  assert.equal(endpointLocation('http://10.0.0.5/v1'), 'lan');
+  assert.equal(endpointLocation('http://gpu-box.local:8000/v1'), 'lan');
+  assert.equal(endpointLocation('http://[fd00::12]:8000/v1'), 'lan');
+  assert.equal(endpointLocation('http://203.0.113.9:11434/v1'), 'cloud');
+  assert.equal(endpointLocation('https://api.example.com/v1'), 'cloud');
+  const local = (baseUrl: string, extra = {}) => ({ name: 'L', kind: 'local' as const, model: 'm', baseUrl, ...extra });
+  assert.match(profileIssues('L', local('http://203.0.113.9:11434/v1'))[0], /remote address/);
+  assert.match(profileIssues('L', local('http://192.168.1.20:11434/v1'))[0], /Allow local-network endpoint/);
+  assert.deepEqual(profileIssues('L', local('http://192.168.1.20:11434/v1', { lan: true })), []);
+  assert.match(profileIssues('L', local('http://192.168.1.20:11434/v1', { lan: true, keyEnv: 'LAN_KEY' }))[0], /plain HTTP/);
+  assert.deepEqual(profileIssues('L', local('https://192.168.1.20/v1', { lan: true, keyEnv: 'LAN_KEY' })), []);
+  assert.deepEqual(profileIssues('L', local('http://127.0.0.1:11434/v1', { keyEnv: 'LOCAL_KEY' })), [], 'loopback HTTP never leaves the device');
+  assert.throws(() => validateQwenProfiles({ h: { kind: 'hosted', model: 'm', baseUrl: 'https://x.example/v1', keyEnv: 'K', lan: true } }), /lan applies only to local/);
+  // A saved, unchanged older profile does not block saving other settings; an edited one must comply.
+  const legacy = { old: { name: 'old', kind: 'local', model: 'm', baseUrl: 'http://192.168.1.20:11434/v1' } };
+  assert.ok(validateProfilesForSave(legacy, legacy).old);
+  assert.throws(() => validateProfilesForSave({ old: { ...legacy.old, model: 'n' } }, legacy), /Allow local-network endpoint/);
+});
+
+test('DT-05/web tools: every non-reviewer tool of the verified release is excluded, host-side web tools always', () => {
+  const read = qwenExcludedTools('read');
+  const write = qwenExcludedTools('write');
+  for (const t of ['write_file', 'edit', 'run_shell_command', 'exec', 'notebook_edit', 'agent', 'web_fetch', 'web_search', 'monitor', 'send_message', 'cron_create', 'enter_worktree', 'skill', 'tool_call', 'exit_plan_mode']) assert.ok(read.includes(t), `reviewer excludes ${t}`);
+  for (const t of ['web_fetch', 'web_search', 'exec', 'agent', 'monitor', 'enter_worktree', 'send_message', 'tool_call', 'tool_search']) assert.ok(write.includes(t), `writer excludes ${t}`);
+  for (const t of ['read_file', 'write_file', 'edit', 'run_shell_command']) assert.ok(!write.includes(t), `writer keeps ${t}`);
+  assert.ok(!read.includes('read_file') && !read.includes('grep_search'));
+  assert.equal(new Set([...read, 'read_file', 'glob', 'grep_search', 'list_directory', 'structured_output']).size, QWEN_TOOLS.length, 'the reviewer allowlist plus its exclusions cover the whole catalog');
+  assert.equal(qwenSupport('0.28.0').ok, true);
+  assert.equal(qwenSupport('qwen 0.28.3').ok, true);
+  assert.match(qwenSupport('0.29.0').reason!, /not verified by Duo/);
+  assert.match(qwenSupport('unknown').reason!, /cannot read/);
+});
+
+test('DT-05: launch arguments carry the role deny list; an unverified release and a trust downgrade fail closed', { skip: !available }, async () => {
+  const log = join(dir, 'policy.jsonl');
+  process.env.FAKE_LOG = log;
+  try {
+    const opts = { bin, model: 'qwen3-coder-plus', cwd: dir, system: 'x', configDir: dir, message: 'hi', timeoutSec: 4, onLine: () => undefined };
+    assert.equal((await executeQwen({ ...opts, access: 'read', id: 'policy-read' })).error, undefined);
+    const readArgs: string[] = calls(log).at(-1).args;
+    const excluded = readArgs[readArgs.indexOf('--exclude-tools') + 1].split(',');
+    assert.ok(excluded.includes('web_fetch') && excluded.includes('write_file') && excluded.includes('run_shell_command'));
+    assert.equal(readArgs[readArgs.indexOf('--approval-mode') + 1], 'plan');
+    assert.ok(readArgs.includes('--safe-mode'));
+    assert.equal((await executeQwen({ ...opts, access: 'write', network: true, id: 'policy-net' })).error, undefined);
+    const net = JSON.parse(readFileSync(join(dir, 'qwen-policy-policy-net.json'), 'utf8'));
+    assert.deepEqual(net.tools.executionSandbox, { backend: 'bwrap', filesystem: 'workspace-write', network: 'open' });
+    await executeQwen({ ...opts, access: 'write', id: 'policy-closed' });
+    assert.equal(JSON.parse(readFileSync(join(dir, 'qwen-policy-policy-closed.json'), 'utf8')).tools.executionSandbox.network, 'closed');
+    const old = { ...bin, args: [file, '--fake-version=0.27.4'] };
+    await assert.rejects(executeQwen({ ...opts, bin: old, access: 'read', id: 'old' }), /0\.27\.4 is not verified/);
+    process.env.FAKE_QWEN_MODE = 'trust-downgrade';
+    const started = Date.now();
+    const downgraded = await executeQwen({ ...opts, access: 'write', id: 'trust', timeoutSec: 15 });
+    assert.match(downgraded.error ?? '', /folder trust is enabled/);
+    assert.ok(Date.now() - started < 10_000, 'stopped at once rather than waiting for the turn');
+  } finally { delete process.env.FAKE_LOG; delete process.env.FAKE_QWEN_MODE; }
 });

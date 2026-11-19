@@ -1,6 +1,6 @@
 // Chat lifecycle in the GUI engine, with the claw SessionManager replaced by a controllable stub.
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
@@ -63,4 +63,40 @@ test('stopping a chat still records the stopped turn', async () => {
   assert.equal(chats.get(c.id).turns[0].status, 'stopped');
   assert.ok(events.some((e) => e.t === 'chat_turn_end' && e.chat === c.id));
   assert.ok(readdirSync(chatsDir()).includes(`${c.id}.json`));
+});
+
+test('DT-03: a chat never resumes local Qwen history on another endpoint, and says so', { skip: process.platform !== 'linux' || !existsSync('/usr/bin/bwrap') }, async () => {
+  const log = join(tmp, 'qwen-chat.jsonl');
+  Object.assign(process.env, { DUO_QWEN_BIN: join(import.meta.dirname, 'fakes', 'qwen.mjs'), FAKE_LOG: log, HOSTED_TEST_KEY: 'hosted-chat-key-123' });
+  try {
+    const events: Ev[] = [];
+    const bus = { emit: (e: Ev) => events.push(e), add: () => undefined } as any;
+    const cfg = structuredClone(DEFAULT_CONFIG);
+    cfg.localModelsEnabled = true;
+    cfg.qwenProfiles = {
+      desk: { name: 'Desk', kind: 'local', model: 'local-coder', baseUrl: 'http://127.0.0.1:11434/v1' },
+      cloud: { name: 'Cloud', kind: 'hosted', model: 'qwen3-coder-plus', baseUrl: 'https://example.invalid/v1', keyEnv: 'HOSTED_TEST_KEY' },
+    };
+    const bin = { command: process.execPath, args: [], env: {}, display: 'node' };
+    const chats = new ChatManager(bus, cfg, { codex: bin, claude: bin }, new PermissionBroker(bus), { url: 'http://127.0.0.1:1', token: 't' }, 'mcp.ts');
+    const turnEnd = async () => { for (let i = 0; i < 200 && !events.some((e) => e.t === 'chat_turn_end'); i++) await new Promise((r) => setTimeout(r, 20)); events.length = 0; };
+    const lastArgs = (): string[] => JSON.parse(readFileSync(log, 'utf8').trim().split('\n').at(-1)!).args;
+    const c = chats.create({ engine: 'qwen', spec: 'qwen:local-coder+profile=desk', access: 'read-only', cwd: tmp });
+    chats.send(c.id, 'local secret context'); await turnEnd();
+    chats.send(c.id, 'second local turn'); await turnEnd();
+    assert.ok(lastArgs().includes('--resume'), 'same endpoint continues the conversation');
+    // Edit the profile's endpoint in Settings: the stored session must not follow it.
+    cfg.qwenProfiles.desk = { ...cfg.qwenProfiles.desk, baseUrl: 'http://127.0.0.1:8080/v1' };
+    chats.send(c.id, 'after endpoint edit'); await turnEnd();
+    assert.ok(!lastArgs().includes('--resume'));
+    assert.match(chats.get(c.id).turns.at(-1)!.newContext ?? '', /endpoint changed/);
+    // Switch the chat to a hosted (cloud) profile.
+    const updated = chats.update(c.id, { spec: 'qwen:qwen3-coder-plus+profile=cloud' });
+    assert.match(updated.notice ?? '', /new conversation with a cloud model.*not sent/);
+    assert.equal(chats.get(c.id).qwenSessionId, undefined);
+    chats.send(c.id, 'cloud turn'); await turnEnd();
+    assert.ok(!lastArgs().includes('--resume'), 'the cloud endpoint receives no local session');
+    assert.doesNotMatch(readFileSync(log, 'utf8').trim().split('\n').at(-1)!, /local secret context/);
+    await chats.close();
+  } finally { for (const k of ['DUO_QWEN_BIN', 'FAKE_LOG', 'HOSTED_TEST_KEY']) delete process.env[k]; }
 });

@@ -2,7 +2,9 @@
 import { existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import type { Config } from '../config.ts';
-import { assignModels, type AssignmentRequest } from '../assignment.ts';
+import { assignModels, type AssignmentRequest, type OptionalCandidate, type RoleNeed } from '../assignment.ts';
+import { ReadinessStore } from '../readiness.ts';
+import { initialState } from '../templates/runtime.ts';
 import { resolveClaudeBin, resolveCodexBin, resolveQwenBin } from '../config.ts';
 import { SCRATCH_DIR } from '../paths.ts';
 import { ask } from '../protocols/ask.ts';
@@ -19,7 +21,7 @@ import { validateTemplate } from '../templates/validate.ts';
 import type { CoordinationTemplate } from '../templates/types.ts';
 import { exportHtml } from '../render.ts';
 import { parseSeat, seatIds, type Seat } from '../seats.ts';
-import { validateProviderSeat } from '../providers.ts';
+import { optionalTarget, validateProviderSeat } from '../providers.ts';
 import { deleteRun, listRuns, markInterrupted, RunStore, type RunMeta } from '../store.ts';
 import { finishWorkspace, workspaceDiff, workspaceOptionsAsync } from '../worktree.ts';
 import type { Bus } from './bus.ts';
@@ -68,30 +70,85 @@ export class RunManager {
   private readonly seen = new Set<string>();
   private readonly bus: Bus;
   private readonly cfg: Config;
-  private readonly verifiedQwen = new Map<string, string>();
+  readonly readiness: ReadinessStore;
 
-  constructor(bus: Bus, cfg: Config) {
+  constructor(bus: Bus, cfg: Config, readiness = new ReadinessStore()) {
     this.bus = bus;
     this.cfg = cfg;
+    this.readiness = readiness;
     // Runs this app was running when it was killed still say "running" on disk.
     markInterrupted((id) => this.active.has(id));
   }
 
-  verifyQwenProfile(id: string, profile: Config['qwenProfiles'][string]): void {
-    this.verifiedQwen.set(id, JSON.stringify(profile));
+  /** The executor's rule, shared by every run this manager starts (and continues). */
+  private eligibility: RunOptions['eligibility'] = (seat, need) => this.readiness.eligibility(this.cfg, seat, need);
+
+  /** What each requested slot's role needs before roles are bound: a writer edits, others read. */
+  private slotNeeds(protocol: Protocol, template: CoordinationTemplate | undefined, n: number): RoleNeed[] {
+    const mode = template?.library ?? protocol;
+    if (mode === 'pair') return ['write', 'read'];
+    const writes = !template?.library && Object.values(template?.roles ?? {}).some((r) => r.access && r.access !== 'read');
+    return Array.from({ length: n }, () => (writes ? 'write' : 'read'));
   }
 
-  suggest(req: Pick<StartRun, 'seats' | 'assignment' | 'protocol'>): { seats: string[]; reasons: string[]; } {
+  /** Optional models with at least one verified role, for automatic and hybrid assignment. */
+  private async optionalCandidates(): Promise<OptionalCandidate[]> {
+    const out: OptionalCandidate[] = [];
+    const views = await this.readiness.describeAll(this.cfg);
+    for (const v of Object.values(views)) {
+      if (!v.roles.review && !v.roles.write) continue;
+      const spec = v.provider === 'deepseek' ? `codex:${v.model}+provider=deepseek` : `qwen:${v.model}+profile=${v.target.slice('qwen:'.length)}`;
+      out.push({ spec, engine: v.engine, label: v.label, location: v.location, review: v.roles.review, write: v.roles.write });
+    }
+    return out;
+  }
+
+  private template(req: Pick<StartRun, 'protocol' | 'template'>): CoordinationTemplate | undefined {
+    if (req.protocol !== 'custom') return undefined;
+    return typeof req.template === 'string' ? getTemplate(req.template) : validateTemplate(req.template);
+  }
+
+  /** Reasons the given seats cannot take the roles they would hold (empty when all can). */
+  private async blocked(seats: Seat[], needs: RoleNeed[]): Promise<string[]> {
+    const out: string[] = [];
+    for (const [i, seat] of seats.entries()) {
+      try { validateProviderSeat(this.cfg, seat); } catch (e) { out.push(`Seat ${i + 1}: ${(e as Error).message}`); continue; }
+      const why = await this.readiness.eligibility(this.cfg, seat, needs[i] ?? 'read');
+      if (why) out.push(`Seat ${i + 1} (${needs[i] === 'write' ? 'writer' : 'reviewer/participant'}): ${why}`);
+    }
+    return out;
+  }
+
+  async suggest(req: Pick<StartRun, 'seats' | 'assignment' | 'protocol' | 'template'>): Promise<{ seats: string[]; reasons: string[]; blocked: string[]; }> {
     if (!Array.isArray(req.seats) || req.seats.length < 1 || req.seats.length > 32) throw new Error('choose 1–32 model seats');
     const assignment = req.assignment ?? { mode: 'manual', preference: 'best-fit' };
-    if (assignment.mode === 'manual') return assignModels({ requested: req.seats, assignment, defaults: { codex: this.cfg.gui.codex.spec, claude: this.cfg.gui.claude.spec, qwen: this.cfg.gui.qwen.spec }, profiles: {}, verified: new Set(), availability: { codex: true, claude: true, qwen: true }, pair: req.protocol === 'pair' });
+    const template = this.template(req);
+    const needs = this.slotNeeds(req.protocol, template, req.seats.length);
+    const pair = (template?.library ?? req.protocol) === 'pair';
     const isAvailable = (resolveBin: () => unknown) => { try { resolveBin(); return true; } catch { return false; } };
-    const verified = new Set(Object.entries(this.cfg.qwenProfiles).filter(([id, p]) => p.enabled !== false && (p.kind !== 'local' || this.cfg.localModelsEnabled) && this.verifiedQwen.get(id) === JSON.stringify(p)).map(([id]) => id));
-    return assignModels({ requested: req.seats, assignment,
-      defaults: { codex: this.cfg.gui.codex.spec, claude: this.cfg.gui.claude.spec, qwen: this.cfg.gui.qwen.spec },
-      profiles: this.cfg.qwenProfiles, verified,
-      availability: { codex: isAvailable(() => resolveCodexBin(this.cfg)), claude: isAvailable(() => resolveClaudeBin(this.cfg)), qwen: process.platform === 'linux' && existsSync('/usr/bin/bwrap') && isAvailable(() => resolveQwenBin(this.cfg)) },
-      pair: req.protocol === 'pair' });
+    const selected = assignment.mode === 'manual'
+      ? assignModels({ requested: req.seats, assignment, defaults: { codex: this.cfg.gui.codex.spec, claude: this.cfg.gui.claude.spec }, optional: [], availability: { codex: true, claude: true }, slots: needs, pair })
+      : assignModels({ requested: req.seats, assignment, slots: needs, pair,
+        defaults: { codex: this.cfg.gui.codex.spec, claude: this.cfg.gui.claude.spec },
+        optional: await this.optionalCandidates(),
+        availability: { codex: isAvailable(() => resolveCodexBin(this.cfg)), claude: isAvailable(() => resolveClaudeBin(this.cfg)) } });
+    // Manual seats and hybrid overrides are the user's: check them, never replace them.
+    const ids = seatIds(selected.seats.length);
+    let parsed: Seat[];
+    try { parsed = selected.seats.map((s, i) => parseSeat(s, ids[i], this.cfg.defaults)); }
+    catch (e) { return { ...selected, blocked: [(e as Error).message] }; }
+    return { ...selected, blocked: await this.blocked(parsed, this.boundNeeds(template, parsed) ?? needs) };
+  }
+
+  /** A fully custom template's seat needs from the roles its selectors bind at the start. */
+  private boundNeeds(template: CoordinationTemplate | undefined, seats: Seat[]): RoleNeed[] | undefined {
+    if (!template || template.library) return undefined;
+    try {
+      for (const seat of seats) validateProviderSeat(this.cfg, seat); // selectors read the resolved backend
+      const roles = initialState(template, seats).roles;
+      const writers = new Set(Object.entries(roles).filter(([r]) => template.roles[r]?.access && template.roles[r].access !== 'read').flatMap(([, ids]) => ids));
+      return seats.map((s) => (writers.has(s.id) ? 'write' : 'read'));
+    } catch { return undefined; }
   }
 
   private sink: RunOptions['sink'] = (e) => {
@@ -168,10 +225,11 @@ export class RunManager {
 
   async start(req: StartRun): Promise<{ id: string; }> {
     if (!PROTOCOLS.includes(req.protocol)) throw new Error(`unknown protocol ${req.protocol}`);
-    const template = req.protocol === 'custom' ? (typeof req.template === 'string' ? getTemplate(req.template) : validateTemplate(req.template)) : undefined;
+    const template = this.template(req);
     const mode = template?.library ?? req.protocol;
     if (!Array.isArray(req.seats) || req.seats.length > 32) throw new Error('choose up to 32 model seats');
-    const selected = this.suggest(req);
+    const selected = await this.suggest({ ...req, template });
+    if (selected.blocked.length) throw new Error(`Cannot start: ${selected.blocked.join('; ')}`);
     const workspace = !req.noProject;
     if (!workspace && (mode === 'review' || mode === 'pair' || Object.values(template?.roles ?? {}).some((r) => r.access && r.access !== 'read'))) throw new Error(`${req.protocol} works on a project folder`);
     let cwd: string;
@@ -189,12 +247,17 @@ export class RunManager {
     if (seats.length < min) throw new Error(`${req.protocol} needs at least ${min} seat(s)`);
     if (mode === 'pair' && seats.length !== 2) throw new Error('pair takes exactly two seats: the writer and the reviewer');
     const chair = req.chair && mode !== 'pair' ? parseSeat(req.chair, 'Z', this.cfg.defaults) : undefined;
-    if (chair) validateProviderSeat(this.cfg, chair);
+    if (chair) {
+      validateProviderSeat(this.cfg, chair);
+      const why = await this.readiness.eligibility(this.cfg, chair, 'read');
+      if (why) throw new Error(`Cannot start: chair: ${why}`);
+    }
     const brief = (req.brief ?? '').trim() || (mode === 'review' ? `Review ${req.review?.kind ?? 'uncommitted'}` : '');
     if (!brief) throw new Error(mode === 'pair' ? 'describe the task first' : 'the brief is empty');
     let pairSettings: PairSettings | undefined;
     if (mode === 'pair') {
       pairSettings = pairSettingsOf({ pair: req.pair ?? {} });
+      if (pairSettings.writerAccess === 'full' && seats[0].engine === 'qwen') throw new Error('Qwen Code writers run only inside Duo\'s Bubblewrap workspace sandbox; choose "Sandboxed" or "Sandboxed + network" writer access');
       if (pairSettings.isolation === 'worktree' && !(await workspaceOptionsAsync(cwd)).head) throw new Error(`${cwd} is not a git repository with at least one commit; choose "In place" or commit first`);
     }
     for (const [name, value] of [['rounds', req.rounds], ['minRounds', req.minRounds]] as const) if (value !== undefined && (!Number.isInteger(value) || value < 1 || value > 1000)) throw new Error(`${name} must be 1–1000`);
@@ -213,6 +276,7 @@ export class RunManager {
       extra: { gui: true, assignment: { ...(req.assignment ?? { mode: 'manual', preference: 'best-fit' }), reasons: selected.reasons }, ...(template ? { template } : {}), ...(req.review ? { target: req.review, focus: req.review.focus } : {}), ...(pairSettings ? { pair: pairSettings } : {}) },
       workspace,
       sink: this.sink,
+      eligibility: this.eligibility,
     };
     const ctx = RunContext.create(this.cfg, opts);
     this.track(ctx, () => {
@@ -230,7 +294,7 @@ export class RunManager {
     let id: string | undefined;
     try {
       return await generateTemplate(this.cfg, {
-        ...req, safe: false, sink: this.sink, onContext: (ctx) => {
+        ...req, safe: false, sink: this.sink, eligibility: this.eligibility, onContext: (ctx) => {
           id = ctx.store.meta.id; this.active.set(id, ctx); this.sink!({ kind: 'log', text: 'authoring template draft', run: id });
         }
       });
@@ -250,6 +314,7 @@ export class RunManager {
         chair: chairSeat,
         safe: false,
         sink: this.sink,
+        eligibility: this.eligibility,
         onContext: (ctx) => {
           nid = ctx.store.meta.id;
           this.active.set(nid, ctx);
@@ -299,10 +364,19 @@ export class RunManager {
     return { queued: true };
   }
 
-  override(id: string, target: string, spec: string): { queued: boolean } {
+  async override(id: string, target: string, spec: string, o: { confirmCloudHandoff?: boolean } = {}): Promise<{ queued: boolean }> {
     const ctx = this.active.get(id);
     if (!ctx) throw new Error('run is not active; future assignments cannot be changed');
-    ctx.override(target, spec);
+    // Refuse an optional model that has not passed even the reviewer test; the role's exact
+    // need (writer or reviewer) is enforced again when the replacement opens.
+    const next = parseSeat(spec, target, this.cfg.defaults);
+    validateProviderSeat(this.cfg, next);
+    if (optionalTarget(next)) {
+      const role = ctx.store.meta.seats.find((s) => s.id === target && s.clawSession)?.role;
+      const why = await this.readiness.eligibility(this.cfg, next, role === 'writer' ? 'write' : 'read');
+      if (why) throw new Error(why);
+    }
+    ctx.override(target, spec, o);
     return { queued: true };
   }
 
@@ -350,6 +424,7 @@ export class RunManager {
   }
 
   async close(): Promise<void> {
+    this.readiness.cancelAll();
     for (const ctx of this.active.values()) ctx.cancel();
     await new Promise((r) => setTimeout(r, 300));
   }

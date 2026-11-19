@@ -1,5 +1,6 @@
 import { useState } from 'preact/hooks';
 import { buildSpec, getOpt, parseSpec, setOpt, shortSpec, type SpecParts } from './spec.ts';
+import { readinessLine } from './Readiness.tsx';
 import { app } from './store.ts';
 import type { Engine } from './types.ts';
 import { Dropdown, EngineMark, Icon } from './ui.tsx';
@@ -66,7 +67,8 @@ export function SeatPicker({ spec, onChange, engineLocked, seat, align = 'left',
                 {s.deepseek.enabled && s.deepseek.models.map((model) => (
                   <button type="button" class={`model-row ${deepseek && p.model === model ? 'on' : ''}`} onClick={() => apply(setOpt({ ...p, model, effort: 'high', opts: p.opts.filter(([k]) => !['web', 'tier'].includes(k)) }, 'provider', 'deepseek'))}>
                     <span class="model-name">DeepSeek · {model}{deepseek && p.model === model && <Icon name="check" size={13} />}</span>
-                    <span class="model-desc">Cloud API · Codex coding engine · API usage billed by DeepSeek</span>
+                    <span class="model-desc">Engine: Codex · Provider: DeepSeek API (cloud, billed by DeepSeek)</span>
+                    <span class="model-rate">{readinessLine(`deepseek:${model}`) ?? 'not tested'}</span>
                   </button>
                 ))}
               </>
@@ -77,7 +79,8 @@ export function SeatPicker({ spec, onChange, engineLocked, seat, align = 'left',
                   {Object.entries(s.qwenProfiles).filter(([, profile]) => profile.enabled !== false && (profile.kind !== 'local' || s.localModelsEnabled)).map(([id, profile]) => (
                     <button type="button" class={`model-row ${getOpt(p, 'profile') === id ? 'on' : ''}`} onClick={() => apply(setOpt({ ...p, model: profile.model, effort: undefined }, 'profile', id))}>
                       <span class="model-name">{profile.name}{getOpt(p, 'profile') === id && <Icon name="check" size={13} />}</span>
-                      <span class="model-desc">{profile.kind === 'local' ? 'Local model' : 'Hosted provider'} · via Qwen Code · {profile.model}</span>
+                      <span class="model-desc">Engine: Qwen Code · Provider: {profile.kind === 'local' ? 'your inference server' : 'hosted endpoint'} · Model: {profile.model}</span>
+                      <span class="model-rate">{readinessLine(`qwen:${id}`) ?? 'not tested'}</span>
                     </button>
                   ))}
                 </>
