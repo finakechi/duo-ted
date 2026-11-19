@@ -31,6 +31,10 @@ export interface ParsedTurn {
   /** The CLI reported the turn as finished (turn.completed / result). */
   completed: boolean;
   structured?: unknown;
+  /** Qwen: continuation retries after the provider ended a response early (stream dropped mid-turn). */
+  retries: number;
+  /** Qwen: the final result event's total_tokens, the context usage the provider reported. */
+  totalTokens?: number;
 }
 
 function clip(s: string, n = MAX_TOOL_OUTPUT): string {
@@ -52,7 +56,7 @@ function lines(raw: string): Record<string, any>[] {
 
 /** `codex exec --json` events for one turn (one process). */
 export function parseCodexStream(raw: string): ParsedTurn {
-  const t: ParsedTurn = { reply: '', interim: [], thinking: [], tools: [], usageIsCumulative: true, warnings: [], completed: false };
+  const t: ParsedTurn = { reply: '', interim: [], thinking: [], tools: [], usageIsCumulative: true, warnings: [], completed: false, retries: 0 };
   const messages: string[] = [];
   const errors: string[] = [];
   for (const ev of lines(raw)) {
@@ -120,7 +124,7 @@ export function parseCodexStream(raw: string): ParsedTurn {
 
 /** Claude Code `--output-format stream-json` events for one turn (a slice of a session's stream). */
 export function parseClaudeStream(raw: string): ParsedTurn {
-  const t: ParsedTurn = { reply: '', interim: [], thinking: [], tools: [], usageIsCumulative: false, warnings: [], completed: false };
+  const t: ParsedTurn = { reply: '', interim: [], thinking: [], tools: [], usageIsCumulative: false, warnings: [], completed: false, retries: 0 };
   const pending = new Map<string, ToolCall>();
   for (const ev of lines(raw)) {
     if (ev.session_id && !t.sessionId) t.sessionId = ev.session_id;
@@ -233,7 +237,12 @@ export function parseQwenStream(raw: string): ParsedTurn {
         if (ev.structured_result !== undefined) t.structured = ev.structured_result;
         if (typeof ev.result === 'string') t.reply = ev.result;
         if (ev.is_error || (ev.subtype && ev.subtype !== 'success')) t.error = String(ev.result || ev.subtype || 'Qwen error');
+        const total = ev.usage?.total_tokens;
+        if (typeof total === 'number' && Number.isFinite(total) && total > 0) t.totalTokens = total;
       }
+      // A continuation retry means the provider ended a response early and Qwen Code re-sent
+      // the partial output with a resume instruction instead of failing the turn.
+      if (ev.type === 'system' && ev.subtype === 'retry') t.retries++;
       if (ev.type === 'tool_use') {
         const tool: ToolCall = { name: String(ev.name ?? ev.tool?.name ?? 'tool'), input: JSON.stringify(ev.input ?? ev.tool?.input ?? {}).slice(0, 2000) };
         t.tools.push(tool);
@@ -247,6 +256,19 @@ export function parseQwenStream(raw: string): ParsedTurn {
   }
   if (!sawResult && !t.error) t.error = malformed ? `malformed Qwen output (${malformed} invalid JSONL events)` : 'Qwen did not emit a result event';
   return t;
+}
+
+/**
+ * True when the turn shows the signature of a context window too small for the agent: the CLI
+ * retried the response as a continuation (the provider ended it early) and the model never got
+ * far enough to call a tool. Provider usage totals that land exactly on a 4K boundary
+ * (4096, 8192, and so on) say every attempt was stopped at the server's context ceiling; a
+ * couple of retries with no usable total is enough when nothing else explains the empty turn.
+ */
+export function looksLikeContextTruncation(t: ParsedTurn): boolean {
+  if (t.retries < 1 || t.tools.length > 0 || t.error || t.reply) return false;
+  if (typeof t.totalTokens === 'number' && t.totalTokens > 0 && t.totalTokens % 4096 === 0) return true;
+  return t.retries >= 2;
 }
 
 /** Pull a JSON object out of a model reply (tolerates code fences and surrounding prose). */

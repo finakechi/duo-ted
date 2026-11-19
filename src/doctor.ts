@@ -6,7 +6,8 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { binVersionAsync, runBinAsync, type BinSpec } from './bins.ts';
-import { codexCatalogAsync, profileIssues, resolveClaudeBin, resolveCodexBin, resolveQwenBin, type Config } from './config.ts';
+import { codexCatalogAsync, endpointLocation, profileIssues, resolveClaudeBin, resolveCodexBin, resolveQwenBin, type Config } from './config.ts';
+import { isOllamaEndpoint, ollamaServedContext, OLLAMA_RECOMMENDED_CONTEXT, QWEN_MIN_CONTEXT_TOKENS } from './ollama.ts';
 import { bwrapAvailable, qwenVersionStatus } from './qwen.ts';
 import { gitAsync } from './worktree.ts';
 import { errorHint } from './errors.ts';
@@ -102,7 +103,15 @@ export async function runDoctor(cfg: Config, o: { quick?: boolean } = {}): Promi
       fix: !qwen ? 'Install Qwen Code 0.28.x, or set qwenBin in the Duo config.' : !qwen.ok ? 'Install a Qwen Code release Duo has verified (0.28.x).' : !sandbox ? 'Install Bubblewrap (bwrap) from your distribution.' : undefined });
     for (const [id, p] of active) {
       const issue = profileIssues(id, p)[0];
-      if (issue) add({ id: `profile-${id}`, label: `Profile ${id}`, level: 'warn', detail: issue, fix: 'Edit the profile in Settings.' });
+      if (issue) { add({ id: `profile-${id}`, label: `Profile ${id}`, level: 'warn', detail: issue, fix: 'Edit the profile in Settings.' }); continue; }
+      // Passive read of the server's own status: a model currently loaded with a 4K window can
+      // never run Qwen Code's agent prompt, so say so before the user wastes a readiness test.
+      if (p.kind === 'local' && !o.quick && await isOllamaEndpoint(p.baseUrl, endpointLocation(p.baseUrl), 3000)) {
+        const ctx = await ollamaServedContext(p.baseUrl, p.model, 3000);
+        if (ctx !== undefined && ctx < QWEN_MIN_CONTEXT_TOKENS) add({ id: `profile-${id}-context`, label: `Profile ${id} context window`, level: 'warn',
+          detail: `${p.model} is currently loaded with a ${ctx.toLocaleString('en-US')}-token context window; Qwen Code's agent prompt needs at least ${QWEN_MIN_CONTEXT_TOKENS.toLocaleString('en-US')}`,
+          fix: `Set OLLAMA_CONTEXT_LENGTH=${OLLAMA_RECOMMENDED_CONTEXT} on the Ollama server and restart it (systemd: sudo systemctl edit ollama, add Environment="OLLAMA_CONTEXT_LENGTH=32768" under [Service], then sudo systemctl restart ollama).` });
+      }
     }
   }
   add({ id: 'data', label: 'data', level: 'info', detail: DUO_HOME });

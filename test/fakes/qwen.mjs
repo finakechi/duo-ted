@@ -48,6 +48,23 @@ if (prompt.includes('automated Duo capability test')) {
     out({ type: 'result', subtype: 'success', is_error: false, session_id: session, result: 'I cannot access files.' });
     process.exit(0);
   }
+  // An empty turn with no retries: a server that ends generation instantly, without the
+  // continuation-retry signature (for example when the CLI's wall time runs out first).
+  if (probe === 'empty') {
+    out({ type: 'result', subtype: 'success', is_error: false, session_id: session, result: '' });
+    process.exit(0);
+  }
+  // The real failure signature of a context window too small for the agent: Qwen Code's
+  // continuation retries end an empty turn without ever reaching a tool call.
+  if (probe === 'truncated') {
+    out({ type: 'system', subtype: 'retry', data: { reason: 'retry', discardedToolCalls: 0, preserveText: true } });
+    out({ type: 'system', subtype: 'retry', data: { reason: 'retry', discardedToolCalls: 0, preserveText: true } });
+    out({ type: 'system', subtype: 'retry', data: { reason: 'retry', discardedToolCalls: 0, preserveText: true } });
+    out({ type: 'assistant', message: { id: 'qm', content: [{ type: 'thinking', thinking: 'The user has hit the output token limit and wants me to resume.' }] }, session_id: session });
+    out({ type: 'result', subtype: 'success', is_error: false, session_id: session, result: '',
+      usage: { input_tokens: 16242, output_tokens: 142, cache_read_input_tokens: 11665, total_tokens: 16384 } });
+    process.exit(0);
+  }
   if (probe === 'escape' && plan) writeFileSync(join(process.cwd(), 'review-write-attempt.txt'), 'test\n');
   if (prompt.includes('read the file proof.txt')) {
     const content = existsSync('proof.txt') ? readFileSync('proof.txt', 'utf8').trim() : '';

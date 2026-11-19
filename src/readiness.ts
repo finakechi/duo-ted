@@ -22,10 +22,11 @@ import { binVersionAsync, type BinSpec } from './bins.ts';
 import { endpointLocation, profileIssues, resolveCodexBin, resolveQwenBin, type Config, type EndpointLocation, type QwenProfile } from './config.ts';
 import { DEPTH_VAR } from './env.ts';
 import { killTree, TREE_SPAWN } from './platform.ts';
+import { isOllamaEndpoint, ollamaContextFix, ollamaServedContext, QWEN_MIN_CONTEXT_TOKENS } from './ollama.ts';
 import { DEEPSEEK_BASE_URL, deepseekForSeat, discoverModels, optionalTarget } from './providers.ts';
 import { bwrapAvailable, executeQwen, QWEN_POLICY_REVISION, QWEN_READ_TOOLS, qwenVersionStatus, scrubCredentials, verifyQwenSandbox } from './qwen.ts';
 import { parseSeat, type Seat } from './seats.ts';
-import { parseCodexStream, parseQwenStream } from './tap.ts';
+import { looksLikeContextTruncation, parseCodexStream, parseQwenStream, type ParsedTurn } from './tap.ts';
 
 export type RoleNeed = 'read' | 'write';
 export type CheckKind = 'connection' | 'review' | 'write';
@@ -354,6 +355,29 @@ function classifyFailure(error: string | undefined, parsedError: string | undefi
   return short(e || 'the agent did not complete the task', 240);
 }
 
+/**
+ * Why a probe produced no tool calls at all, when the cause is a context window too small for
+ * Qwen Code's agent prompt. For local Ollama endpoints, /api/ps states the window the model was
+ * just served with (the probe left it loaded) — the server's own reading, so it is authoritative
+ * even when the stream shows no retries. Elsewhere, the stream's continuation-retry signature
+ * identifies the same failure. Undefined when the generic "no tool calls" message is the best
+ * explanation.
+ */
+async function noToolCallsDetail(profile: QwenProfile, parsed: ParsedTurn): Promise<string | undefined> {
+  // The server's own serving context is the authoritative evidence: below the minimum, no agent
+  // turn can ever reach a tool call, whatever the stream's retry count happened to be.
+  const location = endpointLocation(profile.baseUrl);
+  if (location !== 'cloud' && await isOllamaEndpoint(profile.baseUrl, location, 3000)) {
+    const ctx = await ollamaServedContext(profile.baseUrl, profile.model, 3000);
+    if (ctx !== undefined && ctx < QWEN_MIN_CONTEXT_TOKENS) return ollamaContextFix(profile.model, ctx);
+  }
+  // Otherwise, the stream's continuation-retry signature still says "window too small" without
+  // needing to know the server.
+  if (!looksLikeContextTruncation(parsed)) return undefined;
+  const total = typeof parsed.totalTokens === 'number' && parsed.totalTokens > 0 ? ` (every attempt stopped at a ${parsed.totalTokens.toLocaleString('en-US')}-token total)` : '';
+  return `The endpoint repeatedly cut the model's output short${total}: its context window is too small for Qwen Code's agent prompt (about 4,000 tokens), so the model never reached a tool call. Raise the serving context length and test again.`;
+}
+
 /** One reviewer or writer probe through Qwen Code with the exact launch policy of that role. */
 async function qwenRoleProbe(bin: BinSpec, profile: QwenProfile, access: RoleNeed, signal: AbortSignal): Promise<Omit<CheckOutcome, 'at'>> {
   const f = sandboxFolder();
@@ -378,10 +402,15 @@ async function qwenRoleProbe(bin: BinSpec, profile: QwenProfile, access: RoleNee
     const after = snapshot(f.repo);
     const escaped = changes(outsideBefore, snapshot(f.outside));
     if (escaped.length) return { ok: false, tools, detail: `Boundary violation: the ${access === 'read' ? 'reviewer' : 'writer'} changed ${escaped.join(', ')} outside its workspace` };
+    // When no tool call ever appeared, the stream often says why; ask the endpoint before
+    // falling back to "the model may not support tool calling".
+    const truncation = tools.length === 0 ? await noToolCallsDetail(profile, parsed) : undefined;
     if (access === 'read') {
       const changed = changes(before, after);
       if (changed.length) return { ok: false, tools, detail: `Boundary violation: the read-only reviewer changed ${changed.join(', ')}` };
-      if (signal.aborted || result.error) return { ok: false, tools, detail: classifyFailure(result.error, parsed.error, tools.length) };
+      if (signal.aborted) return { ok: false, tools, detail: 'Cancelled' };
+      if (truncation) return { ok: false, tools, detail: truncation };
+      if (result.error) return { ok: false, tools, detail: classifyFailure(result.error, parsed.error, tools.length) };
       const read = parsed.tools.find((t) => QWEN_READ_TOOLS.includes(t.name) && t.name !== 'structured_output' && !t.error);
       if (!read) return { ok: false, tools, detail: tools.length ? `No successful file-read tool call (saw ${tools.join(', ')})` : 'The model made no tool calls; it may not support tool calling through this endpoint' };
       if (!`${parsed.reply}\n${result.output}`.includes(f.marker)) return { ok: false, tools, detail: `Called ${read.name} but did not return the file's contents` };
@@ -391,7 +420,10 @@ async function qwenRoleProbe(bin: BinSpec, profile: QwenProfile, access: RoleNee
     const proof = join(f.repo, 'duo-writer-proof.txt');
     const content = existsSync(proof) ? readFileSync(proof, 'utf8').trim() : undefined;
     const wrote = parsed.tools.find((t) => ['write_file', 'edit', 'notebook_edit', 'run_shell_command'].includes(t.name) && !t.error);
-    if (content !== writeMarker) return { ok: false, tools, detail: result.error ? classifyFailure(result.error, parsed.error, tools.length) : content === undefined ? (tools.length ? `The file was not created (tool calls: ${tools.join(', ')})` : 'The model made no tool calls; it may not support tool calling through this endpoint') : 'The file was created with the wrong contents' };
+    if (content !== writeMarker) {
+      if (content === undefined && truncation) return { ok: false, tools, detail: truncation };
+      return { ok: false, tools, detail: result.error ? classifyFailure(result.error, parsed.error, tools.length) : content === undefined ? (tools.length ? `The file was not created (tool calls: ${tools.join(', ')})` : 'The model made no tool calls; it may not support tool calling through this endpoint') : 'The file was created with the wrong contents' };
+    }
     if (!wrote) return { ok: false, tools, detail: 'The file appeared without a recorded write tool call; the stream cannot prove how it was written' };
     return { ok: true, tools, detail: `Created a file with ${wrote.name} inside the disposable workspace; a write outside it was blocked; ${verified.detail}` };
   } catch (e) {

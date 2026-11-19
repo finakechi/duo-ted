@@ -25,7 +25,7 @@ const linux = process.platform === 'linux' && existsSync('/usr/bin/bwrap');
 const calls = () => (existsSync(LOG) ? readFileSync(LOG, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []);
 const probeDirs = () => readdirSync(tmpdir()).filter((d) => d.startsWith('duo-readiness-') && !tmp.endsWith(d));
 
-async function endpoint(models: string[], o: { status?: number } = {}): Promise<{ url: string; hits: () => number; auth: () => string[]; server: Server }> {
+async function endpoint(models: string[], o: { status?: number; ollama?: { servedContext: number } } = {}): Promise<{ url: string; hits: () => number; auth: () => string[]; server: Server }> {
   let hits = 0;
   const auth: string[] = [];
   const server = createServer((req, res) => {
@@ -33,6 +33,12 @@ async function endpoint(models: string[], o: { status?: number } = {}): Promise<
     auth.push(String(req.headers.authorization ?? ''));
     if (o.status) { res.writeHead(o.status).end('denied'); return; }
     res.setHeader('content-type', 'application/json');
+    const path = String(req.url ?? '/').split('?')[0];
+    if (o.ollama && path === '/api/version') { res.end(JSON.stringify({ version: '0.40.15' })); return; }
+    if (o.ollama && path === '/api/ps') {
+      res.end(JSON.stringify({ models: models.map((id) => ({ name: id, context_length: o.ollama!.servedContext })) }));
+      return;
+    }
     res.end(JSON.stringify({ data: models.map((id) => ({ id })) }));
   });
   await new Promise<void>((done) => server.listen(0, '127.0.0.1', done));
@@ -155,6 +161,43 @@ test('missing tool calls, a broken reviewer boundary and a missing sandbox each 
     const sandbox = await new ReadinessStore().check(cfg, 'qwen:desk', 'write');
     assert.match(sandbox.detail, /sandbox not established.*Permission denied/);
   } finally { ep.server.close(); delete process.env.FAKE_QWEN_PROBE; delete process.env.FAKE_QWEN_SANDBOX; }
+});
+
+test('a context window too small for the agent is diagnosed instead of blaming the model', { skip: !linux }, async () => {
+  const ep = await endpoint(['local-coder']);
+  try {
+    const cfg = config({ baseUrl: ep.url });
+    process.env.FAKE_QWEN_PROBE = 'truncated';
+    const review = await new ReadinessStore().check(cfg, 'qwen:desk', 'review');
+    assert.equal(review.status, 'failed');
+    assert.match(review.detail, /context window is too small/);
+    assert.match(review.detail, /16,384-token total/);
+    assert.doesNotMatch(review.detail, /may not support tool calling/, 'the truncation signature overrides the generic guess');
+    const write = await new ReadinessStore().check(cfg, 'qwen:desk', 'write');
+    assert.equal(write.status, 'failed');
+    assert.match(write.detail, /context window is too small/);
+  } finally { ep.server.close(); delete process.env.FAKE_QWEN_PROBE; }
+});
+
+test('an Ollama server that serves a small context window is named with its exact fix', { skip: !linux }, async () => {
+  const ep = await endpoint(['local-coder'], { ollama: { servedContext: 4096 } });
+  try {
+    const cfg = config({ baseUrl: ep.url });
+    process.env.FAKE_QWEN_PROBE = 'truncated';
+    const review = await new ReadinessStore().check(cfg, 'qwen:desk', 'review');
+    assert.equal(review.status, 'failed');
+    assert.match(review.detail, /Ollama served local-coder/);
+    assert.match(review.detail, /4,096-token context/);
+    assert.match(review.detail, /OLLAMA_CONTEXT_LENGTH=32768/);
+    assert.match(review.detail, /systemctl edit ollama/);
+    // The server's own served context is enough evidence: an empty turn with no retry events
+    // still gets the exact diagnosis instead of the generic guess.
+    process.env.FAKE_QWEN_PROBE = 'empty';
+    const empty = await new ReadinessStore().check(cfg, 'qwen:desk', 'write');
+    assert.equal(empty.status, 'failed');
+    assert.match(empty.detail, /Ollama served local-coder/);
+    assert.match(empty.detail, /OLLAMA_CONTEXT_LENGTH=32768/);
+  } finally { ep.server.close(); delete process.env.FAKE_QWEN_PROBE; }
 });
 
 test('a change to the profile, endpoint or harness makes earlier proof stale', { skip: !linux }, async () => {
