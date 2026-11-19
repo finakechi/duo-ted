@@ -187,6 +187,28 @@ test('overrides reject unknown seats and unconfigured Qwen profiles', async () =
   await ctx.fail(new Error('cancelled'), []);
 });
 
+const deferred = () => { let resolve!: (v: void) => void; const promise = new Promise<void>((r) => { resolve = r; }); return { promise, resolve }; };
+
+test('DT-02: a stop racing a seat that is still opening retires it and never spawns a turn', async (t) => {
+  rmSync(LOG, { force: true });
+  const ctx = ctxFor('ask', ['claude:sonnet@low']);
+  const manager = (ctx.engines as any).manager;
+  const gate = deferred();
+  const stopped: string[] = [];
+  const start = t.mock.method(manager, 'startSession', async () => { await gate.promise; return {}; });
+  t.mock.method(manager, 'stopSession', async (name: string) => { stopped.push(name); });
+  const work = ask(ctx);
+  // Deterministically reach openSeat's session start, then stop while it is still opening.
+  for (let i = 0; i < 300 && start.mock.callCount() === 0; i++) await new Promise((r) => setTimeout(r, 10));
+  assert.equal(start.mock.callCount(), 1, 'the seat reached session startup');
+  ctx.cancel();
+  gate.resolve();
+  await work;
+  assert.equal(ctx.store.meta.status, 'cancelled');
+  assert.equal(ctx.store.meta.turns.length, 0, 'cancellation during seat opening never starts a turn');
+  assert.ok(stopped.length >= 1, 'the session that finished opening during the stop was retired');
+});
+
 test('Qwen continuation recovers pending instructions and a future assignment from the previous run', { skip: process.platform !== 'linux' || !existsSync('/usr/bin/bwrap') }, async () => {
   rmSync(LOG, { force: true });
   const original = ctxFor('ask', ['qwen:qwen3-coder-plus']);

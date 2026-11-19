@@ -125,14 +125,22 @@ export class ChatManager {
   private readonly perms: PermissionBroker;
   private readonly api: { url: string; token: string };
   private readonly mcpScript: string;
+  /**
+   * Same rule every workflow enforces: an optional model (DeepSeek, a Qwen endpoint profile) may
+   * take a write-access chat role only after its writer test, and any other chat role only after
+   * its reviewer test. Built-in Claude/Codex seats need no test. When a chat is not eligible,
+   * nothing is spawned and no endpoint is contacted; the turn fails with the reason.
+   */
+  private readonly eligibility?: (seat: Seat, need: 'read' | 'write') => Promise<string | undefined>;
 
-  constructor(bus: Bus, cfg: Config, bins: { codex: BinSpec; claude: BinSpec }, perms: PermissionBroker, api: { url: string; token: string }, mcpScript: string) {
+  constructor(bus: Bus, cfg: Config, bins: { codex: BinSpec; claude: BinSpec }, perms: PermissionBroker, api: { url: string; token: string }, mcpScript: string, eligibility?: (seat: Seat, need: 'read' | 'write') => Promise<string | undefined>) {
     this.bus = bus;
     this.cfg = cfg;
     this.bins = bins;
     this.perms = perms;
     this.api = api;
     this.mcpScript = mcpScript;
+    this.eligibility = eligibility;
     for (const d of [CHATS_DIR, TAPS_DIR, MCP_DIR]) mkdirSync(d, { recursive: true });
     // Permission-bridge files carry the token of the launch that wrote them, and tokens are per
     // launch: any found now were left by a launch that crashed, so they hold a dead token.
@@ -198,6 +206,14 @@ export class ChatManager {
     const table = engine === 'claude' ? CLAUDE_ACCESS : engine === 'codex' ? CODEX_ACCESS : QWEN_ACCESS;
     if (!Object.hasOwn(table, access)) throw new Error(`unknown access "${access}" for ${engine} (${Object.keys(table).join(', ')})`);
     return seat;
+  }
+
+  /** Why this chat's seat may not run with its access; undefined when it may (see `eligibility`). */
+  private async eligible(s: ChatSession): Promise<string | undefined> {
+    if (!this.eligibility) return undefined;
+    const seat = parseSeat(s.spec, 'A', this.cfg.defaults);
+    if (!seat.provider && !seat.profile) return undefined;
+    return this.eligibility(seat, s.access === 'read-only' ? 'read' : 'write');
   }
 
   create(o: { engine: Engine; spec?: string; access?: string; cwd: string; useCodexConfig?: boolean; title?: string }): ChatSession {
@@ -465,6 +481,10 @@ export class ChatManager {
       this.perms.cancelChat(s.id);
       void this.stopLive(s.id);
     } });
+    // Role readiness before any process starts: an unverified optional model is refused with the
+    // reason instead of being sent work (the same gate runs enforce, via Engines.openSeat).
+    const ineligible = await this.eligible(s);
+    if (ineligible) return this.endTurn(s, turn, started, { error: ineligible });
     if (s.engine === 'qwen') return this.runQwenTurn(s, turn, text, started);
     try {
       clawName = await this.ensureLive(s);

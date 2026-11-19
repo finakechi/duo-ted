@@ -389,7 +389,7 @@ function ready(): void {
   const addr = server.address();
   const port = typeof addr === 'object' && addr ? addr.port : 0;
   const url = `http://127.0.0.1:${port}`;
-  chats = new ChatManager(bus, cfg, bins, perms, { url, token }, MCP_SCRIPT);
+  chats = new ChatManager(bus, cfg, bins, perms, { url, token }, MCP_SCRIPT, (seat, need) => readiness.eligibility(loadConfig(), seat, need));
   runs = new RunManager(bus, cfg, readiness);
   process.stdout.write(JSON.stringify({ ready: true, url, token, platform: IS_WIN ? 'win32' : IS_MAC ? 'darwin' : process.platform }) + '\n');
   // Ask both CLIs their versions in the background now, so a run started later (which records them
