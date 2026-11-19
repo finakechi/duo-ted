@@ -161,3 +161,33 @@ test('the HTML export of a run can never run scripts', async () => {
   assert.doesNotMatch(res.headers.get('content-security-policy') ?? '', /script-src/);
   assert.match(await res.text(), /<h2>Turns<\/h2>/);
 });
+
+test('legacy Claude/Codex-only state has no optional targets; readiness API validates and never contacts disabled providers', async () => {
+  const state = (await api('/api/state')).data;
+  assert.deepEqual(state.readiness, {});
+  assert.deepEqual(state.profilePolicy, {});
+  assert.equal(state.deepseek.enabled, false);
+  assert.equal(state.localModelsEnabled, false);
+  assert.equal((await api('/api/readiness/check', 'POST', { target: 'qwen:none', kind: 'bogus' })).status, 400);
+  const unknown = await api('/api/readiness/check', 'POST', { target: 'qwen:none', kind: 'connection' });
+  assert.equal(unknown.status, 200);
+  assert.equal(unknown.data.status, 'unsupported');
+  const ds = await api('/api/readiness/check', 'POST', { target: 'deepseek:deepseek-flash', kind: 'review' });
+  assert.equal(ds.data.status, 'disabled');
+  // A new profile that violates the endpoint policy cannot be saved; the reason is returned.
+  const bad = await api('/api/config', 'PUT', { qwenProfiles: { lan: { name: 'LAN', kind: 'local', model: 'm', baseUrl: 'http://192.168.1.20:11434/v1' } } });
+  assert.equal(bad.status, 400);
+  assert.match(bad.data.error, /Allow local-network endpoint/);
+  const hosted = await api('/api/config', 'PUT', { qwenProfiles: { h: { name: 'H', kind: 'hosted', model: 'm', baseUrl: 'https://example.invalid/v1' } } });
+  assert.match(hosted.data.error, /never falls back to OPENAI_API_KEY/);
+  const ok = await api('/api/config', 'PUT', { qwenProfiles: { lan: { name: 'LAN', kind: 'local', model: 'm', baseUrl: 'http://192.168.1.20:11434/v1', lan: true, enabled: false } } });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.data.profilePolicy.lan.location, 'lan');
+  assert.equal(ok.data.readiness['qwen:lan'].status, 'disabled');
+  const manual = await api('/api/assignments/suggest', 'POST', { protocol: 'pair', seats: ['codex:gpt-6-sol', 'claude:sonnet'] });
+  assert.deepEqual(manual.data.blocked, []);
+  const blocked = await api('/api/runs', 'POST', { protocol: 'ask', seats: ['qwen:m+profile=lan'], cwd: temp, brief: 'x' });
+  assert.equal(blocked.status, 400);
+  assert.match(blocked.data.error, /disabled/);
+  await api('/api/config', 'PUT', { qwenProfiles: {} });
+});

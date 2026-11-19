@@ -47,6 +47,10 @@ export interface SeatRecord {
   role: string;
   customRole?: boolean;
   clawSession: string;
+  /** Identity of the model backend that holds this seat's conversation (see providers.backendKey). */
+  backendKey?: string;
+  /** Where the seat's model ran, from its endpoint address. */
+  location?: 'device' | 'lan' | 'cloud';
   codexThreadId?: string;
   claudeSessionId?: string;
   qwenSessionId?: string;

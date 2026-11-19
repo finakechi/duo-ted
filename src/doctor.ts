@@ -6,7 +6,9 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { binVersionAsync, runBinAsync, type BinSpec } from './bins.ts';
-import { codexCatalogAsync, resolveClaudeBin, resolveCodexBin, type Config } from './config.ts';
+import { codexCatalogAsync, endpointLocation, profileIssues, resolveClaudeBin, resolveCodexBin, resolveQwenBin, type Config } from './config.ts';
+import { isOllamaEndpoint, ollamaServedContext, OLLAMA_RECOMMENDED_CONTEXT, QWEN_MIN_CONTEXT_TOKENS } from './ollama.ts';
+import { bwrapAvailable, qwenVersionStatus } from './qwen.ts';
 import { gitAsync } from './worktree.ts';
 import { errorHint } from './errors.ts';
 import { CONFIG_PATH, DUO_HOME, PROJECT_ROOT } from './paths.ts';
@@ -90,6 +92,28 @@ export async function runDoctor(cfg: Config, o: { quick?: boolean } = {}): Promi
     fix: cfg.deepseek.enabled && !process.env[cfg.deepseek.keyEnv] ? `Set ${cfg.deepseek.keyEnv} before starting Duo.` : undefined });
   add({ id: 'local-models', label: 'Local Models', level: 'info',
     detail: cfg.localModelsEnabled ? `enabled · ${Object.values(cfg.qwenProfiles).filter((p) => p.kind === 'local' && p.enabled !== false).length} active profiles (connection not tested)` : 'disabled (optional)' });
+  // Only when the user has active Qwen endpoint profiles: legacy Claude/Codex setups see no new lines.
+  const active = Object.entries(cfg.qwenProfiles).filter(([, p]) => p.enabled !== false && (p.kind === 'hosted' || cfg.localModelsEnabled));
+  if (active.length) {
+    let qwen: { version: string; ok: boolean; reason?: string } | undefined;
+    try { qwen = await qwenVersionStatus(resolveQwenBin(cfg)); } catch { /* not installed */ }
+    const sandbox = bwrapAvailable();
+    add({ id: 'qwen-harness', label: 'Qwen Code harness', level: qwen?.ok && sandbox ? 'ok' : 'warn',
+      detail: !qwen ? 'not installed: Qwen endpoint profiles cannot run as agents' : !qwen.ok ? qwen.reason! : !sandbox ? `${qwen.version} · /usr/bin/bwrap missing, Qwen seats are refused` : `${qwen.version} (verified release) · Bubblewrap available · roles still need the readiness tests in Settings`,
+      fix: !qwen ? 'Install Qwen Code 0.28.x, or set qwenBin in the Duo config.' : !qwen.ok ? 'Install a Qwen Code release Duo has verified (0.28.x).' : !sandbox ? 'Install Bubblewrap (bwrap) from your distribution.' : undefined });
+    for (const [id, p] of active) {
+      const issue = profileIssues(id, p)[0];
+      if (issue) { add({ id: `profile-${id}`, label: `Profile ${id}`, level: 'warn', detail: issue, fix: 'Edit the profile in Settings.' }); continue; }
+      // Passive read of the server's own status: a model currently loaded with a 4K window can
+      // never run Qwen Code's agent prompt, so say so before the user wastes a readiness test.
+      if (p.kind === 'local' && !o.quick && await isOllamaEndpoint(p.baseUrl, endpointLocation(p.baseUrl), 3000)) {
+        const ctx = await ollamaServedContext(p.baseUrl, p.model, 3000);
+        if (ctx !== undefined && ctx < QWEN_MIN_CONTEXT_TOKENS) add({ id: `profile-${id}-context`, label: `Profile ${id} context window`, level: 'warn',
+          detail: `${p.model} is currently loaded with a ${ctx.toLocaleString('en-US')}-token context window; Qwen Code's agent prompt needs at least ${QWEN_MIN_CONTEXT_TOKENS.toLocaleString('en-US')}`,
+          fix: `Set OLLAMA_CONTEXT_LENGTH=${OLLAMA_RECOMMENDED_CONTEXT} on the Ollama server and restart it (systemd: sudo systemctl edit ollama, add Environment="OLLAMA_CONTEXT_LENGTH=32768" under [Service], then sudo systemctl restart ollama).` });
+      }
+    }
+  }
   add({ id: 'data', label: 'data', level: 'info', detail: DUO_HOME });
   return out;
 }

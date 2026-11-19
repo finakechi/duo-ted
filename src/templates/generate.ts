@@ -12,14 +12,14 @@ const OUTPUT = {
   type: 'object', properties: { templateJson: { type: 'string' }, explanation: { type: 'string' } },
   required: ['templateJson', 'explanation'], additionalProperties: false,
 };
-export interface GenerateRequest { description: string; model: string; current?: CoordinationTemplate; safe?: boolean; sink?: RunOptions['sink']; onContext?: (ctx: RunContext) => void; }
+export interface GenerateRequest { description: string; model: string; current?: CoordinationTemplate; safe?: boolean; sink?: RunOptions['sink']; onContext?: (ctx: RunContext) => void; eligibility?: RunOptions['eligibility']; }
 /** Compile descriptions to drafts with the chosen local model; validate and repair before returning. */
 export async function generateTemplate(cfg: Config, req: GenerateRequest): Promise<{ template: CoordinationTemplate; explanation: string; run: string; }> {
   if (!req.description?.trim() || req.description.length > 30000) throw new Error('Describe the coordination method in 1–30000 characters');
   if (req.current) validateTemplate(req.current);
   const seat = parseSeat(req.model, 'A', cfg.defaults, { safe: req.safe });
   const cwd = join(SCRATCH_DIR, 'template-builder'); mkdirSync(cwd, { recursive: true });
-  const ctx = RunContext.create(cfg, { protocol: 'template-builder', title: 'Build coordination template', brief: req.description, cwd, seats: [seat], rounds: 1, minRounds: 1, anon: false, quiet: true, workspace: false, extra: {}, sink: req.sink });
+  const ctx = RunContext.create(cfg, { protocol: 'template-builder', title: 'Build coordination template', brief: req.description, cwd, seats: [seat], rounds: 1, minRounds: 1, anon: false, quiet: true, workspace: false, extra: {}, sink: req.sink, eligibility: req.eligibility });
   req.onContext?.(ctx);
   const sessions = [];
   try {

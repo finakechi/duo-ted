@@ -41,6 +41,8 @@ export interface ChatTurn {
   unpriced?: string;
   error?: string;
   hint?: string;
+  /** This turn began a new provider conversation; earlier turns were not sent to it. */
+  newContext?: string;
 }
 
 export interface ChatSummary {
@@ -248,8 +250,18 @@ export interface GuiDefaults {
   theme: 'system' | 'light' | 'dark';
   notify: boolean;
 }
-export interface QwenProfile { name: string; kind: 'hosted' | 'local'; model: string; baseUrl: string; keyEnv?: string; enabled?: boolean; capabilities?: { tools?: boolean; structuredOutput?: boolean; reasoning?: boolean; contextTokens?: number; multimodal?: boolean }; }
+export interface QwenProfile { name: string; kind: 'hosted' | 'local'; model: string; baseUrl: string; keyEnv?: string; lan?: boolean; enabled?: boolean; capabilities?: { tools?: boolean; structuredOutput?: boolean; reasoning?: boolean; contextTokens?: number; multimodal?: boolean }; }
 export interface DeepSeekSettings { enabled: boolean; keyEnv: string; models: string[]; }
+export type EndpointLocation = 'device' | 'lan' | 'cloud';
+export interface CheckOutcome { ok: boolean; detail: string; tools?: string[]; at: string; modelListed?: boolean; }
+/** Role readiness of an optional model (server: src/readiness.ts). */
+export interface ReadinessView {
+  target: string; label: string; engine: 'qwen' | 'codex'; provider: 'deepseek' | 'local' | 'hosted'; model: string;
+  location: EndpointLocation; endpoint: string;
+  status: 'disabled' | 'unsupported' | 'untested' | 'checking' | 'unreachable' | 'connected' | 'failed' | 'read-verified' | 'write-verified';
+  detail: string; roles: { review: boolean; write: boolean };
+  connection?: CheckOutcome; review?: CheckOutcome; write?: CheckOutcome; stale?: boolean; paid: boolean; harness?: string;
+}
 
 export interface Prefs {
   project?: string;
@@ -283,6 +295,8 @@ export interface AppState {
   access: { claude: Record<string, string>; codex: Record<string, string>; qwen: Record<string, string>; };
   models: { codex: CodexModel[]; claude: { alias: string; note: string; }[]; };
   qwenProfiles: Record<string, QwenProfile>;
+  profilePolicy: Record<string, { location: EndpointLocation; issues: string[] }>;
+  readiness: Record<string, ReadinessView>;
   deepseek: DeepSeekSettings;
   localModelsEnabled: boolean;
   rates: Record<string, [number, number, number]>;

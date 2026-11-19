@@ -38,7 +38,7 @@ test('Codex provider overrides keep credentials out of argv and catalog', () => 
   configuration.deepseek.enabled = true;
   const seat = parseSeat('codex:deepseek-v4-pro@high+provider=deepseek', 'A', defaults);
   assert.equal(validateProviderSeat(configuration, seat), undefined);
-  assert.deepEqual(seat.backend, { provider: 'deepseek', locality: 'cloud' });
+  assert.deepEqual(seat.backend, { provider: 'deepseek', locality: 'cloud', location: 'cloud' });
   assert.throws(() => deepseekForSeat(configuration, seat, scratch), /DEEPSEEK_API_KEY/);
   process.env.DEEPSEEK_API_KEY = 'private-secret-not-for-logs';
   try {
@@ -58,7 +58,7 @@ test('Local profile gates are optional and fail safely for incompatible tools', 
   assert.throws(() => validateProviderSeat(configuration, seat), /disabled/);
   configuration.localModelsEnabled = true;
   assert.ok(validateProviderSeat(configuration, seat));
-  assert.deepEqual(seat.backend, { provider: 'local', locality: 'local' });
+  assert.deepEqual(seat.backend, { provider: 'local', locality: 'local', location: 'device' });
   configuration.qwenProfiles.desk.enabled = false;
   assert.throws(() => validateProviderSeat(configuration, seat), /disabled/);
   configuration.qwenProfiles.desk.enabled = true;

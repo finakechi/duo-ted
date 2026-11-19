@@ -38,6 +38,25 @@ if (mode === 'fatal') {
 if (mode === 'slow') await new Promise((r) => setTimeout(r, Number(process.env.FAKE_CODEX_SLOW_MS ?? 20_000)));
 if (mode === 'reconnect') out({ type: 'error', message: 'Reconnecting... 1/5 (stream disconnected before completion: idle timeout waiting for websocket)' });
 
+// Readiness probes: read the proof file with a command, or write the requested proof file.
+if (prompt.includes('automated Duo capability test')) {
+  const sandboxMode = valueOf(args, '--sandbox');
+  if (prompt.includes('read the file proof.txt')) {
+    const content = existsSync('proof.txt') ? readFileSync('proof.txt', 'utf8').trim() : '';
+    out({ type: 'item.completed', item: { id: 'cat', type: 'command_execution', command: 'cat proof.txt', aggregated_output: content + '\n', exit_code: 0, status: 'completed' } });
+    out({ type: 'item.completed', item: { id: 'msg', type: 'agent_message', text: content } });
+  } else {
+    const marker = /DUO_WRITE_PROOF_\w+/.exec(prompt)?.[0];
+    if (marker && sandboxMode === 'workspace-write') {
+      writeFileSync('duo-writer-proof.txt', marker + '\n');
+      out({ type: 'item.completed', item: { id: 'p', type: 'file_change', changes: [{ path: 'duo-writer-proof.txt', kind: 'add' }], status: 'completed' } });
+    }
+    out({ type: 'item.completed', item: { id: 'msg', type: 'agent_message', text: 'done' } });
+  }
+  out({ type: 'turn.completed', usage: { input_tokens: 10, cached_input_tokens: 0, output_tokens: 2, reasoning_output_tokens: 0 } });
+  process.exit(0);
+}
+
 out({ type: 'item.started', item: { id: 'cmd', type: 'command_execution', command: 'ls', aggregated_output: '', status: 'in_progress' } });
 out({ type: 'item.completed', item: { id: 'cmd', type: 'command_execution', command: 'ls', aggregated_output: 'README.md\n', exit_code: 0, status: 'completed' } });
 

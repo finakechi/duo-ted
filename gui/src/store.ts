@@ -225,8 +225,12 @@ export function stopChat(chatId: string): void {
 }
 
 export async function patchChat(chatId: string, patch: Record<string, unknown>): Promise<void> {
-  const c = await guard(api<ChatSession>(`/api/chats/${chatId}`, { method: 'PATCH', body: patch }));
-  if (c) chats.value = { ...chats.value, [chatId]: { ...chats.value[chatId], ...c } };
+  const c = await guard(api<ChatSession & { notice?: string }>(`/api/chats/${chatId}`, { method: 'PATCH', body: patch }));
+  if (!c) return;
+  const { notice, ...chat } = c;
+  chats.value = { ...chats.value, [chatId]: { ...chats.value[chatId], ...chat } };
+  // Switching provider starts a new conversation; say so when it happens.
+  if (notice) toast(notice, 'info');
 }
 
 export async function deleteChat(chatId: string): Promise<void> {
@@ -363,6 +367,9 @@ function onEvent(e: any): void {
     }
     case 'quota':
       if (s) app.value = { ...s, quota: e.quota };
+      break;
+    case 'readiness':
+      if (s && e.view) app.value = { ...s, readiness: { ...s.readiness, [e.target]: e.view } };
       break;
     case 'models':
       // The engine served a cached Codex catalog and has fetched a fresh one in the background.

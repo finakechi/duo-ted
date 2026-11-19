@@ -25,7 +25,7 @@ import { killTree } from './platform.ts';
 import { codexPrice } from './pricing.ts';
 import { saveClaudeQuota } from './quota.ts';
 import { executeQwen } from './qwen.ts';
-import { deepseekForSeat, validateProviderSeat } from './providers.ts';
+import { backendKey, deepseekForSeat, seatLocation, validateProviderSeat } from './providers.ts';
 import { codexOverrides, formatSeat, type Seat } from './seats.ts';
 import type { RunStore, SeatRecord, TurnRecord, Usage } from './store.ts';
 import { extractJson, parseClaudeStream, parseCodexStream, parseQwenStream, type ParsedTurn } from './tap.ts';
@@ -52,7 +52,7 @@ export interface SeatSession {
   live?: { n: number; round: number; kind: string; translator: ClaudeTranslator | CodexTranslator; pending: Set<Block>; timer?: ReturnType<typeof setTimeout>; };
   codexRouteName?: string;
   claudeSinkId?: string;
-  qwen?: { cwd: string; system: string; schema?: object; access: 'read' | 'write'; profile?: QwenProfile; process?: ChildProcessWithoutNullStreams; };
+  qwen?: { cwd: string; system: string; schema?: object; access: 'read' | 'write'; network: boolean; profile?: QwenProfile; process?: ChildProcessWithoutNullStreams; };
   /** Kept so a future seat can change providers without widening this role's permissions. */
   setup?: { role: SeatRecord['role']; opts: Parameters<Engines['openSeat']>[2]; };
   /** The protocol retains the original handle; new turns go to the replacement session. */
@@ -81,7 +81,15 @@ export interface EngineHooks {
   onTurnStart?: (seat: string, n: number, round: number, kind: string) => void;
   /** Streaming blocks of a turn in flight, throttled. */
   onLive?: (u: LiveUpdate) => void;
+  /**
+   * Why this seat may not take a role with this access (an optional model without a passing
+   * readiness test); undefined allows it. Applied to every seat any workflow opens.
+   */
+  eligibility?: (seat: Seat, need: 'read' | 'write') => Promise<string | undefined>;
 }
+
+/** The error a cancelled run's late operations end with (classifyError: aborted). */
+export const CANCELLED = 'duo: run cancelled';
 
 export class Engines {
   private manager: SessionManager;
@@ -128,11 +136,25 @@ export class Engines {
       access?: SeatAccess;
       /** Hide the user's installed Codex skills from the seat (discussion seats do not need them). */
       hideSkills?: boolean;
-      resume?: Pick<SeatRecord, 'codexThreadId' | 'claudeSessionId' | 'qwenSessionId' | 'codexUsageTotals' | 'claudeCostTotal'>;
+      resume?: Pick<SeatRecord, 'codexThreadId' | 'claudeSessionId' | 'qwenSessionId' | 'codexUsageTotals' | 'claudeCostTotal' | 'backendKey'>;
     },
   ): Promise<SeatSession> {
+    if (this.stopped) throw new Error(CANCELLED);
     const configuredProfile = validateProviderSeat(this.cfg, seat);
     if (opts.schema && configuredProfile?.capabilities?.structuredOutput === false) throw new Error(`profile ${seat.profile} cannot produce the structured responses required by this role`);
+    const need = opts.access?.kind === 'write' ? 'write' : 'read';
+    if (seat.engine === 'qwen' && opts.access?.kind === 'write' && opts.access.codexSandbox === 'danger-full-access') {
+      throw new Error('Qwen Code cannot run with full access: Duo runs Qwen writers only inside its Bubblewrap workspace sandbox. Choose "Sandboxed" or "Sandboxed + network" writer access');
+    }
+    const ineligible = await this.hooks.eligibility?.(seat, need);
+    if (ineligible) throw new Error(ineligible);
+    // A stored conversation may only continue on the backend that holds it.
+    const key = backendKey(this.cfg, seat);
+    const resumes = opts.resume && (opts.resume.codexThreadId || opts.resume.claudeSessionId || opts.resume.qwenSessionId);
+    if (resumes && (opts.resume!.backendKey ? opts.resume!.backendKey !== key : !!(seat.profile || seat.provider))) {
+      throw new Error(`${seat.id}: the model endpoint changed since this conversation was recorded; continuing it would send its history to a different provider. Start a new run instead`);
+    }
+    if (this.stopped) throw new Error(CANCELLED);
     const access = opts.access ?? { kind: 'read' };
     const suffix = opts.sessionKey ?? (role === 'chair' ? 'chair' : role === 'reviewer' ? `${seat.id}-rev` : seat.id);
     const clawName = `duo-${this.runTag}-${suffix}`;
@@ -148,6 +170,8 @@ export class Engines {
       role,
       ...(opts.sessionKey ? { customRole: true } : {}),
       clawSession: clawName,
+      backendKey: key,
+      location: seatLocation(this.cfg, seat),
       codexThreadId: opts.resume?.codexThreadId,
       claudeSessionId: opts.resume?.claudeSessionId,
       qwenSessionId: opts.resume?.qwenSessionId,
@@ -204,7 +228,12 @@ export class Engines {
           ...(ss.record.codexThreadId ? { resumeSessionId: ss.record.codexThreadId } : {}),
         }));
       };
-      await start();
+      try {
+        await start();
+      } catch (e) {
+        dropCodexRoute(route);
+        throw e;
+      }
       ss.restart = async () => {
         await this.manager.stopSession(clawName).catch(() => undefined);
         await start();
@@ -212,7 +241,7 @@ export class Engines {
     } else if (seat.engine === 'qwen') {
       if (!this.bins.qwen) throw new Error('Qwen Code CLI is not configured');
       const profile = configuredProfile;
-      ss.qwen = { cwd: opts.cwd, system: opts.system, schema: opts.schema, access: access.kind === 'read' ? 'read' : 'write', profile };
+      ss.qwen = { cwd: opts.cwd, system: opts.system, schema: opts.schema, access: access.kind === 'read' ? 'read' : 'write', network: access.kind === 'write' && !!access.network, profile };
       ss.restart = async () => undefined; // each Qwen turn is a new CLI process with --resume
     } else {
       const sessionId = opts.resume?.claudeSessionId ?? randomUUID();
@@ -244,6 +273,11 @@ export class Engines {
       };
     }
     this.sessions.add(ss);
+    // Cancelled while the session was being created: stop it rather than hand it to a workflow.
+    if (this.stopped) {
+      await this.retire(ss);
+      throw new Error(CANCELLED);
+    }
     return ss;
   }
 
@@ -284,6 +318,10 @@ export class Engines {
       sessionKey: `${current.seat.id}-override-${randomUUID().slice(0, 8)}`,
       resume: undefined,
     });
+    if (this.stopped) {
+      await this.retire(next);
+      throw new Error(CANCELLED);
+    }
     next.record.customRole = current.record.customRole;
     await this.retire(current);
     handle.redirect = next;
@@ -294,6 +332,8 @@ export class Engines {
 
   /** One turn: send, then rebuild the full record from the raw stream. */
   async send(ss: SeatSession, message: string, o: SendOpts): Promise<TurnRecord> {
+    // Never start work after a stop, even if a caller raced it (an override that was opening a seat).
+    if (this.stopped) throw new Error(CANCELLED);
     ss = ss.redirect ?? ss;
     const n = this.run.allocTurn();
     const seatKey = ss.record.role === 'chair' && !ss.record.customRole ? 'chair' : ss.seat.id;
@@ -311,7 +351,7 @@ export class Engines {
           const q = ss.qwen;
           const result = await executeQwen({ bin: this.bins.qwen!, model: ss.seat.model, cwd: q.cwd, system: q.system,
             schema: q.schema, message, timeoutSec, resumeId: ss.record.qwenSessionId, profile: q.profile,
-            access: q.access, configDir: this.run.dir, id: `${this.runTag}-${ss.seat.id}`,
+            access: q.access, network: q.network, configDir: this.run.dir, id: `${this.runTag}-${ss.seat.id}`,
             onLine: (line) => { ss.capture.push(line); try { appendFileSync(join(this.tapsDir, `${ss.seat.id}.jsonl`), line + '\n'); } catch {} this.feedLive(ss, line); },
             onProcess: (proc) => { q.process = proc; },
           });
@@ -410,7 +450,7 @@ export class Engines {
       rateLimits: parsed.rateLimits,
       verdict: typeof (structured as any)?.verdict === 'string' ? (structured as any).verdict : undefined,
       ...(o.templateStep ? { templateStep: o.templateStep } : {}),
-      error: parsed.error || transportError || (!reply ? (this.stopped ? 'duo: run cancelled' : 'empty reply') : undefined),
+      error: parsed.error || transportError || (!reply ? (this.stopped ? CANCELLED : 'empty reply') : undefined),
       warnings: parsed.warnings.length ? parsed.warnings : undefined,
     };
     this.run.writeTurn(turn, message, raw);
