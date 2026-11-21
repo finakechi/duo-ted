@@ -545,6 +545,13 @@ function Settings({ tab: initial }: { tab?: 'general' | 'deepseek' | 'local' | '
   const [presets, setPresets] = useState(JSON.stringify(s.presets, null, 2));
   const [profiles, setProfiles] = useState(structuredClone(s.qwenProfiles));
   const [deepseek, setDeepseek] = useState(structuredClone(s.deepseek));
+  const [deepseekKey, setDeepseekKey] = useState('');
+  const [keyStatus, setKeyStatus] = useState<{ available: boolean; saved: boolean; reason?: string } | null>(null);
+  useEffect(() => {
+    if (!desktop?.deepseekKeyStatus) return;
+    void desktop.deepseekKeyStatus().then(setKeyStatus).catch(() =>
+      setKeyStatus({ available: false, saved: false, reason: 'Cannot access desktop credential storage.' }));
+  }, []);
   const [localEnabled, setLocalEnabled] = useState(s.localModelsEnabled);
   const [newProfileId, setNewProfileId] = useState('local');
   const [newHostedId, setNewHostedId] = useState('hosted');
@@ -561,7 +568,15 @@ function Settings({ tab: initial }: { tab?: 'general' | 'deepseek' | 'local' | '
       setErr(`Invalid presets JSON: ${(e as Error).message}`);
       return;
     }
-    if (await saveSettings({ gui, presets: p, qwenProfiles: profiles, deepseek, localModelsEnabled: localEnabled, warnPercent: warn })) close();
+    if (!await saveSettings({ gui, presets: p, qwenProfiles: profiles, deepseek, localModelsEnabled: localEnabled, warnPercent: warn })) return;
+    if (deepseekKey) {
+      try {
+        if (!desktop?.saveDeepseekKey) throw new Error('Saving keys requires the Duo desktop app.');
+        setKeyStatus(await desktop.saveDeepseekKey(deepseekKey));
+        setDeepseekKey('');
+      } catch (e) { setErr((e as Error).message); return; }
+    }
+    close();
   };
   const dirty = ['general', 'deepseek', 'local', 'presets'].includes(tab);
   const editProfile = (id: string, patch: Partial<AppState['qwenProfiles'][string]>) => setProfiles((current) => ({ ...current, [id]: { ...current[id], ...patch } }));
@@ -635,8 +650,25 @@ function Settings({ tab: initial }: { tab?: 'general' | 'deepseek' | 'local' | '
           <Toggle checked={deepseek.enabled} onChange={(enabled) => setDeepseek({ ...deepseek, enabled })} label="Enable DeepSeek" hint="Off by default; no connection is attempted while disabled" />
           {deepseek.enabled && <>
             <p class="muted small">Codex is the coding engine; DeepSeek provides the model. API usage is billed by DeepSeek. Duo does not enable paid web search.</p>
-            <label class="field">API key environment variable<input class="mono" value={deepseek.keyEnv} spellcheck={false} onInput={(e) => setDeepseek({ ...deepseek, keyEnv: e.currentTarget.value })} /></label>
-            <p class="muted small">Set this variable before starting Duo. The key itself is never saved in settings.</p>
+            {desktop?.saveDeepseekKey ? <>
+              <label class="field">API key (saved on this device)
+                <input type="password" class="mono" autocomplete="off" spellcheck={false}
+                  placeholder={keyStatus?.saved ? 'Enter a replacement key' : 'Paste your DeepSeek API key'}
+                  value={deepseekKey} onInput={(e) => setDeepseekKey(e.currentTarget.value)} disabled={!keyStatus?.available} />
+              </label>
+              <div class="row wrap">
+                <span class="muted small" role="status">{keyStatus?.saved ? 'A key is saved (contents hidden).' : 'No saved key.'}</span>
+                {keyStatus?.saved && <button type="button" class="btn small" onClick={async () => {
+                  if (!window.confirm('Remove the saved DeepSeek key from this device?')) return;
+                  try { setKeyStatus(await desktop.removeDeepseekKey()); setDeepseekKey(''); setErr(''); }
+                  catch (e) { setErr((e as Error).message); }
+                }}>Remove saved key</button>}
+              </div>
+              {keyStatus?.reason && <p class="muted small">{keyStatus.reason}</p>}
+              <p class="muted small">Enter a key and press Save. It is encrypted using your OS keychain, never shown again or stored in config.json. Leave blank to keep the existing key.</p>
+            </> : <p class="muted small">Direct key storage requires the Duo desktop app.</p>}
+            <label class="field">Fallback API-key environment variable<input class="mono" value={deepseek.keyEnv} spellcheck={false} onInput={(e) => setDeepseek({ ...deepseek, keyEnv: e.currentTarget.value })} /></label>
+            <p class="muted small">Used when no desktop key is available. Set it before starting Duo.</p>
             <label class="field">Model identifiers (one per line)<textarea rows={3} class="mono" value={deepseek.models.join('\n')} spellcheck={false} onInput={(e) => setDeepseek({ ...deepseek, models: e.currentTarget.value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean) })} /></label>
             <button type="button" class="btn small" onClick={async () => {
               setQwenChecks((c) => ({ ...c, deepseek: 'Checking DeepSeek model discovery…' }));

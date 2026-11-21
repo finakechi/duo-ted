@@ -1,5 +1,5 @@
-// The only desktop capabilities the page gets: a native folder picker, "show this folder",
-// notifications when the window is in the background, and being told to open a view.
+// Limited desktop capabilities: folder operations, notifications, navigation, and
+// write-only secure credential management. Secret values are never readable by the page.
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('duoDesktop', {
@@ -8,4 +8,7 @@ contextBridge.exposeInMainWorld('duoDesktop', {
   openPath: (p) => ipcRenderer.invoke('duo:open-path', p),
   notify: (o) => ipcRenderer.invoke('duo:notify', o),
   onNavigate: (fn) => ipcRenderer.on('duo:navigate', (_e, route) => fn(route)),
+  deepseekKeyStatus: () => ipcRenderer.invoke('duo:deepseek-key-status'),
+  saveDeepseekKey: (key) => ipcRenderer.invoke('duo:deepseek-key-save', key),
+  removeDeepseekKey: () => ipcRenderer.invoke('duo:deepseek-key-remove'),
 });

@@ -6,7 +6,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DEFAULT_CONFIG, resolveCodexBin, validateDeepSeekSettings, validateQwenProfiles } from '../src/config.ts';
-import { deepseekForSeat, discoverModels, validateProviderSeat } from '../src/providers.ts';
+import { DEEPSEEK_SAVED_KEY_ENV, deepseekForSeat, discoverModels, validateProviderSeat } from '../src/providers.ts';
 import { formatSeat, parseSeat } from '../src/seats.ts';
 import { initialState } from '../src/templates/runtime.ts';
 import { validateTemplate } from '../src/templates/validate.ts';
@@ -49,6 +49,23 @@ test('Codex provider overrides keep credentials out of argv and catalog', () => 
     assert.doesNotMatch(JSON.stringify(route), /private-secret-not-for-logs/);
     assert.doesNotMatch(readFileSync(join(scratch, 'duo-deepseek-models.json'), 'utf8'), /private-secret-not-for-logs/);
   } finally { delete process.env.DEEPSEEK_API_KEY; }
+});
+
+test('Saved desktop key takes precedence over an environment key without entering args or catalog', () => {
+  const configuration = cfg();
+  configuration.deepseek.enabled = true;
+  const seat = parseSeat('codex:deepseek-flash@high+provider=deepseek', 'A', defaults);
+  process.env.DEEPSEEK_API_KEY = 'fallback-secret-not-for-logs';
+  process.env[DEEPSEEK_SAVED_KEY_ENV] = 'saved-secret-not-for-logs';
+  try {
+    const route = deepseekForSeat(configuration, seat, scratch)!;
+    assert.match(route.overrides.join(' '), /env_key="DUO_DEEPSEEK_SAVED_KEY"/);
+    assert.doesNotMatch(JSON.stringify(route), /saved-secret-not-for-logs|fallback-secret-not-for-logs/);
+    assert.doesNotMatch(readFileSync(join(scratch, 'duo-deepseek-models.json'), 'utf8'), /saved-secret-not-for-logs/);
+  } finally {
+    delete process.env[DEEPSEEK_SAVED_KEY_ENV];
+    delete process.env.DEEPSEEK_API_KEY;
+  }
 });
 
 test('Local profile gates are optional and fail safely for incompatible tools', () => {
