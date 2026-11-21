@@ -82,6 +82,9 @@ export interface DesktopBridge {
   openPath(p: string): Promise<string>;
   notify(o: { title: string; body: string; route?: string }): Promise<boolean>;
   onNavigate(fn: (route: string) => void): void;
+  deepseekKeyStatus(): Promise<{ available: boolean; saved: boolean; reason?: string }>;
+  saveDeepseekKey(key: string): Promise<{ available: boolean; saved: boolean; reason?: string }>;
+  removeDeepseekKey(): Promise<{ available: boolean; saved: boolean; reason?: string }>;
 }
 
 /** Present when running inside the Electron shell. */

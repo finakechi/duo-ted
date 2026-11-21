@@ -7,11 +7,12 @@
  * launchers on Linux and macOS start apps without the shell's PATH, which is where nvm, mise,
  * Homebrew and ~/.local/bin live), then the PATH this process has.
  */
-const { app, BrowserWindow, dialog, ipcMain, nativeTheme, Notification, shell } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, nativeTheme, Notification, safeStorage, shell } = require('electron');
 const { execFileSync, spawn } = require('node:child_process');
 const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
+const { makeDeepSeekCredentialStore } = require('./credentials.cjs');
 
 const ROOT = path.resolve(__dirname, '..');
 const SMOKE = process.env.DUO_DESKTOP_SMOKE === '1';
@@ -33,6 +34,39 @@ let win = null;
 let origin = '';
 let token = '';
 let quitting = false;
+let credentials;
+
+/** The renderer can store or remove keys but never read them back. */
+function credentialStore() {
+  credentials ??= makeDeepSeekCredentialStore(safeStorage, app.getPath('userData'));
+  return credentials;
+}
+
+/** Only the own main frame may invoke credential operations. */
+function assertOwnWindow(event) {
+  if (!win || event.sender !== win.webContents || event.senderFrame !== win.webContents.mainFrame) {
+    throw new Error('Desktop credential access denied');
+  }
+}
+
+/** Apply a saved-key change to the live Node engine, without placing the secret in any URL/log. */
+function syncDeepSeekKey(key) {
+  if (!origin || !token) return Promise.reject(new Error('Duo engine not running'));
+  return new Promise((resolve, reject) => {
+    const payload = Buffer.from(JSON.stringify({ key }));
+    const req = http.request(`${origin}/api/internal/deepseek-key`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Length': payload.length },
+      timeout: 5000,
+    }, (res) => {
+      res.resume();
+      res.on('end', () => res.statusCode === 200 ? resolve() : reject(new Error('Engine rejected credential update')));
+    });
+    req.on('timeout', () => req.destroy(new Error('Engine credential update timed out')));
+    req.on('error', () => reject(new Error('Cannot update running Duo engine')));
+    req.end(payload);
+  });
+}
 
 /** The environment of the user's login shell (PATH above all), so the engine finds node, claude and git. */
 function shellEnv() {
@@ -97,6 +131,13 @@ function startEngine() {
   return new Promise((resolve, reject) => {
     const env = SMOKE ? { ...process.env } : { ...process.env, ...shellEnv() };
     delete env.ELECTRON_RUN_AS_NODE;
+    // Prefer the user's saved DeepSeek credential without changing any other provider.
+    // A locked/unavailable OS keychain must not prevent the desktop from starting.
+    delete env.DUO_DEEPSEEK_SAVED_KEY;
+    try {
+      const key = credentialStore().read();
+      if (key) env.DUO_DEEPSEEK_SAVED_KEY = key;
+    } catch { /* Settings will offer to replace an unreadable saved credential. */ }
     const node = findNode(env);
     if (!node) {
       reject(new Error('Duo needs Node.js 22.18 or newer. Install it from https://nodejs.org (or with nvm, mise, Homebrew), then open Duo again. You can also point DUO_NODE at a node binary.'));
@@ -219,6 +260,25 @@ async function createWindow() {
     app.exit(ok ? 0 : 1);
   }
 }
+
+ipcMain.handle('duo:deepseek-key-status', (event) => {
+  assertOwnWindow(event);
+  return credentialStore().status();
+});
+ipcMain.handle('duo:deepseek-key-save', async (event, key) => {
+  assertOwnWindow(event);
+  credentialStore().save(key);
+  try { await syncDeepSeekKey(key); }
+  catch { throw new Error('Key saved securely, but not applied to this session. Restart Duo to use it.'); }
+  return credentialStore().status();
+});
+ipcMain.handle('duo:deepseek-key-remove', async (event) => {
+  assertOwnWindow(event);
+  credentialStore().remove();
+  try { await syncDeepSeekKey(null); }
+  catch { throw new Error('Saved key removed, but the running session still needs a restart.'); }
+  return credentialStore().status();
+});
 
 ipcMain.handle('duo:pick-folder', async () => {
   const r = await dialog.showOpenDialog(win, { properties: ['openDirectory', 'createDirectory'] });

@@ -62,7 +62,7 @@ export function SelectorEditor({ value, onChange, template, seats }: { value: Se
       <div class="template-grid">
         <Pick label="Coding engine" value={value.engine} empty="Any engine" options={['codex', 'claude', 'qwen']} onChange={(v) => update({ engine: (v || undefined) as Selector['engine'] })} />
         <Pick label="Model provider" value={value.provider} empty="Any provider" options={['openai', 'anthropic', 'qwen', 'deepseek', 'local', 'hosted']} onChange={(v) => update({ provider: (v || undefined) as Selector['provider'] })} />
-        <Pick label="Execution" value={value.locality} empty="Local or cloud" options={['local', 'cloud']} onChange={(v) => update({ locality: (v || undefined) as Selector['locality'] })} />
+        <Pick label="Execution" value={value.locality} empty="Local or cloud" hint="Local means this device or an allowed local-network server, judged from the endpoint address" options={['local', 'cloud']} onChange={(v) => update({ locality: (v || undefined) as Selector['locality'] })} />
         <Pick label="Currently in role" value={value.fromRole} empty="Any role" options={Object.keys(template.roles)} onChange={(v) => update({ fromRole: v || undefined })} />
       </div>
       <Field label="Exact model name" hint="Leave blank to allow any model."><input value={value.model ?? ''} placeholder="e.g. gpt-6-sol" onInput={(e) => update({ model: e.currentTarget.value || undefined })} /></Field>

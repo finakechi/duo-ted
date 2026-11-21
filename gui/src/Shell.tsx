@@ -5,6 +5,7 @@ import { MODE_ORDER, MODES, ModeDemo, type ModeId } from './demos.tsx';
 import { DiffView } from './Diff.tsx';
 import { NewRun, outcomeTone, PROTOCOLS, RunView, StatusChip } from './Run.tsx';
 import { AccessPicker, SeatPicker } from './SeatPicker.tsx';
+import { ReadinessPanel } from './Readiness.tsx';
 import { shortSpec } from './spec.ts';
 import {
   app, chats, confirmAction, connected, deleteChat, deleteRun, dismissToast, doctor, gitTick, go, guard, loadDoctor, modal, openNewChat, openSideBySide, paletteOpen,
@@ -545,6 +546,13 @@ function Settings({ tab: initial }: { tab?: 'general' | 'deepseek' | 'local' | '
   const [presets, setPresets] = useState(JSON.stringify(s.presets, null, 2));
   const [profiles, setProfiles] = useState(structuredClone(s.qwenProfiles));
   const [deepseek, setDeepseek] = useState(structuredClone(s.deepseek));
+  const [deepseekKey, setDeepseekKey] = useState('');
+  const [keyStatus, setKeyStatus] = useState<{ available: boolean; saved: boolean; reason?: string } | null>(null);
+  useEffect(() => {
+    if (!desktop?.deepseekKeyStatus) return;
+    void desktop.deepseekKeyStatus().then(setKeyStatus).catch(() =>
+      setKeyStatus({ available: false, saved: false, reason: 'Cannot access desktop credential storage.' }));
+  }, []);
   const [localEnabled, setLocalEnabled] = useState(s.localModelsEnabled);
   const [newProfileId, setNewProfileId] = useState('local');
   const [newHostedId, setNewHostedId] = useState('hosted');
@@ -561,10 +569,20 @@ function Settings({ tab: initial }: { tab?: 'general' | 'deepseek' | 'local' | '
       setErr(`Invalid presets JSON: ${(e as Error).message}`);
       return;
     }
-    if (await saveSettings({ gui, presets: p, qwenProfiles: profiles, deepseek, localModelsEnabled: localEnabled, warnPercent: warn })) close();
+    if (!await saveSettings({ gui, presets: p, qwenProfiles: profiles, deepseek, localModelsEnabled: localEnabled, warnPercent: warn })) return;
+    if (deepseekKey) {
+      try {
+        if (!desktop?.saveDeepseekKey) throw new Error('Saving keys requires the Duo desktop app.');
+        setKeyStatus(await desktop.saveDeepseekKey(deepseekKey));
+        setDeepseekKey('');
+      } catch (e) { setErr((e as Error).message); return; }
+    }
+    close();
   };
   const dirty = ['general', 'deepseek', 'local', 'presets'].includes(tab);
   const editProfile = (id: string, patch: Partial<AppState['qwenProfiles'][string]>) => setProfiles((current) => ({ ...current, [id]: { ...current[id], ...patch } }));
+  /** Tests run against saved settings only; an edited profile must be saved first. */
+  const savedProfile = (id: string) => !!s.qwenProfiles[id] && JSON.stringify(s.qwenProfiles[id]) === JSON.stringify(profiles[id]) && (s.qwenProfiles[id].kind !== 'local' || s.localModelsEnabled === localEnabled);
   return (
     <Modal title="Settings" onClose={close} wide footer={dirty ? <>
       <div class="spacer" />
@@ -592,19 +610,16 @@ function Settings({ tab: initial }: { tab?: 'general' | 'deepseek' | 'local' | '
               <div class="row"><SeatPicker spec={gui.qwen.spec} engineLocked onChange={(spec) => setGui({ ...gui, qwen: { ...gui.qwen, spec } })} /><AccessPicker engine="qwen" access={gui.qwen.access} onChange={(access) => setGui({ ...gui, qwen: { ...gui.qwen, access } })} /></div>
               <p class="muted small">Qwen uses its existing authentication. Write access requires Linux Bubblewrap.</p>
               <details class="template-details"><summary>Hosted Qwen endpoint profiles</summary><div class="template-stack">
-                <p class="muted small">Existing hosted OpenAI-compatible profiles remain available. API keys are read from environment variables, never saved here. Configure local servers under Local Models.</p>
+                <p class="muted small">Hosted OpenAI-compatible endpoints run in the cloud. Each profile must name the environment variable holding its own API key; Duo never falls back to OPENAI_API_KEY or saves a key here. Configure servers on this device or your network under Local Models.</p>
                 {Object.entries(profiles).filter(([, p]) => p.kind === 'hosted').map(([id, p]) => <div class="template-subcard" key={id}>
                   <div class="row wrap"><strong>{id}</strong><Toggle checked={p.enabled !== false} onChange={(enabled) => editProfile(id, { enabled })} label="Enabled" /></div>
                   <label class="field">Profile name<input value={p.name} onInput={(e) => editProfile(id, { name: e.currentTarget.value })} /></label>
                   <label class="field">Model identifier<input class="mono" value={p.model} onInput={(e) => editProfile(id, { model: e.currentTarget.value })} /></label>
                   <label class="field">HTTPS endpoint<input class="mono" value={p.baseUrl} onInput={(e) => editProfile(id, { baseUrl: e.currentTarget.value })} /></label>
                   <label class="field">API-key environment variable<input class="mono" value={p.keyEnv ?? ''} onInput={(e) => editProfile(id, { keyEnv: e.currentTarget.value || undefined })} /></label>
+                  <ProfileIssues id={id} />
+                  <ReadinessPanel target={`qwen:${id}`} saved={savedProfile(id)} />
                   <div class="row wrap">
-                    <button type="button" class="btn small" onClick={async () => {
-                      setQwenChecks((c) => ({ ...c, [id]: 'Testing saved hosted endpoint…' }));
-                      try { const r = await api<{ reachable: boolean; toolUse: string; detail: string }>('/api/qwen/test', { method: 'POST', body: { profile: id } }); setQwenChecks((c) => ({ ...c, [id]: `${r.reachable ? 'Connected' : 'Unavailable'} · tool use ${r.toolUse}: ${r.detail}` })); }
-                      catch (e) { setQwenChecks((c) => ({ ...c, [id]: (e as Error).message })); }
-                    }}>Test saved profile</button>
                     <button type="button" class="btn small" onClick={() => setProfiles((v) => { const next = { ...v }; delete next[id]; return next; })}>Remove profile</button>
                   </div>
                   {qwenChecks[id] && <p class="muted small" role="status">{qwenChecks[id]}</p>}
@@ -615,7 +630,7 @@ function Settings({ tab: initial }: { tab?: 'general' | 'deepseek' | 'local' | '
                     setProfiles((v) => ({ ...v, [newHostedId]: { name: newHostedId, kind: 'hosted', model: 'my-hosted-model', baseUrl: 'https://example.invalid/v1' } })); setErr('');
                   }}>Add hosted profile</button>
                 </div>
-                <p class="muted small">Save and reopen Settings before testing a new or changed profile.</p>
+                <p class="muted small">Save Settings before testing a new or changed profile.</p>
               </div></details>
               {err && <div class="callout bad" role="alert">{err}</div>}
             </section>
@@ -635,8 +650,25 @@ function Settings({ tab: initial }: { tab?: 'general' | 'deepseek' | 'local' | '
           <Toggle checked={deepseek.enabled} onChange={(enabled) => setDeepseek({ ...deepseek, enabled })} label="Enable DeepSeek" hint="Off by default; no connection is attempted while disabled" />
           {deepseek.enabled && <>
             <p class="muted small">Codex is the coding engine; DeepSeek provides the model. API usage is billed by DeepSeek. Duo does not enable paid web search.</p>
-            <label class="field">API key environment variable<input class="mono" value={deepseek.keyEnv} spellcheck={false} onInput={(e) => setDeepseek({ ...deepseek, keyEnv: e.currentTarget.value })} /></label>
-            <p class="muted small">Set this variable before starting Duo. The key itself is never saved in settings.</p>
+            {desktop?.saveDeepseekKey ? <>
+              <label class="field">API key (saved on this device)
+                <input type="password" class="mono" autocomplete="off" spellcheck={false}
+                  placeholder={keyStatus?.saved ? 'Enter a replacement key' : 'Paste your DeepSeek API key'}
+                  value={deepseekKey} onInput={(e) => setDeepseekKey(e.currentTarget.value)} disabled={!keyStatus?.available} />
+              </label>
+              <div class="row wrap">
+                <span class="muted small" role="status">{keyStatus?.saved ? 'A key is saved (contents hidden).' : 'No saved key.'}</span>
+                {keyStatus?.saved && <button type="button" class="btn small" onClick={async () => {
+                  if (!window.confirm('Remove the saved DeepSeek key from this device?')) return;
+                  try { if (!desktop) throw new Error('Desktop credential storage unavailable'); setKeyStatus(await desktop.removeDeepseekKey()); setDeepseekKey(''); setErr(''); }
+                  catch (e) { setErr((e as Error).message); }
+                }}>Remove saved key</button>}
+              </div>
+              {keyStatus?.reason && <p class="muted small">{keyStatus.reason}</p>}
+              <p class="muted small">Enter a key and press Save. It is encrypted using your OS keychain, never shown again or stored in config.json. Leave blank to keep the existing key.</p>
+            </> : <p class="muted small">Direct key storage requires the Duo desktop app.</p>}
+            <label class="field">Fallback API-key environment variable<input class="mono" value={deepseek.keyEnv} spellcheck={false} onInput={(e) => setDeepseek({ ...deepseek, keyEnv: e.currentTarget.value })} /></label>
+            <p class="muted small">Used when no desktop key is available. Set it before starting Duo.</p>
             <label class="field">Model identifiers (one per line)<textarea rows={3} class="mono" value={deepseek.models.join('\n')} spellcheck={false} onInput={(e) => setDeepseek({ ...deepseek, models: e.currentTarget.value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean) })} /></label>
             <button type="button" class="btn small" onClick={async () => {
               setQwenChecks((c) => ({ ...c, deepseek: 'Checking DeepSeek model discovery…' }));
@@ -645,7 +677,11 @@ function Settings({ tab: initial }: { tab?: 'general' | 'deepseek' | 'local' | '
             }}>Test connection and discover models</button>
             {qwenChecks.deepseek && <p class="muted small" role="status">{qwenChecks.deepseek}</p>}
             {!!deepseekModels.length && <p class="muted small">Available: {deepseekModels.join(', ')} <button type="button" class="btn small" onClick={() => setDeepseek({ ...deepseek, models: deepseekModels })}>Use discovered models</button></p>}
-            <p class="muted small">Save and reopen Settings before testing changed credentials or activation. Live coding requires a compatible Codex CLI.</p>
+            <p class="muted small">DeepSeek models take a role only after passing that role's test below (results last until Duo restarts or these settings change). Save Settings before testing changed credentials or models.</p>
+            {deepseek.models.map((model) => <div class="template-subcard" key={model}>
+              <strong class="mono">{model}</strong>
+              <ReadinessPanel target={`deepseek:${model}`} saved={s.deepseek.enabled && s.deepseek.keyEnv === deepseek.keyEnv && s.deepseek.models.includes(model)} />
+            </div>)}
           </>}
           {err && <div class="callout bad" role="alert">{err}</div>}
         </section>}
@@ -660,6 +696,7 @@ function Settings({ tab: initial }: { tab?: 'general' | 'deepseek' | 'local' | '
               <label class="field">Endpoint URL<input class="mono" value={p.baseUrl} spellcheck={false} onInput={(e) => editProfile(id, { baseUrl: e.currentTarget.value })} /></label>
               <label class="field">Model identifier<input class="mono" value={p.model} spellcheck={false} onInput={(e) => editProfile(id, { model: e.currentTarget.value })} /></label>
               <label class="field">Optional API-key environment variable<input class="mono" value={p.keyEnv ?? ''} spellcheck={false} onInput={(e) => editProfile(id, { keyEnv: e.currentTarget.value || undefined })} /></label>
+              <Toggle checked={!!p.lan} onChange={(lan) => editProfile(id, { lan: lan || undefined })} label="Allow local-network endpoint" hint="Needed for an address on your LAN rather than this device; a key over a LAN requires HTTPS" />
               <details class="template-details"><summary>Declared model capabilities (optional)</summary><div class="template-stack">
                 {([['tools', 'Coding tool calls'], ['structuredOutput', 'Structured replies'], ['reasoning', 'Reasoning mode'], ['multimodal', 'Image input']] as const).map(([key, label]) =>
                   <label class="field">{label}<select value={p.capabilities?.[key] === undefined ? 'unknown' : p.capabilities[key] ? 'yes' : 'no'} onChange={(e) => {
@@ -679,15 +716,11 @@ function Settings({ tab: initial }: { tab?: 'general' | 'deepseek' | 'local' | '
                   try { const r = await api<{ models: string[] }>('/api/local/models', { method: 'POST', body: { profile: id } }); setLocalModels((v) => ({ ...v, [id]: r.models })); setQwenChecks((c) => ({ ...c, [id]: `Connected · ${r.models.length} models` })); }
                   catch (e) { setQwenChecks((c) => ({ ...c, [id]: (e as Error).message })); }
                 }}>Discover models</button>
-                <button type="button" class="btn small" onClick={async () => {
-                  setQwenChecks((c) => ({ ...c, [id]: 'Testing coding tools…' }));
-                  try { const r = await api<{ reachable: boolean; toolUse: string; detail: string }>('/api/qwen/test', { method: 'POST', body: { profile: id } }); setQwenChecks((c) => ({ ...c, [id]: `${r.reachable ? 'Connected' : 'Unavailable'} · tool use ${r.toolUse}: ${r.detail}` })); }
-                  catch (e) { setQwenChecks((c) => ({ ...c, [id]: (e as Error).message })); }
-                }}>Test coding tools</button>
               </div>
               {!!localModels[id]?.length && <label class="field">Discovered models<select value={p.model} onChange={(e) => editProfile(id, { model: e.currentTarget.value })}><option value={p.model}>{p.model}</option>{localModels[id].filter((m) => m !== p.model).map((m) => <option value={m}>{m}</option>)}</select></label>}
               {qwenChecks[id] && <p class="muted small" role="status">{qwenChecks[id]}</p>}
-              <p class="muted small">Tool use is unverified until the coding-tool test passes. A connection alone is not sufficient.</p>
+              <ProfileIssues id={id} />
+              <ReadinessPanel target={`qwen:${id}`} saved={savedProfile(id)} />
             </div>)}
             <div class="row wrap"><label class="field">New profile ID<input class="mono" value={newProfileId} onInput={(e) => setNewProfileId(e.currentTarget.value)} /></label><button type="button" class="btn small" onClick={() => {
               if (!/^[A-Za-z][\w-]{0,63}$/.test(newProfileId) || profiles[newProfileId]) { setErr('Choose a unique profile ID starting with a letter.'); return; }
@@ -695,7 +728,7 @@ function Settings({ tab: initial }: { tab?: 'general' | 'deepseek' | 'local' | '
             }}>Add local profile</button></div>
           </>}
           {err && <div class="callout bad" role="alert">{err}</div>}
-          <p class="muted small">Save and reopen Settings before connection tests. Disabled profiles stay saved and disappear from model selection.</p>
+          <p class="muted small">Save Settings before testing a new or changed profile. A connection or model list does not make a model eligible: it takes the reviewer or writer role only after passing that role's test. Disabled profiles stay saved, make no connections and disappear from model selection.</p>
         </section>}
         {tab === 'presets' && (
           <section>
@@ -914,4 +947,11 @@ export function App() {
       <Toasts />
     </div>
   );
+}
+
+/** Why a saved profile cannot be used as configured (endpoint location, transport, credential). */
+function ProfileIssues({ id }: { id: string }) {
+  const issues = app.value?.profilePolicy?.[id]?.issues ?? [];
+  if (!issues.length) return null;
+  return <div class="callout bad small" role="note">{issues.map((i) => <p>{i}</p>)}</div>;
 }

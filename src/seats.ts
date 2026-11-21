@@ -60,7 +60,7 @@ export interface Seat {
   /** Model host, distinct from the coding engine. */
   provider?: 'deepseek';
   /** Resolved only in a run, never supplied by an untrusted seat spec. */
-  backend?: { provider: 'deepseek' | 'openai' | 'anthropic' | 'qwen' | 'local' | 'hosted'; locality: 'local' | 'cloud' };
+  backend?: { provider: 'deepseek' | 'openai' | 'anthropic' | 'qwen' | 'local' | 'hosted'; locality: 'local' | 'cloud'; location: 'device' | 'lan' | 'cloud' };
 }
 
 export interface SeatDefaults {
