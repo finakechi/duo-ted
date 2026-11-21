@@ -660,7 +660,7 @@ function Settings({ tab: initial }: { tab?: 'general' | 'deepseek' | 'local' | '
                 <span class="muted small" role="status">{keyStatus?.saved ? 'A key is saved (contents hidden).' : 'No saved key.'}</span>
                 {keyStatus?.saved && <button type="button" class="btn small" onClick={async () => {
                   if (!window.confirm('Remove the saved DeepSeek key from this device?')) return;
-                  try { setKeyStatus(await desktop.removeDeepseekKey()); setDeepseekKey(''); setErr(''); }
+                  try { if (!desktop) throw new Error('Desktop credential storage unavailable'); setKeyStatus(await desktop.removeDeepseekKey()); setDeepseekKey(''); setErr(''); }
                   catch (e) { setErr((e as Error).message); }
                 }}>Remove saved key</button>}
               </div>
