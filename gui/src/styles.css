@@ -1128,3 +1128,17 @@ table.data.small td, table.data.small th { padding: 4px 6px; font-size: 12px; }
   .template-workflow-head > .field { max-width: 100%; width: 100%; }
   .template-section-title { flex-wrap: wrap; }
 }
+
+/* Role readiness of optional models (Settings, model pickers). */
+.readiness { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+.readiness-head { align-items: center; gap: 8px; }
+.readiness-pill { display: inline-flex; align-items: center; gap: 5px; padding: 2px 9px; border-radius: 999px; font-size: 12px; font-weight: 550; background: var(--bg-sunken); color: var(--text-2); }
+.readiness-pill.good { background: var(--good-soft); color: var(--good); }
+.readiness-pill.warn { background: var(--warn-soft); color: var(--warn); }
+.readiness-pill.bad { background: var(--bad-soft); color: var(--bad); }
+.readiness-facts { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; margin: 0; font-size: 12.5px; }
+.readiness-facts dt { color: var(--text-3); }
+.readiness-facts dd { margin: 0; overflow-wrap: anywhere; }
+.readiness-checks { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 2px; }
+.context-break { display: flex; align-items: center; gap: 10px; margin: 6px 0 10px; color: var(--text-3); font-size: 12px; }
+.context-break::before, .context-break::after { content: ''; flex: 1; border-top: 1px dashed var(--border-2); }

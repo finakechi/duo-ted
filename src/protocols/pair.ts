@@ -371,6 +371,7 @@ export async function continuePair(cfg: Config, prev: RunStore, note: string, o:
     quiet: o.quiet,
     extra: { continuedFrom: pm.id, note, pair: state.settings, ...(pm.options.template ? { template: pm.options.template } : {}) },
     sink: o.sink,
+    eligibility: o.eligibility,
   };
   const ctx = RunContext.create(cfg, opts, prev);
   o.onContext?.(ctx);

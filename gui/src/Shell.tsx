@@ -5,6 +5,7 @@ import { MODE_ORDER, MODES, ModeDemo, type ModeId } from './demos.tsx';
 import { DiffView } from './Diff.tsx';
 import { NewRun, outcomeTone, PROTOCOLS, RunView, StatusChip } from './Run.tsx';
 import { AccessPicker, SeatPicker } from './SeatPicker.tsx';
+import { ReadinessPanel } from './Readiness.tsx';
 import { shortSpec } from './spec.ts';
 import {
   app, chats, confirmAction, connected, deleteChat, deleteRun, dismissToast, doctor, gitTick, go, guard, loadDoctor, modal, openNewChat, openSideBySide, paletteOpen,
@@ -580,6 +581,8 @@ function Settings({ tab: initial }: { tab?: 'general' | 'deepseek' | 'local' | '
   };
   const dirty = ['general', 'deepseek', 'local', 'presets'].includes(tab);
   const editProfile = (id: string, patch: Partial<AppState['qwenProfiles'][string]>) => setProfiles((current) => ({ ...current, [id]: { ...current[id], ...patch } }));
+  /** Tests run against saved settings only; an edited profile must be saved first. */
+  const savedProfile = (id: string) => !!s.qwenProfiles[id] && JSON.stringify(s.qwenProfiles[id]) === JSON.stringify(profiles[id]) && (s.qwenProfiles[id].kind !== 'local' || s.localModelsEnabled === localEnabled);
   return (
     <Modal title="Settings" onClose={close} wide footer={dirty ? <>
       <div class="spacer" />
@@ -607,19 +610,16 @@ function Settings({ tab: initial }: { tab?: 'general' | 'deepseek' | 'local' | '
               <div class="row"><SeatPicker spec={gui.qwen.spec} engineLocked onChange={(spec) => setGui({ ...gui, qwen: { ...gui.qwen, spec } })} /><AccessPicker engine="qwen" access={gui.qwen.access} onChange={(access) => setGui({ ...gui, qwen: { ...gui.qwen, access } })} /></div>
               <p class="muted small">Qwen uses its existing authentication. Write access requires Linux Bubblewrap.</p>
               <details class="template-details"><summary>Hosted Qwen endpoint profiles</summary><div class="template-stack">
-                <p class="muted small">Existing hosted OpenAI-compatible profiles remain available. API keys are read from environment variables, never saved here. Configure local servers under Local Models.</p>
+                <p class="muted small">Hosted OpenAI-compatible endpoints run in the cloud. Each profile must name the environment variable holding its own API key; Duo never falls back to OPENAI_API_KEY or saves a key here. Configure servers on this device or your network under Local Models.</p>
                 {Object.entries(profiles).filter(([, p]) => p.kind === 'hosted').map(([id, p]) => <div class="template-subcard" key={id}>
                   <div class="row wrap"><strong>{id}</strong><Toggle checked={p.enabled !== false} onChange={(enabled) => editProfile(id, { enabled })} label="Enabled" /></div>
                   <label class="field">Profile name<input value={p.name} onInput={(e) => editProfile(id, { name: e.currentTarget.value })} /></label>
                   <label class="field">Model identifier<input class="mono" value={p.model} onInput={(e) => editProfile(id, { model: e.currentTarget.value })} /></label>
                   <label class="field">HTTPS endpoint<input class="mono" value={p.baseUrl} onInput={(e) => editProfile(id, { baseUrl: e.currentTarget.value })} /></label>
                   <label class="field">API-key environment variable<input class="mono" value={p.keyEnv ?? ''} onInput={(e) => editProfile(id, { keyEnv: e.currentTarget.value || undefined })} /></label>
+                  <ProfileIssues id={id} />
+                  <ReadinessPanel target={`qwen:${id}`} saved={savedProfile(id)} />
                   <div class="row wrap">
-                    <button type="button" class="btn small" onClick={async () => {
-                      setQwenChecks((c) => ({ ...c, [id]: 'Testing saved hosted endpoint…' }));
-                      try { const r = await api<{ reachable: boolean; toolUse: string; detail: string }>('/api/qwen/test', { method: 'POST', body: { profile: id } }); setQwenChecks((c) => ({ ...c, [id]: `${r.reachable ? 'Connected' : 'Unavailable'} · tool use ${r.toolUse}: ${r.detail}` })); }
-                      catch (e) { setQwenChecks((c) => ({ ...c, [id]: (e as Error).message })); }
-                    }}>Test saved profile</button>
                     <button type="button" class="btn small" onClick={() => setProfiles((v) => { const next = { ...v }; delete next[id]; return next; })}>Remove profile</button>
                   </div>
                   {qwenChecks[id] && <p class="muted small" role="status">{qwenChecks[id]}</p>}
@@ -630,7 +630,7 @@ function Settings({ tab: initial }: { tab?: 'general' | 'deepseek' | 'local' | '
                     setProfiles((v) => ({ ...v, [newHostedId]: { name: newHostedId, kind: 'hosted', model: 'my-hosted-model', baseUrl: 'https://example.invalid/v1' } })); setErr('');
                   }}>Add hosted profile</button>
                 </div>
-                <p class="muted small">Save and reopen Settings before testing a new or changed profile.</p>
+                <p class="muted small">Save Settings before testing a new or changed profile.</p>
               </div></details>
               {err && <div class="callout bad" role="alert">{err}</div>}
             </section>
@@ -677,7 +677,11 @@ function Settings({ tab: initial }: { tab?: 'general' | 'deepseek' | 'local' | '
             }}>Test connection and discover models</button>
             {qwenChecks.deepseek && <p class="muted small" role="status">{qwenChecks.deepseek}</p>}
             {!!deepseekModels.length && <p class="muted small">Available: {deepseekModels.join(', ')} <button type="button" class="btn small" onClick={() => setDeepseek({ ...deepseek, models: deepseekModels })}>Use discovered models</button></p>}
-            <p class="muted small">Save and reopen Settings before testing changed credentials or activation. Live coding requires a compatible Codex CLI.</p>
+            <p class="muted small">DeepSeek models take a role only after passing that role's test below (results last until Duo restarts or these settings change). Save Settings before testing changed credentials or models.</p>
+            {deepseek.models.map((model) => <div class="template-subcard" key={model}>
+              <strong class="mono">{model}</strong>
+              <ReadinessPanel target={`deepseek:${model}`} saved={s.deepseek.enabled && s.deepseek.keyEnv === deepseek.keyEnv && s.deepseek.models.includes(model)} />
+            </div>)}
           </>}
           {err && <div class="callout bad" role="alert">{err}</div>}
         </section>}
@@ -692,6 +696,7 @@ function Settings({ tab: initial }: { tab?: 'general' | 'deepseek' | 'local' | '
               <label class="field">Endpoint URL<input class="mono" value={p.baseUrl} spellcheck={false} onInput={(e) => editProfile(id, { baseUrl: e.currentTarget.value })} /></label>
               <label class="field">Model identifier<input class="mono" value={p.model} spellcheck={false} onInput={(e) => editProfile(id, { model: e.currentTarget.value })} /></label>
               <label class="field">Optional API-key environment variable<input class="mono" value={p.keyEnv ?? ''} spellcheck={false} onInput={(e) => editProfile(id, { keyEnv: e.currentTarget.value || undefined })} /></label>
+              <Toggle checked={!!p.lan} onChange={(lan) => editProfile(id, { lan: lan || undefined })} label="Allow local-network endpoint" hint="Needed for an address on your LAN rather than this device; a key over a LAN requires HTTPS" />
               <details class="template-details"><summary>Declared model capabilities (optional)</summary><div class="template-stack">
                 {([['tools', 'Coding tool calls'], ['structuredOutput', 'Structured replies'], ['reasoning', 'Reasoning mode'], ['multimodal', 'Image input']] as const).map(([key, label]) =>
                   <label class="field">{label}<select value={p.capabilities?.[key] === undefined ? 'unknown' : p.capabilities[key] ? 'yes' : 'no'} onChange={(e) => {
@@ -711,15 +716,11 @@ function Settings({ tab: initial }: { tab?: 'general' | 'deepseek' | 'local' | '
                   try { const r = await api<{ models: string[] }>('/api/local/models', { method: 'POST', body: { profile: id } }); setLocalModels((v) => ({ ...v, [id]: r.models })); setQwenChecks((c) => ({ ...c, [id]: `Connected · ${r.models.length} models` })); }
                   catch (e) { setQwenChecks((c) => ({ ...c, [id]: (e as Error).message })); }
                 }}>Discover models</button>
-                <button type="button" class="btn small" onClick={async () => {
-                  setQwenChecks((c) => ({ ...c, [id]: 'Testing coding tools…' }));
-                  try { const r = await api<{ reachable: boolean; toolUse: string; detail: string }>('/api/qwen/test', { method: 'POST', body: { profile: id } }); setQwenChecks((c) => ({ ...c, [id]: `${r.reachable ? 'Connected' : 'Unavailable'} · tool use ${r.toolUse}: ${r.detail}` })); }
-                  catch (e) { setQwenChecks((c) => ({ ...c, [id]: (e as Error).message })); }
-                }}>Test coding tools</button>
               </div>
               {!!localModels[id]?.length && <label class="field">Discovered models<select value={p.model} onChange={(e) => editProfile(id, { model: e.currentTarget.value })}><option value={p.model}>{p.model}</option>{localModels[id].filter((m) => m !== p.model).map((m) => <option value={m}>{m}</option>)}</select></label>}
               {qwenChecks[id] && <p class="muted small" role="status">{qwenChecks[id]}</p>}
-              <p class="muted small">Tool use is unverified until the coding-tool test passes. A connection alone is not sufficient.</p>
+              <ProfileIssues id={id} />
+              <ReadinessPanel target={`qwen:${id}`} saved={savedProfile(id)} />
             </div>)}
             <div class="row wrap"><label class="field">New profile ID<input class="mono" value={newProfileId} onInput={(e) => setNewProfileId(e.currentTarget.value)} /></label><button type="button" class="btn small" onClick={() => {
               if (!/^[A-Za-z][\w-]{0,63}$/.test(newProfileId) || profiles[newProfileId]) { setErr('Choose a unique profile ID starting with a letter.'); return; }
@@ -727,7 +728,7 @@ function Settings({ tab: initial }: { tab?: 'general' | 'deepseek' | 'local' | '
             }}>Add local profile</button></div>
           </>}
           {err && <div class="callout bad" role="alert">{err}</div>}
-          <p class="muted small">Save and reopen Settings before connection tests. Disabled profiles stay saved and disappear from model selection.</p>
+          <p class="muted small">Save Settings before testing a new or changed profile. A connection or model list does not make a model eligible: it takes the reviewer or writer role only after passing that role's test. Disabled profiles stay saved, make no connections and disappear from model selection.</p>
         </section>}
         {tab === 'presets' && (
           <section>
@@ -946,4 +947,11 @@ export function App() {
       <Toasts />
     </div>
   );
+}
+
+/** Why a saved profile cannot be used as configured (endpoint location, transport, credential). */
+function ProfileIssues({ id }: { id: string }) {
+  const issues = app.value?.profilePolicy?.[id]?.issues ?? [];
+  if (!issues.length) return null;
+  return <div class="callout bad small" role="note">{issues.map((i) => <p>{i}</p>)}</div>;
 }

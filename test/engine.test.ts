@@ -187,6 +187,28 @@ test('overrides reject unknown seats and unconfigured Qwen profiles', async () =
   await ctx.fail(new Error('cancelled'), []);
 });
 
+const deferred = () => { let resolve!: (v: void) => void; const promise = new Promise<void>((r) => { resolve = r; }); return { promise, resolve }; };
+
+test('DT-02: a stop racing a seat that is still opening retires it and never spawns a turn', async (t) => {
+  rmSync(LOG, { force: true });
+  const ctx = ctxFor('ask', ['claude:sonnet@low']);
+  const manager = (ctx.engines as any).manager;
+  const gate = deferred();
+  const stopped: string[] = [];
+  const start = t.mock.method(manager, 'startSession', async () => { await gate.promise; return {}; });
+  t.mock.method(manager, 'stopSession', async (name: string) => { stopped.push(name); });
+  const work = ask(ctx);
+  // Deterministically reach openSeat's session start, then stop while it is still opening.
+  for (let i = 0; i < 300 && start.mock.callCount() === 0; i++) await new Promise((r) => setTimeout(r, 10));
+  assert.equal(start.mock.callCount(), 1, 'the seat reached session startup');
+  ctx.cancel();
+  gate.resolve();
+  await work;
+  assert.equal(ctx.store.meta.status, 'cancelled');
+  assert.equal(ctx.store.meta.turns.length, 0, 'cancellation during seat opening never starts a turn');
+  assert.ok(stopped.length >= 1, 'the session that finished opening during the stop was retired');
+});
+
 test('Qwen continuation recovers pending instructions and a future assignment from the previous run', { skip: process.platform !== 'linux' || !existsSync('/usr/bin/bwrap') }, async () => {
   rmSync(LOG, { force: true });
   const original = ctxFor('ask', ['qwen:qwen3-coder-plus']);
@@ -404,4 +426,135 @@ test('a copied pair template continues on the same workspace with the same defin
   assert.equal(next!.store.meta.workspace!.path, ctx.store.meta.workspace!.path);
   assert.equal(next!.store.meta.turns[0].round, 2);
   const result = finishWorkspace(next!.store.meta.workspace!, 'discard', next!.store.meta.title); assert.ok(result.ok, result.message);
+});
+
+const { RunAborted, CloudHandoffError } = await import('../src/protocols/common.ts');
+const { ReadinessStore } = await import('../src/readiness.ts');
+const { writerSeatAccess } = await import('../src/protocols/pair.ts');
+const qwenReady = process.platform === 'linux' && existsSync('/usr/bin/bwrap');
+
+test('DT-02: a Stop while an override opens its replacement starts no turn and retires the new session', async () => {
+  rmSync(LOG, { force: true });
+  const ctx = ctxFor('ask', ['claude:sonnet@low']);
+  const ss = await ctx.engines.openSeat(ctx.opts.seats[0], 'participant', { system: 'Answer', cwd: tmp });
+  ctx.recordSeats([ss]);
+  ctx.override('A', 'codex:gpt-6-sol@low');
+  const engines = ctx.engines as any;
+  const open = engines.openSeat.bind(engines);
+  let opened: any;
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  let reached!: () => void;
+  const atGate = new Promise<void>((r) => { reached = r; });
+  // The replacement session is created, then the user presses Stop before the override returns.
+  engines.openSeat = async (...args: unknown[]) => { opened = await open(...args); reached(); await gate; return opened; };
+  const sending = ctx.send(ss, 'MUST-NOT-RUN', { round: 1, kind: 'answer' });
+  await atGate;
+  ctx.cancel();
+  release();
+  await assert.rejects(sending, (e: Error) => e instanceof RunAborted || /cancelled/.test(e.message));
+  assert.equal(ctx.store.meta.turns.length, 0, 'no turn was recorded');
+  assert.ok(!calls().some((c) => c.prompt?.includes('MUST-NOT-RUN')), 'no CLI received the turn');
+  assert.ok(!engines.sessions.has(opened), 'the session opened during the stop was retired');
+  await assert.rejects(ctx.engines.send(ss, 'late', { round: 2, kind: 'late' }), /cancelled/);
+  await assert.rejects(ctx.engines.openSeat(ctx.opts.seats[0], 'participant', { system: 'x', cwd: tmp }), /cancelled/);
+  await ctx.fail(new Error('cancelled'), [ss]);
+  assert.equal(ctx.store.meta.status, 'cancelled');
+});
+
+test('DT-02: a Stop before the replacement opens leaves the original agent and records the run as cancelled', async () => {
+  const ctx = ctxFor('ask', ['claude:sonnet@low']);
+  const ss = await ctx.engines.openSeat(ctx.opts.seats[0], 'participant', { system: 'Answer', cwd: tmp });
+  ctx.override('A', 'codex:gpt-6-sol@low');
+  const engines = ctx.engines as any;
+  const open = engines.openSeat.bind(engines);
+  let reached!: () => void;
+  const atGate = new Promise<void>((r) => { reached = r; });
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  engines.openSeat = async (...args: unknown[]) => { reached(); await gate; return open(...args); };
+  const sending = ctx.send(ss, 'MUST-NOT-RUN-EITHER', { round: 1, kind: 'answer' });
+  await atGate;
+  ctx.cancel();
+  release();
+  await assert.rejects(sending);
+  assert.equal(ss.seat.engine, 'claude', 'a cancelled role change does not take effect');
+  assert.equal(ctx.store.meta.turns.length, 0);
+  await ctx.fail(new Error('cancelled'), [ss]);
+});
+
+test('the executor refuses an optional model without a passing role test, in every workflow', async () => {
+  const configuration = structuredClone(cfg);
+  configuration.deepseek.enabled = true;
+  process.env.DEEPSEEK_API_KEY = 'sensitive-test-key-do-not-log';
+  try {
+    const store = new ReadinessStore();
+    const seats = ['codex:deepseek-flash@high+provider=deepseek', 'claude:sonnet@low'].map((spec, i) => parseSeat(spec, String.fromCharCode(65 + i), D));
+    const ctx = RunContext.create(configuration, { protocol: 'pair', title: 'gate', brief: 'x', cwd: tmp, seats, rounds: 1, minRounds: 1, anon: false, quiet: true, extra: {},
+      eligibility: (seat, need) => store.eligibility(configuration, seat, need) });
+    await assert.rejects(ctx.engines.openSeat(seats[0], 'writer', { system: 'x', cwd: tmp, access: writerSeatAccess('sandboxed') }), /DeepSeek deepseek-flash is not verified as a writer: run "Test writer" in Settings → DeepSeek/);
+    await assert.rejects(ctx.engines.openSeat(seats[0], 'reviewer', { system: 'x', cwd: tmp }), /not verified as a reviewer/);
+    const claude = await ctx.engines.openSeat(seats[1], 'reviewer', { system: 'x', cwd: tmp });
+    assert.ok(claude, 'Claude and Codex need no readiness test');
+    await ctx.finish('completed', {}, [claude]);
+  } finally { delete process.env.DEEPSEEK_API_KEY; }
+});
+
+test('DT-05: a Qwen writer is never given full access; a stored session resumes only on its own endpoint', { skip: !qwenReady }, async () => {
+  const configuration = structuredClone(cfg);
+  configuration.localModelsEnabled = true;
+  configuration.qwenProfiles = { desk: { name: 'Desk', kind: 'local', model: 'local-coder', baseUrl: 'http://127.0.0.1:11434/v1' } };
+  const seat = parseSeat('qwen:local-coder+profile=desk', 'A', D);
+  const ctx = RunContext.create(configuration, { protocol: 'ask', title: 'q', brief: 'x', cwd: tmp, seats: [seat], rounds: 1, minRounds: 1, anon: false, quiet: true, extra: {} });
+  await assert.rejects(ctx.engines.openSeat(seat, 'writer', { system: 'x', cwd: tmp, access: writerSeatAccess('full') }), /cannot run with full access/);
+  await assert.rejects(ctx.engines.openSeat(seat, 'participant', { system: 'x', cwd: tmp, resume: { qwenSessionId: 'old', backendKey: 'qwen-endpoint|hosted|https://elsewhere.example/v1|K' } }), /endpoint changed/);
+  await assert.rejects(ctx.engines.openSeat(seat, 'participant', { system: 'x', cwd: tmp, resume: { qwenSessionId: 'legacy-without-key' } }), /endpoint changed/);
+  const fresh = await ctx.engines.openSeat(seat, 'writer', { system: 'x', cwd: tmp, access: writerSeatAccess('sandboxed-network') });
+  assert.equal(fresh.qwen?.network, true);
+  assert.equal(fresh.record.location, 'device');
+  await ctx.finish('completed', {}, [fresh]);
+});
+
+test('DT-03: moving a local agent to a cloud model forwards its local replies only after confirmation', { skip: !qwenReady }, async () => {
+  rmSync(LOG, { force: true });
+  const configuration = structuredClone(cfg);
+  configuration.localModelsEnabled = true;
+  configuration.qwenProfiles = { desk: { name: 'Desk', kind: 'local', model: 'local-coder', baseUrl: 'http://127.0.0.1:11434/v1' } };
+  const seat = parseSeat('qwen:local-coder+profile=desk', 'A', D);
+  const ctx = RunContext.create(configuration, { protocol: 'ask', title: 'handoff', brief: 'x', cwd: tmp, seats: [seat], rounds: 2, minRounds: 1, anon: false, quiet: true, extra: {} });
+  const ss = await ctx.engines.openSeat(seat, 'participant', { system: 'x', cwd: tmp });
+  ctx.recordSeats([ss]);
+  assert.ok(!(await ctx.send(ss, 'Local work', { round: 1, kind: 'answer' })).error);
+  assert.throws(() => ctx.override('A', 'claude:sonnet@low'), (e: Error) => e instanceof CloudHandoffError && /sends its earlier replies/.test(e.message));
+  ctx.override('A', 'claude:sonnet@low', { confirmCloudHandoff: true });
+  assert.ok(!(await ctx.send(ss, 'Continue in the cloud', { round: 2, kind: 'answer' })).error);
+  const claude = calls().filter((c) => c.cli === 'claude' && c.prompt?.includes('Continue in the cloud')).at(-1);
+  assert.match(claude.prompt, /completed_prior_agent_work/);
+  assert.match(claude.prompt, /Qwen answered/);
+  const control = JSON.parse(readFileSync(join(ctx.store.dir, 'control.json'), 'utf8'));
+  assert.equal(control.appliedOverrides.at(-1).cloudHandoff, true);
+  // Cloud to cloud later still counts: this seat's history includes local output.
+  assert.throws(() => ctx.override('A', 'codex:gpt-6-sol@low'), CloudHandoffError);
+  await ctx.finish('completed', {}, [ss]);
+  assert.equal(ctx.store.meta.seats.find((s) => s.id === 'A')?.location, 'cloud');
+});
+
+test('an override that cannot be applied keeps the current agent and says why instead of failing the run', async () => {
+  const configuration = structuredClone(cfg);
+  configuration.deepseek.enabled = true;
+  process.env.DEEPSEEK_API_KEY = 'sensitive-test-key-do-not-log';
+  try {
+    const store = new ReadinessStore();
+    const seats = [parseSeat('claude:sonnet@low', 'A', D)];
+    const ctx = RunContext.create(configuration, { protocol: 'ask', title: 'reject', brief: 'x', cwd: tmp, seats, rounds: 1, minRounds: 1, anon: false, quiet: true, extra: {},
+      eligibility: (seat, need) => store.eligibility(configuration, seat, need) });
+    const ss = await ctx.engines.openSeat(seats[0], 'participant', { system: 'x', cwd: tmp });
+    ctx.override('A', 'codex:deepseek-flash@high+provider=deepseek');
+    const t = await ctx.send(ss, 'Still Claude?', { round: 1, kind: 'answer' });
+    assert.ok(!t.error, t.error);
+    assert.equal(ss.seat.engine, 'claude');
+    const control = JSON.parse(readFileSync(join(ctx.store.dir, 'control.json'), 'utf8'));
+    assert.match(control.appliedOverrides.at(-1).rejected, /not verified as a reviewer/);
+    await ctx.finish('completed', {}, [ss]);
+  } finally { delete process.env.DEEPSEEK_API_KEY; }
 });

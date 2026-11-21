@@ -29,6 +29,8 @@ export interface QwenProfile {
   model: string;
   baseUrl: string;
   keyEnv?: string;
+  /** Explicit opt-in for a local profile whose endpoint is on the local network rather than this device. */
+  lan?: boolean;
   /** A disabled profile stays saved but is not eligible for new runs. */
   enabled?: boolean;
   /** User-declared capabilities; connectivity alone never establishes these. */
@@ -53,20 +55,27 @@ export function validateDeepSeekSettings(value: unknown): DeepSeekSettings {
   return { enabled: v.enabled, keyEnv: v.keyEnv, models: [...new Set(v.models as string[])] };
 }
 
-/** Validate every persisted field; endpoint profiles must never become a place to store API keys. */
-export function validateQwenProfiles(value: unknown): Record<string, QwenProfile> {
+/**
+ * Validate every persisted field; endpoint profiles must never become a place to store API keys.
+ * `strict` (every save) also rejects configurations the endpoint policy forbids: a hosted profile
+ * without a named credential variable, a "local" profile at a remote address, an undeclared LAN
+ * address, or a credential sent over plain HTTP off this device. Loading is lenient so that an older
+ * saved profile is still shown (as unsupported, with the reason) instead of silently disappearing.
+ */
+export function validateQwenProfiles(value: unknown, strict = true): Record<string, QwenProfile> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Qwen profiles must be an object keyed by profile ID');
   const result: Record<string, QwenProfile> = {};
   for (const [id, item] of Object.entries(value)) {
     if (!/^[A-Za-z][\w-]{0,63}$/.test(id) || !item || typeof item !== 'object' || Array.isArray(item)) throw new Error(`invalid Qwen profile ID: ${id}`);
     const p = item as Record<string, unknown>;
-    if (Object.keys(p).some((key) => !['name', 'kind', 'model', 'baseUrl', 'keyEnv', 'enabled', 'capabilities'].includes(key))) throw new Error(`Qwen profile ${id}: unknown or secret-bearing field`);
+    if (Object.keys(p).some((key) => !['name', 'kind', 'model', 'baseUrl', 'keyEnv', 'lan', 'enabled', 'capabilities'].includes(key))) throw new Error(`Qwen profile ${id}: unknown or secret-bearing field`);
     if (p.kind !== 'hosted' && p.kind !== 'local') throw new Error(`Qwen profile ${id}: kind must be hosted or local`);
     if (typeof p.model !== 'string' || !p.model.trim() || /[\s@+=]/.test(p.model)) throw new Error(`Qwen profile ${id}: invalid model`);
     if (typeof p.baseUrl !== 'string') throw new Error(`Qwen profile ${id}: baseUrl required`);
     if (p.keyEnv !== undefined && (typeof p.keyEnv !== 'string' || !/^[A-Z_][A-Z0-9_]*$/.test(p.keyEnv))) throw new Error(`Qwen profile ${id}: keyEnv must name an environment variable`);
     if (p.name !== undefined && (typeof p.name !== 'string' || p.name.length > 80)) throw new Error(`Qwen profile ${id}: invalid name`);
     if (p.enabled !== undefined && typeof p.enabled !== 'boolean') throw new Error(`Qwen profile ${id}: enabled must be true or false`);
+    if (p.lan !== undefined && (typeof p.lan !== 'boolean' || p.kind !== 'local')) throw new Error(`Qwen profile ${id}: lan applies only to local profiles and must be true or false`);
     if (p.capabilities !== undefined) {
       if (!p.capabilities || typeof p.capabilities !== 'object' || Array.isArray(p.capabilities)) throw new Error(`Qwen profile ${id}: invalid capabilities`);
       const c = p.capabilities as Record<string, unknown>;
@@ -75,9 +84,68 @@ export function validateQwenProfiles(value: unknown): Record<string, QwenProfile
     let url: URL;
     try { url = new URL(p.baseUrl); } catch { throw new Error(`Qwen profile ${id}: invalid endpoint URL`); }
     if (url.username || url.password || url.search || url.hash || !['http:', 'https:'].includes(url.protocol) || (p.kind === 'hosted' && url.protocol !== 'https:')) throw new Error(`Qwen profile ${id}: invalid or insecure endpoint URL`);
-    result[id] = { name: String(p.name || id), kind: p.kind, model: p.model, baseUrl: url.toString().replace(/\/$/, ''), ...(p.keyEnv ? { keyEnv: p.keyEnv } : {}), ...(p.enabled !== undefined ? { enabled: p.enabled } : {}), ...(p.capabilities ? { capabilities: p.capabilities as QwenProfile['capabilities'] } : {}) };
+    const profile: QwenProfile = { name: String(p.name || id), kind: p.kind, model: p.model, baseUrl: url.toString().replace(/\/$/, ''), ...(p.keyEnv ? { keyEnv: p.keyEnv } : {}), ...(p.lan !== undefined ? { lan: p.lan } : {}), ...(p.enabled !== undefined ? { enabled: p.enabled } : {}), ...(p.capabilities ? { capabilities: p.capabilities as QwenProfile['capabilities'] } : {}) };
+    if (strict) {
+      const issue = profileIssues(id, profile)[0];
+      if (issue) throw new Error(issue);
+    }
+    result[id] = profile;
   }
   return result;
+}
+
+/**
+ * Profiles about to be saved: new or edited ones must satisfy the endpoint policy; an unchanged
+ * saved profile is kept as it is (it stays blocked at run time with its reason) so that an older
+ * configuration never prevents saving unrelated settings.
+ */
+export function validateProfilesForSave(value: unknown, saved: Record<string, unknown> = {}): Record<string, QwenProfile> {
+  const lenient = validateQwenProfiles(value, false);
+  const previous = (() => { try { return validateQwenProfiles(saved, false); } catch { return {} as Record<string, QwenProfile>; } })();
+  for (const [id, profile] of Object.entries(lenient)) {
+    if (previous[id] && JSON.stringify(previous[id]) === JSON.stringify(profile)) continue;
+    const issue = profileIssues(id, profile)[0];
+    if (issue) throw new Error(issue);
+  }
+  return lenient;
+}
+
+export type EndpointLocation = 'device' | 'lan' | 'cloud';
+
+/**
+ * Where an endpoint actually is, judged from its address alone (never from a profile's label):
+ * loopback names and addresses are this device; private, link-local and CGNAT address literals,
+ * single-label names and .local/.lan/.home.arpa/.internal names are the local network; anything
+ * else is remote. A name is not resolved, so a public name that points at a LAN host still counts
+ * as remote: the conservative direction.
+ */
+export function endpointLocation(baseUrl: string): EndpointLocation {
+  let host: string;
+  try { host = new URL(baseUrl).hostname.toLowerCase().replace(/^\[|\]$/g, ''); } catch { return 'cloud'; }
+  if (host === 'localhost' || host.endsWith('.localhost') || host === '::1' || host === '0.0.0.0' || /^127\.\d+\.\d+\.\d+$/.test(host) || /^::ffff:(7f[0-9a-f]{2}:[0-9a-f]{1,4}|127\.)/.test(host)) return 'device';
+  const v4 = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(host);
+  if (v4) {
+    const [a, b] = [Number(v4[1]), Number(v4[2])];
+    if (a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254) || (a === 100 && b >= 64 && b <= 127)) return 'lan';
+    return 'cloud';
+  }
+  if (host.includes(':')) return /^(fe[89ab][0-9a-f]|f[cd][0-9a-f]{2}):/.test(host) ? 'lan' : 'cloud';
+  if (!host.includes('.') || /\.(local|lan|home\.arpa|internal)$/.test(host)) return 'lan';
+  return 'cloud';
+}
+
+/** Why a profile may not be used as configured; empty when it satisfies the endpoint policy. */
+export function profileIssues(id: string, p: QwenProfile): string[] {
+  const issues: string[] = [];
+  const location = endpointLocation(p.baseUrl);
+  let protocol = '';
+  let host = '';
+  try { const u = new URL(p.baseUrl); protocol = u.protocol; host = u.host; } catch { issues.push(`Profile ${id}: invalid endpoint URL`); }
+  if (p.kind === 'hosted' && !p.keyEnv) issues.push(`Hosted profile ${id} must name the environment variable that holds its API key; Duo never falls back to OPENAI_API_KEY or another provider's key`);
+  if (p.kind === 'local' && location === 'cloud') issues.push(`Local profile ${id} points to a remote address (${host}); use an address on this device or your local network, or configure it as a hosted HTTPS profile`);
+  if (p.kind === 'local' && location === 'lan' && !p.lan) issues.push(`Local profile ${id} uses a local-network address (${host}); turn on "Allow local-network endpoint" to use it deliberately`);
+  if (p.keyEnv && protocol === 'http:' && location !== 'device') issues.push(`Profile ${id} would send its API key over plain HTTP to ${host}; use HTTPS, or remove the key for an unauthenticated local-network server`);
+  return issues;
 }
 
 export interface Config {
@@ -131,7 +199,7 @@ export function saveConfig(patch: Partial<Config>): Config {
   let current: Record<string, unknown> = {};
   if (existsSync(CONFIG_PATH)) current = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'));
   const next = { ...current, ...patch };
-  if (patch.qwenProfiles !== undefined) next.qwenProfiles = validateQwenProfiles(patch.qwenProfiles);
+  if (patch.qwenProfiles !== undefined) next.qwenProfiles = validateProfilesForSave(patch.qwenProfiles, (current.qwenProfiles ?? {}) as Record<string, unknown>);
   if (patch.deepseek !== undefined) next.deepseek = validateDeepSeekSettings(patch.deepseek);
   if (patch.localModelsEnabled !== undefined && typeof patch.localModelsEnabled !== 'boolean') throw new Error('Local Models enabled must be true or false');
   mkdirSync(dirname(CONFIG_PATH), { recursive: true });
@@ -166,15 +234,8 @@ export function loadConfig(): Config {
   else cfg.localModelsEnabled = Object.values(user.qwenProfiles ?? {}).some((p) => p?.kind === 'local');
   if (user.qwenProfiles && typeof user.qwenProfiles === 'object' && !Array.isArray(user.qwenProfiles)) {
     for (const [id, profile] of Object.entries(user.qwenProfiles)) {
-      if (!/^[A-Za-z][\w-]{0,63}$/.test(id) || !profile || typeof profile !== 'object') continue;
-      const p = profile as QwenProfile;
-      if ((p.kind !== 'hosted' && p.kind !== 'local') || typeof p.model !== 'string' || !p.model.trim() || typeof p.baseUrl !== 'string') continue;
-      try {
-        const url = new URL(p.baseUrl);
-        if (url.username || url.password || url.search || url.hash || !['http:', 'https:'].includes(url.protocol) || (p.kind === 'hosted' && url.protocol !== 'https:')) continue;
-        if (p.keyEnv && !/^[A-Z_][A-Z0-9_]*$/.test(p.keyEnv)) continue;
-        cfg.qwenProfiles[id] = validateQwenProfiles({ [id]: p })[id];
-      } catch { /* invalid endpoint */ }
+      // Structurally invalid entries are skipped; policy problems are reported, not hidden (see profileIssues).
+      try { cfg.qwenProfiles[id] = validateQwenProfiles({ [id]: profile }, false)[id]; } catch { /* invalid endpoint */ }
     }
   }
   if (user.timeoutSec) Object.assign(cfg.timeoutSec, user.timeoutSec);

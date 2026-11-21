@@ -29,6 +29,8 @@ export interface ContinueOptions {
   sink?: RunOptions['sink'];
   /** Receives the new run's context as soon as it exists (for cancel, and to show the new id). */
   onContext?: (ctx: RunContext) => void;
+  /** Role readiness for optional models (see RunOptions.eligibility). */
+  eligibility?: RunOptions['eligibility'];
 }
 
 export async function continueRun(cfg: Config, ref: string, note: string, o: ContinueOptions): Promise<string> {
@@ -61,6 +63,7 @@ export async function continueRun(cfg: Config, ref: string, note: string, o: Con
     extra: { continuedFrom: pm.id, note, ...(pm.options.template ? { template: pm.options.template } : {}) },
     workspace: pm.options.workspace !== false,
     sink: o.sink,
+    eligibility: o.eligibility,
   }, prev);
   o.onContext?.(ctx);
 

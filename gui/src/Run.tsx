@@ -1,6 +1,6 @@
 import { seatId } from '../../src/seat-ids.ts';
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { api, desktop, exportUrl, MOD } from './api.ts';
+import { api, ApiError, desktop, exportUrl, MOD } from './api.ts';
 import { BlockView, Markdown } from './Chat.tsx';
 import { MODES, ModeDemo, type ModeId } from './demos.tsx';
 import { DiffView } from './Diff.tsx';
@@ -492,7 +492,20 @@ export function RunView({ id }: { id: string; }) {
       await api(`/api/runs/${encodeURIComponent(id)}/override`, { method: 'POST', body: { target: overrideTarget, spec: overrideSpec } });
       await loadRun(id);
       toast('Assignment queued for the selected agent’s next turn', 'success');
-    } catch (e) { toast((e as Error).message); }
+    } catch (e) {
+      // A local agent's earlier replies would go to a cloud model: only on explicit confirmation.
+      if (e instanceof ApiError && e.status === 409) {
+        const target = overrideTarget;
+        const spec = overrideSpec;
+        confirmAction({ title: 'Send local work to a cloud model?', body: e.message, action: 'Switch and send' }, () => void (async () => {
+          try {
+            await api(`/api/runs/${encodeURIComponent(id)}/override`, { method: 'POST', body: { target, spec, confirmCloudHandoff: true } });
+            await loadRun(id);
+            toast('Assignment queued; the cloud model will receive this agent’s earlier replies', 'success');
+          } catch (err) { toast((err as Error).message); }
+        })());
+      } else toast((e as Error).message);
+    }
     finally { setControlBusy(false); }
   };
   useEffect(() => {
@@ -655,7 +668,7 @@ export function NewRun({ draft }: { draft?: Partial<StartRun>; }) {
   const [assignmentMode, setAssignmentMode] = useState<AssignmentRequest['mode']>('manual');
   const [assignmentPreference, setAssignmentPreference] = useState<AssignmentRequest['preference']>('best-fit');
   const [assignmentOverrides, setAssignmentOverrides] = useState<number[]>([]);
-  const [suggested, setSuggested] = useState<{ seats: string[]; reasons: string[]; error?: string }>();
+  const [suggested, setSuggested] = useState<{ seats: string[]; reasons: string[]; blocked?: string[]; error?: string }>();
   const [chair, setChair] = useState<string | undefined>(draft?.chair ?? remembered?.chair ?? preset?.chair);
   const [rounds, setRounds] = useState<number>(draft?.rounds ?? (protocol === 'pair' ? 4 : preset?.rounds ?? 3));
   const [minRounds, setMinRounds] = useState(1);
@@ -674,16 +687,19 @@ export function NewRun({ draft }: { draft?: Partial<StartRun>; }) {
   const isPair = protocol === 'pair' || library === 'pair';
   const pairSeats = [seats[0] ?? s.gui.codex.spec, seats[1] ?? s.gui.claude.spec];
   const isReview = protocol === 'review' || library === 'review';
+  // Every mode asks the server: automatic/hybrid for the assignment, all modes for role eligibility
+  // (the same rule the executor enforces), so an ineligible choice is explained before starting.
   useEffect(() => {
-    if (assignmentMode === 'manual') { setSuggested(undefined); return; }
     setSuggested(undefined);
+    if (protocol === 'custom' && !templateDraft) return;
     let cancelled = false;
-    const timer = setTimeout(() => void api<{ seats: string[]; reasons: string[] }>('/api/assignments/suggest', { method: 'POST', body: {
-      protocol: isPair ? 'pair' : protocol, seats,
+    const timer = setTimeout(() => void api<{ seats: string[]; reasons: string[]; blocked: string[] }>('/api/assignments/suggest', { method: 'POST', body: {
+      protocol: isPair && protocol !== 'custom' ? 'pair' : protocol, seats: isPair ? pairSeats : seats,
+      ...(protocol === 'custom' ? { template: templateDraft } : {}),
       assignment: { mode: assignmentMode, preference: assignmentPreference, overrides: assignmentOverrides },
-    } }).then((data) => { if (!cancelled) setSuggested(data); }).catch((error: Error) => { if (!cancelled) setSuggested({ seats: [], reasons: [], error: error.message }); }), 100);
+    } }).then((data) => { if (!cancelled) setSuggested(data); }).catch((error: Error) => { if (!cancelled) setSuggested({ seats: [], reasons: [], error: error.message }); }), 150);
     return () => { cancelled = true; clearTimeout(timer); };
-  }, [assignmentMode, assignmentPreference, assignmentOverrides.join(','), seats.join('|'), protocol, isPair]);
+  }, [assignmentMode, assignmentPreference, assignmentOverrides.join(','), seats.join('|'), protocol, isPair, JSON.stringify(templateDraft ?? null)]);
   const renderedSeats = assignmentMode === 'manual' ? seats : suggested?.seats ?? [];
   const override = (slot: number) => setAssignmentOverrides((current) => current.includes(slot) ? current.filter((n) => n !== slot) : [...current, slot]);
   const editable = (slot: number) => assignmentMode === 'manual' || (assignmentMode === 'hybrid' && assignmentOverrides.includes(slot));
@@ -719,6 +735,7 @@ export function NewRun({ draft }: { draft?: Partial<StartRun>; }) {
     if (isPair && isolation === 'worktree' && ws && !ws.head) return toast('A worktree needs a git repository with at least one commit; choose “In place”');
     if ((protocol === 'debate' || library === 'debate') && minRounds > rounds) return toast('Minimum rounds cannot exceed the maximum');
     if (assignmentMode !== 'manual' && (suggested?.error || suggested?.seats.length !== seats.length)) return toast(suggested?.error ?? 'Wait for agent assignment');
+    if (suggested?.blocked?.length) return toast(`Cannot start: ${suggested.blocked.join('; ')}`);
     void startRun({
       protocol,
       assignment: { mode: assignmentMode, preference: assignmentPreference, overrides: assignmentOverrides },
@@ -768,7 +785,8 @@ export function NewRun({ draft }: { draft?: Partial<StartRun>; }) {
               <option value="local-first">Local First</option><option value="best-fit">Best Fit</option><option value="cloud-first">Cloud First</option>
             </select></label>}
           </div>
-          {assignmentMode !== 'manual' && <p class="muted small" role="status">{suggested?.error ?? (suggested?.reasons.join(' · ') || 'Checking eligible agents…')} — Qwen profiles need a successful tool-use test in Settings. Best Fit uses fixed eligibility rules, not quality scores.</p>}
+          {assignmentMode !== 'manual' && <p class="muted small" role="status">{suggested?.error ?? (suggested?.reasons.join(' · ') || 'Checking eligible agents…')} — DeepSeek and Qwen profiles take a role only after passing that role's test in Settings. Best Fit uses fixed eligibility rules, not quality scores.</p>}
+          {!!suggested?.blocked?.length && <div class="callout bad small" role="alert">{suggested.blocked.map((b) => <p>{b}</p>)}</div>}
           {isPair ? (
             <div class="pair-seats">
               <div class="seat-row">
