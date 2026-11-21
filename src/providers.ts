@@ -5,6 +5,11 @@ import type { Config, DeepSeekSettings, QwenProfile } from './config.ts';
 import type { Seat } from './seats.ts';
 
 export const DEEPSEEK_BASE_URL = 'https://api.deepseek.com';
+/** Only the Electron shell sets this; it is never persisted in Duo's public config. */
+export const DEEPSEEK_SAVED_KEY_ENV = 'DUO_DEEPSEEK_SAVED_KEY';
+function deepseekCredentialEnv(settings: DeepSeekSettings): string {
+  return process.env[DEEPSEEK_SAVED_KEY_ENV] ? DEEPSEEK_SAVED_KEY_ENV : settings.keyEnv;
+}
 
 /** Codex requires a model catalog for models outside its built-in OpenAI catalog.
  * Metadata here follows DeepSeek's published Codex integration; custom identifiers can be
@@ -36,7 +41,8 @@ export function deepseekForSeat(cfg: Config, seat: Seat, catalogDir: string): { 
   const s = cfg.deepseek;
   if (!s.enabled) throw new Error('DeepSeek is disabled in Settings');
   if (!s.models.includes(seat.model)) throw new Error(`DeepSeek model ${seat.model} is not configured`);
-  if (!process.env[s.keyEnv]) throw new Error(`DeepSeek: set environment variable ${s.keyEnv} before starting Duo`);
+  const keyEnv = deepseekCredentialEnv(s);
+  if (!process.env[keyEnv]) throw new Error(`DeepSeek: save an API key in Settings or set environment variable ${s.keyEnv} before starting Duo`);
   mkdirSync(catalogDir, { recursive: true });
   const catalog = join(catalogDir, 'duo-deepseek-models.json');
   writeFileSync(catalog, JSON.stringify({ models: s.models.map(codexModel) }), { mode: 0o600 });
@@ -47,7 +53,7 @@ export function deepseekForSeat(cfg: Config, seat: Seat, catalogDir: string): { 
       'model_providers.duo_deepseek.name="DeepSeek"',
       `model_providers.duo_deepseek.base_url=${q(DEEPSEEK_BASE_URL)}`,
       'model_providers.duo_deepseek.wire_api="responses"',
-      `model_providers.duo_deepseek.env_key=${q(s.keyEnv)}`,
+      `model_providers.duo_deepseek.env_key=${q(keyEnv)}`,
       `model_catalog_json=${q(catalog)}`,
       'web_search="disabled"', 'features.standalone_web_search=false',
     ],
@@ -93,6 +99,7 @@ export async function discoverModels(baseUrl: string, keyEnv?: string): Promise<
 
 export async function discoverDeepSeek(settings: DeepSeekSettings): Promise<string[]> {
   if (!settings.enabled) throw new Error('Enable DeepSeek before testing its connection');
-  if (!process.env[settings.keyEnv]) throw new Error(`Set ${settings.keyEnv} before testing DeepSeek`);
-  return discoverModels(DEEPSEEK_BASE_URL, settings.keyEnv);
+  const keyEnv = deepseekCredentialEnv(settings);
+  if (!process.env[keyEnv]) throw new Error(`Save a key in Settings or set ${settings.keyEnv} before testing DeepSeek`);
+  return discoverModels(DEEPSEEK_BASE_URL, keyEnv);
 }

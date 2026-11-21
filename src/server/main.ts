@@ -16,7 +16,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { extname, join } from 'node:path';
 import { binVersionAsync, runBinAsync } from '../bins.ts';
 import { CLAUDE_MODELS, codexCatalogAsync, loadConfig, resolveClaudeBin, resolveCodexBin, resolveQwenBin, saveConfig, validateDeepSeekSettings, validateQwenProfiles, type CodexModel } from '../config.ts';
-import { DEEPSEEK_BASE_URL, discoverDeepSeek, discoverModels } from '../providers.ts';
+import { DEEPSEEK_BASE_URL, DEEPSEEK_SAVED_KEY_ENV, discoverDeepSeek, discoverModels } from '../providers.ts';
 import { liveChecks, runDoctor } from '../doctor.ts';
 import { sanitizeEnvironment } from '../env.ts';
 import { CONFIG_PATH, DUO_HOME, PROJECT_ROOT, SCRATCH_DIR } from '../paths.ts';
@@ -300,6 +300,19 @@ const routes: [string, RegExp, Handler][] = [
     // The export opens on the app's own origin with the token in its URL: model text in it may never run.
     send(res, 200, md ? runs.markdown(m[1]) : runs.html(m[1]), md ? 'text/markdown' : 'text/html', md ? { 'Content-Disposition': `attachment; filename="${m[1]}.md"` } : { 'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; img-src data:; frame-ancestors 'none'" });
     return undefined;
+  }],
+  // Called only by the authenticated Electron main process. Never returns key material.
+  ['POST', /^\/api\/internal\/deepseek-key$/, async (_m, req) => {
+    const b = await body(req);
+    if (!b || typeof b !== 'object' || Array.isArray(b) || !Object.prototype.hasOwnProperty.call(b, 'key')) {
+      throw new HttpError(400, 'Invalid credential update');
+    }
+    if (b.key === null) delete process.env[DEEPSEEK_SAVED_KEY_ENV];
+    else if (typeof b.key === 'string' && b.key.length > 0 && b.key.length <= 4096
+      && b.key === b.key.trim() && !/[\r\n\0]/.test(b.key)) {
+      process.env[DEEPSEEK_SAVED_KEY_ENV] = b.key;
+    } else throw new HttpError(400, 'Invalid credential update');
+    return { ok: true };
   }],
   ['PUT', /^\/api\/config$/, async (_m, req) => {
     const b = await body(req);
