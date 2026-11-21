@@ -28,7 +28,8 @@ test('DeepSeek credential is stored separately, encrypted, and survives relaunch
   first.save('secret-DEEPSEEK-123');
   const location = join(dir, 'credentials', 'deepseek.enc');
   assert.doesNotMatch(readFileSync(location, 'utf8'), /secret-DEEPSEEK-123/);
-  assert.equal(statSync(location).mode & 0o777, 0o600);
+  // Windows ACLs govern file access; POSIX mode bits are not meaningful there.
+  if (process.platform !== 'win32') assert.equal(statSync(location).mode & 0o777, 0o600);
   const second = makeDeepSeekCredentialStore(encryptedStorage, dir, 'linux');
   assert.equal(second.read(), 'secret-DEEPSEEK-123');
   assert.deepEqual(second.status(), { available: true, saved: true });
