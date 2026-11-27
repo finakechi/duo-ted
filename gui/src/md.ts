@@ -68,9 +68,44 @@ DOMPurify.addHook('afterSanitizeAttributes', (node) => {
   node.setAttribute('rel', 'noopener noreferrer');
 });
 
+/**
+ * Rendered output by source text, most recently used last. Opening a chat again (or a run's
+ * report) re-rendered every message: parsing, highlighting and sanitizing were most of the time a
+ * long conversation took to open. The output is already sanitized, and the same source always
+ * renders the same, so it can be reused. Bounded by total size.
+ */
+const rendered = new Map<string, string>();
+let renderedSize = 0;
+let lastRendered = '';
+const RENDERED_MAX = 8 * 1024 * 1024;
+
+function forget(key: string): void {
+  const v = rendered.get(key);
+  if (v === undefined) return;
+  rendered.delete(key);
+  renderedSize -= key.length + v.length;
+}
+
 export function renderMarkdown(src: string): string {
-  const html = marked.parse(src, { async: false }) as string;
-  return DOMPurify.sanitize(html, { ADD_ATTR: ['data-copy', 'target'] });
+  const hit = rendered.get(src);
+  if (hit !== undefined) {
+    rendered.delete(src);
+    rendered.set(src, hit);
+    return hit;
+  }
+  const html = DOMPurify.sanitize(marked.parse(src, { async: false }) as string, { ADD_ATTR: ['data-copy', 'target'] });
+  // A reply streaming in grows on every update: keep only its latest text, not every prefix.
+  if (lastRendered && src.startsWith(lastRendered)) forget(lastRendered);
+  lastRendered = src;
+  if (src.length <= 512 * 1024) {
+    rendered.set(src, html);
+    renderedSize += src.length + html.length;
+    for (const k of rendered.keys()) {
+      if (renderedSize <= RENDERED_MAX) break;
+      forget(k);
+    }
+  }
+  return html;
 }
 
 /** One delegated handler for every Copy button inside rendered markdown. */

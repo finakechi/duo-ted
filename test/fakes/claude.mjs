@@ -41,10 +41,18 @@ for await (const line of createInterface({ input: process.stdin })) {
     out({ type: 'result', subtype: 'success', is_error: true, result: "API Error: 400 Claude Code 2.1.259 does not support this model; version 2.1.280 or newer is required. Run 'claude update', or update the Claude desktop app, then try again.", session_id: sid, user_message_uuids: [msg.uuid], usage: {}, total_cost_usd: 0 });
     continue;
   }
-  const text = `claude answer ${turns}: ${prompt.length} chars`;
+  // FAKE_CLAUDE_STREAM_CHARS: a long Markdown reply (code blocks, lists, tables) streamed in small
+  // deltas every FAKE_CLAUDE_STREAM_MS, for measuring how the window copes with fast streaming.
+  const streamChars = Number(process.env.FAKE_CLAUDE_STREAM_CHARS ?? 0);
+  const text = streamChars ? longMarkdown(streamChars) : `claude answer ${turns}: ${prompt.length} chars`;
   out({ type: 'stream_event', event: { type: 'message_start', message: { id: `m${turns}` } } });
   out({ type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } });
-  out({ type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } } });
+  if (streamChars) {
+    for (let i = 0; i < text.length; i += 24) {
+      out({ type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: text.slice(i, i + 24) } } });
+      await new Promise((r) => setTimeout(r, Number(process.env.FAKE_CLAUDE_STREAM_MS ?? 10)));
+    }
+  } else out({ type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } } });
   out({ type: 'stream_event', event: { type: 'content_block_stop', index: 0 } });
   out({ type: 'assistant', message: { id: `m${turns}`, content: [{ type: 'text', text }] }, session_id: sid });
   cost += 0.01;
@@ -68,4 +76,13 @@ for await (const line of createInterface({ input: process.stdin })) {
   });
   // Simulate a CLI that goes away between turns (crash, update, laptop sleep).
   if (mode === 'die-after-1' && !args.includes('--resume')) process.exit(0);
+}
+
+function longMarkdown(n) {
+  const parts = [];
+  for (let i = 0; parts.join('').length < n; i++) {
+    parts.push(`## Step ${i}\n\nSome prose about step ${i}, with \`inline code\` and a [link](https://example.com).\n\n- first point\n- second point\n\n`);
+    parts.push(i % 2 ? `\`\`\`\nconst value${i} = compute(${i});\nif (value${i} > 10) console.log(value${i});\n\`\`\`\n\n` : `\`\`\`ts\nexport function f${i}(x: number): number {\n  return x * ${i};\n}\n\`\`\`\n\n| a | b |\n|---|---|\n| ${i} | ${i * 2} |\n\n`);
+  }
+  return parts.join('').slice(0, n);
 }
